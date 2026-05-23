@@ -19,6 +19,9 @@ end
 
 desc "test"
 task :test => :mruby do
+  unless system(RbConfig.ruby, "-rwebrick", "-e", "", out: File::NULL, err: File::NULL)
+    abort "test server needs webrick — run: gem install webrick"
+  end
   port_file     = File.expand_path("test/server_port", __dir__)
   server_script = File.expand_path("test/server.ruby",  __dir__)
 
