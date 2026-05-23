@@ -8,6 +8,9 @@ MRuby::Gem::Specification.new('mruby-url') do |spec|
   spec.add_dependency 'mruby-uri-parser'
   spec.add_dependency 'mruby-fast-json'
   spec.add_dependency 'mruby-c-ext-helpers'
+  spec.add_test_dependency 'mruby-env'
+  spec.add_test_dependency 'mruby-string-ext'
+  spec.add_test_dependency 'mruby-sleep'
 
   if spec.for_windows?
     cleaning = Rake.application.top_level_tasks.any? { |t| t =~ /\Aclean|deep_clean\z/ }

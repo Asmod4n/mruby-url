@@ -125,15 +125,19 @@ class URL::IOSelectLoop < URL::EventLoop
   def initialize(session)
     @session    = session
     @watched    = {}    # fd_int => :in / :out / :inout
+    @ios        = {}    # fd_int => IO    (keeps wrapper alive across calls)
     @timeout_ms = 0
   end
 
-  def on_socket(fd, what)
+  def on_socket(io, what)
+    fd_int = io.fileno
     case what
     when :in, :out, :inout
-      @watched[fd] = what
+      @watched[fd_int] = what
+      @ios[fd_int]     = io       # may overwrite a previous wrapper for same fd
     when :remove
-      @watched.delete(fd)
+      @watched.delete(fd_int)
+      @ios.delete(fd_int)
     end
   end
 
@@ -141,28 +145,28 @@ class URL::IOSelectLoop < URL::EventLoop
     @timeout_ms = ms
   end
 
-  # Drives the session until every attached transfer finishes. Yields
-  # (request, result_code) for each completion as it happens.
   def run(&on_complete)
-    running = @session.socket_action     # kick off
+    running = @session.socket_action
     @session.info_read(&on_complete) if on_complete
 
     while running > 0
       reads  = []
       writes = []
-      @watched.each do |fd, mode|
-        reads  << fd if mode == :in  || mode == :inout
-        writes << fd if mode == :out || mode == :inout
+      @watched.each do |fd_int, mode|
+        io = @ios[fd_int]
+        next unless io                  # defensive: skip if somehow desynced
+        reads  << io if mode == :in  || mode == :inout
+        writes << io if mode == :out || mode == :inout
       end
 
       sel_timeout = @timeout_ms < 0 ? nil : @timeout_ms / 1000.0
       r, w, _e = IO.select(reads, writes, nil, sel_timeout)
 
       if r.nil? && w.nil?
-        running = @session.socket_action   # timer fired
+        running = @session.socket_action
       else
-        r&.each { |fd| running = @session.socket_action(fd, :in)  }
-        w&.each { |fd| running = @session.socket_action(fd, :out) }
+        r&.each { |io| running = @session.socket_action(io, :in)  }
+        w&.each { |io| running = @session.socket_action(io, :out) }
       end
 
       @session.info_read(&on_complete) if on_complete
@@ -377,7 +381,6 @@ class URL
   DEFAULT_USER_AGENT      = "mruby-url".freeze
   DEFAULT_TIMEOUT_MS      = 30_000
   DEFAULT_FOLLOW_LOCATION = true
-  DEFAULT_ACCEPT_ENCODING = "".freeze   # let libcurl handle all known schemes
 
   class << self
     # The session used by every one-shot below. Lazy-initialised once,
@@ -472,7 +475,6 @@ class URL
       opts[:timeout_ms]      = DEFAULT_TIMEOUT_MS      unless opts.key?(:timeout_ms)
       opts[:follow_location] = DEFAULT_FOLLOW_LOCATION unless opts.key?(:follow_location)
       opts[:user_agent]      = DEFAULT_USER_AGENT      unless opts.key?(:user_agent)
-      opts[:accept_encoding] = DEFAULT_ACCEPT_ENCODING unless opts.key?(:accept_encoding)
 
       # Basic auth via libcurl (libcurl builds the Authorization header).
       if auth
