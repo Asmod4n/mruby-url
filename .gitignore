@@ -57,3 +57,4 @@ build-iPhoneSimulator/
 compile_commands.json
 build_config.rb.lock
 /mruby/
+test/server.log
