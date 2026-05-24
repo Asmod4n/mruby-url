@@ -393,13 +393,13 @@ class URL
       end
     end
 
-    def get(url, **opts, &block);        _one_shot(:GET,     url, nil,  opts, &block); end
-    def head(url, **opts, &block);       _one_shot(:HEAD,    url, nil,  opts, &block); end
-    def delete(url, body = nil, **opts, &block); _one_shot(:DELETE, url, body, opts, &block); end
-    def options(url, **opts, &block);    _one_shot(:OPTIONS, url, nil,  opts, &block); end
-    def post(url, body = nil, **opts, &block);   _one_shot(:POST,  url, body, opts, &block); end
-    def put(url, body = nil, **opts, &block);    _one_shot(:PUT,   url, body, opts, &block); end
-    def patch(url, body = nil, **opts, &block);  _one_shot(:PATCH, url, body, opts, &block); end
+    def get(url, **opts, &block);        _fire(:GET,     url, nil,  opts, &block); end
+    def head(url, **opts, &block);       _fire(:HEAD,    url, nil,  opts, &block); end
+    def delete(url, body = nil, **opts, &block); _fire(:DELETE, url, body, opts, &block); end
+    def options(url, **opts, &block);    _fire(:OPTIONS, url, nil,  opts, &block); end
+    def post(url, body = nil, **opts, &block);   _fire(:POST,  url, body, opts, &block); end
+    def put(url, body = nil, **opts, &block);    _fire(:PUT,   url, body, opts, &block); end
+    def patch(url, body = nil, **opts, &block);  _fire(:PATCH, url, body, opts, &block); end
 
     # parallel(urls, **opts) -> { url => Response }
     #
@@ -429,6 +429,22 @@ class URL
         out
       ensure
         triples.each { |_url, req, _state| session.remove(req) }
+      end
+    end
+
+    # Routes to a non-blocking path when the event loop has no #run
+    # (platform-driven, e.g. Ascaridol::EventLoop), or to _one_shot when
+    # it does (IOSelectLoop). Non-blocking returns nil; on_data callbacks
+    # fire from the platform loop as data arrives.
+    def _fire(method, url, body, opts, &on_chunk)
+      session = shared
+      if session.event_loop.respond_to?(:run)
+        _one_shot(method, url, body, opts, &on_chunk)
+      else
+        req, _state = _build_request(method, url, body, opts, on_chunk)
+        session.add(req)
+        session.socket_action
+        nil
       end
     end
 
