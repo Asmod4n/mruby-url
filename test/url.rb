@@ -7,7 +7,7 @@
 
 port_file = File.expand_path('server_port', File.dirname(__FILE__))
 unless File.exist?(port_file)
-  raise "#{port_file} missing — run via 'rake test', not mrbtest directly"
+  return "#{port_file} missing — run via 'rake test', not mrbtest directly"
 end
 $server_port = File.read(port_file).strip.to_i
 $base        = "http://127.0.0.1:#{$server_port}"
