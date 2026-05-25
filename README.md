@@ -1,3 +1,8 @@
+STATUS
+======
+
+This gem is still in the design phase and isn't ready to be used yet.
+
 # mruby-url
 
 URL session for mruby. Backed by libcurl, with a high-level HTTP client on
