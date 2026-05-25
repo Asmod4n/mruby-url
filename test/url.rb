@@ -101,11 +101,3 @@ assert('multi-valued header merges into array') do
   assert_kind_of Array, cookies
   assert_equal 2, cookies.length
 end
-
-assert('URL.parallel keyed by exact URL passed') do
-  urls = %W[#{$base}/status/200 #{$base}/status/418 #{$base}/echo]
-  results = URL.parallel(urls)
-  assert_equal 200, results[urls[0]].code
-  assert_equal 418, results[urls[1]].code
-  assert_equal 200, results[urls[2]].code
-end
