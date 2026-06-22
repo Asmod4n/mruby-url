@@ -65,14 +65,40 @@ class URL::EventLoop
   end
 end
 
-# URL session instances are internal. The only public API is URL.default_loop=.
-# The C socket/timer callbacks read @event_loop off the session; _fire_async
-# sets it via the private setter below before handing the session to libcurl.
+# Session instances drive libcurl; the C socket/timer callbacks read
+# @event_loop off the session. #event_loop= is the public setter for users
+# plugging in their own loop; the high-level verbs set it internally.
 class URL
-  private
+  def event_loop
+    @event_loop
+  end
 
-  def _set_event_loop(loop)
+  def event_loop=(loop)
+    unless loop.nil? || loop.is_a?(EventLoop)
+      raise TypeError, "expected a URL::EventLoop, got #{loop.class}"
+    end
     @event_loop = loop
+  end
+
+  # --- internal session bookkeeping (not part of the request API) ---
+
+  # True while this session's blocking loop is driving a transfer. Lets the
+  # high-level verbs notice a re-entrant call (a URL.get from inside a
+  # callback): the session can't drive a second transfer, so a throwaway one
+  # is used for that nested fetch instead.
+  def _busy?
+    @running ? true : false
+  end
+
+  def _busy=(flag)
+    @running = flag
+    flag
+  end
+
+  # IOSelectLoop bound to this session, created once and reused across
+  # blocking calls so libcurl's socket registrations survive between requests.
+  def _sync_loop
+    @sync_loop ||= IOSelectLoop.new(self)
   end
 end
 
@@ -166,6 +192,43 @@ class URL::IOSelectLoop < URL::EventLoop
       end
 
       @session.info_read { |req, code| on_complete&.call(req, code) }
+    end
+  end
+
+  # Drive the session until `target` completes (or the loop falls idle),
+  # rather than until every socket is gone. Required for the reused shared
+  # session, whose kept-alive sockets can outlive any single request.
+  def run_until(target, &on_complete)
+    finished = false
+    drain = lambda do |req, code|
+      finished = true if req.equal?(target)
+      on_complete.call(req, code) if on_complete
+    end
+
+    @session.socket_action
+    @session.info_read(&drain)
+
+    until finished
+      reads  = []
+      writes = []
+      @watching.each_value do |w|
+        reads  << w[:io] if w[:readiness] == :in  || w[:readiness] == :inout
+        writes << w[:io] if w[:readiness] == :out || w[:readiness] == :inout
+      end
+
+      break if reads.empty? && writes.empty? && @timeout_ms < 0
+
+      sel_timeout = @timeout_ms < 0 ? nil : @timeout_ms / 1000.0
+      r, w, _e = IO.select(reads, writes, nil, sel_timeout)
+
+      if r.nil? && w.nil?
+        @session.socket_action
+      else
+        r&.each { |io| @session.socket_action(io, :in)  }
+        w&.each { |io| @session.socket_action(io, :out) }
+      end
+
+      @session.info_read(&drain)
     end
   end
 end
@@ -324,6 +387,13 @@ class URL
       @default_loop
     end
 
+    # Per-mrb_state session reused by every blocking verb so libcurl's
+    # connection pool, TLS sessions and HTTP/2 streams persist across calls.
+    # Tune the pool on it directly, e.g. URL.shared.setopt(:max_total_connections, 64).
+    def shared
+      @shared ||= open
+    end
+
     def get(url, **opts, &block);                _fire(:GET,     url, nil,  opts, &block); end
     def head(url, **opts, &block);               _fire(:HEAD,    url, nil,  opts, &block); end
     def delete(url, body = nil, **opts, &block); _fire(:DELETE,  url, body, opts, &block); end
@@ -345,28 +415,34 @@ class URL
     # point the action block calls session.remove and lets GC clean up.
     def _fire_async(method, url, body, opts, &on_chunk)
       session = open
-      session.send(:_set_event_loop, @default_loop)
+      session.event_loop = @default_loop
       req, _state = _build_request(session, method, url, body, opts, on_chunk)
       session.add(req)
       session.socket_action
       nil
     end
 
-    # Blocking: run an IOSelectLoop to completion, return a Response.
+    # Blocking. Reuse the shared session, except when it's already mid-flight
+    # because we were called from inside one of its callbacks — then it can't
+    # drive a second transfer, so this nested fetch gets a throwaway session.
     def _fire_sync(method, url, body, opts, &on_chunk)
-      session = open
-      loop    = IOSelectLoop.new(session)
-      session.send(:_set_event_loop, loop)
+      session = shared
+      session = open if session._busy?
+
+      loop = session._sync_loop
+      session.event_loop = loop
 
       req, state = _build_request(session, method, url, body, opts, on_chunk)
       session.add(req)
+      session._busy = true
 
       begin
-        loop.run do |r, code|
+        loop.run_until(req) do |r, code|
           state.error_code = code if r.equal?(req) && code != 0
         end
         _response_from(url, req, state)
       ensure
+        session._busy = false
         session.remove(req) rescue nil
       end
     end

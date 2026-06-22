@@ -101,3 +101,23 @@ assert('multi-valued header merges into array') do
   assert_kind_of Array, cookies
   assert_equal 2, cookies.length
 end
+
+assert('top-level calls reuse the shared session') do
+  before = URL.shared
+  r = URL.get("#{$base}/echo")
+  assert_true r.success?
+  assert_true URL.shared.equal?(before)   # same session object, pool reused
+end
+
+assert('URL.get inside a callback transparently uses a fresh session') do
+  nested = nil
+  outer = URL.get("#{$base}/big/1024") do |_chunk|
+    # We're inside the shared session's write callback: it can't drive a
+    # second transfer. The hybrid dispatch must hand this call a fresh one.
+    nested ||= URL.get("#{$base}/echo")
+  end
+  assert_equal '', outer.body                 # outer body was streamed away
+  assert_kind_of URL::Response, nested
+  assert_true nested.success?
+  assert_equal 'GET', nested.json['method']
+end
