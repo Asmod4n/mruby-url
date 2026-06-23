@@ -213,7 +213,16 @@ class URL
   DEFAULT_TIMEOUT_MS      = 30_000
   DEFAULT_FOLLOW_LOCATION = true
 
+  # The protocol schemes compiled into the embedded libcurl (lowercased), e.g.
+  # "http", "https", "smtp", "smtps". Published from C as a frozen Array.
+  PROTOS = URL::Libcurl::PROTOCOLS
+
   class << self
+    # True when the embedded libcurl was built with support for `proto`
+    # (case-insensitive), e.g. URL.supports?("smtps").
+    def supports?(proto)
+      PROTOS.include?(proto.to_s.downcase)
+    end
     # Set once at startup with a platform-driven EventLoop instance; the
     # verbs then attach new sessions to it and return immediately.
     def default_loop=(loop)
@@ -241,6 +250,98 @@ class URL
     def post(url, body = nil, **opts, &block);   _fire(:POST,    url, body, opts, &block); end
     def put(url, body = nil, **opts, &block);    _fire(:PUT,     url, body, opts, &block); end
     def patch(url, body = nil, **opts, &block);  _fire(:PATCH,   url, body, opts, &block); end
+
+    # ----------------------------------------------------------------------
+    #  RFC-verb dispatch (non-HTTP protocols)
+    #
+    #  Each method below is named after the protocol's RFC verb (lowercased)
+    #  and dispatches on the URL scheme to that protocol's implementation,
+    #  gated on URL.supports?(scheme). A scheme with no arm — or an arm whose
+    #  protocol libcurl wasn't built with — raises URL::Error before any
+    #  connection attempt. The arms themselves live in dispatch.rb; the verbs
+    #  here are the public surface.
+    # ----------------------------------------------------------------------
+
+    # send — submit/send a message. (Deliberately overrides Object#send; use
+    # URL.__send__ for reflection. SMTP submission has no single issuable RFC
+    # verb — curl runs MAIL/RCPT/DATA for us.) For smtp/smtps this is the
+    # mail-send path: `server_url` carries the scheme (e.g.
+    # "smtps://mail.example.com:465"); `body` is the full RFC822 message
+    # (positional); `from:`/`to:` are the envelope (to: a String or an Array).
+    # The body is streamed to libcurl's read callback, chunked in Ruby. Extra
+    # **opts (ssl_verify_peer:, userpwd:, timeout_ms:, …) pass straight through
+    # to setopt. Blocking, like the verbs: returns a URL::Response whose `code`
+    # is the final SMTP reply (e.g. 250).
+    def send(server_url, body, from:, to:, **opts)
+      case _scheme_of(server_url)
+      when "smtp", "smtps"
+        _require_protocol!(server_url)
+        session    = shared
+        session    = open if session._busy?
+        recipients = to.is_a?(Array) ? to : [to]
+        req, state = _build_mail_request(session, server_url, from, recipients, body, opts)
+        _drive_sync(session, server_url, req, state)
+      else
+        raise URL::Error, "send not available for #{_scheme_of(server_url)}"
+      end
+    end
+
+    # UID MOVE (RFC 6851) — move message `uid:` to mailbox `to:`. The source
+    # mailbox is the URL path (imaps://host/INBOX); the uid goes into the
+    # command, not the URL. Returns a URL::Response; raises URL::Error on a
+    # NO/BAD reply.
+    def move(url, uid:, to:, **opts)
+      case _scheme_of(url)
+      when "imap", "imaps"
+        _require_protocol!(url)
+        _imap(url, "UID MOVE #{uid} #{to}", opts)
+      else
+        raise URL::Error, "move not available for #{_scheme_of(url)}"
+      end
+    end
+
+    # UID STORE (RFC 3501 §6.4.6) — change flags on message `uid:`. `op:` is
+    # "+" (add, the default), "-" (remove) or "" (replace); `flags:` is the
+    # flag string, e.g. "\\Deleted". Returns a URL::Response; raises on failure.
+    def store(url, uid:, flags:, op: "+", **opts)
+      case _scheme_of(url)
+      when "imap", "imaps"
+        _require_protocol!(url)
+        _imap(url, "UID STORE #{uid} #{op}FLAGS (#{flags})", opts)
+      else
+        raise URL::Error, "store not available for #{_scheme_of(url)}"
+      end
+    end
+
+    # EXPUNGE (RFC 3501 §6.4.3) — permanently remove \Deleted-flagged messages
+    # from the mailbox in the URL path. Returns a URL::Response; raises on
+    # failure. Deleting a message is the documented two-step idiom:
+    # store(uid:, flags: "\\Deleted") then expunge(url).
+    def expunge(url, **opts)
+      case _scheme_of(url)
+      when "imap", "imaps"
+        _require_protocol!(url)
+        _imap(url, "EXPUNGE", opts)
+      else
+        raise URL::Error, "expunge not available for #{_scheme_of(url)}"
+      end
+    end
+
+    # UID FETCH (RFC 3501 §6.4.5) — fetch message `uid:` from the mailbox in
+    # the URL path. Implemented as a plain transfer against the IMAP URL with
+    # ";UID=<uid>" appended, so curl issues "UID FETCH <uid> BODY[]" itself and
+    # hands the message bytes to the write callback. The message is returned in
+    # the Response body, or streamed to `&block` if one is given. Raises on a
+    # NO/BAD reply.
+    def fetch(url, uid:, **opts, &block)
+      case _scheme_of(url)
+      when "imap", "imaps"
+        _require_protocol!(url)
+        _imap(url, nil, opts, ";UID=#{uid}", block)
+      else
+        raise URL::Error, "fetch not available for #{_scheme_of(url)}"
+      end
+    end
   end
 
   # Per-session event loop. Users only touch this for bring-your-own-loop

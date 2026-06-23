@@ -9,8 +9,8 @@ MRuby::Gem::Specification.new('mruby-url') do |spec|
   spec.add_dependency 'mruby-fast-json'
   spec.add_dependency 'mruby-c-ext-helpers'
   spec.add_dependency 'mruby-socket'
+  spec.add_dependency 'mruby-string-ext'   # String#byteslice for Ruby-side upload chunking
   spec.add_test_dependency 'mruby-env'
-  spec.add_test_dependency 'mruby-string-ext'
   spec.add_test_dependency 'mruby-sleep'
 
   if spec.for_windows?

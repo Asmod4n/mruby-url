@@ -37,10 +37,21 @@ class URL
       session = shared
       session = open if session._busy?
 
+      req, state = _build_request(session, method, url, body, opts, on_chunk)
+      _drive_sync(session, url, req, state)
+    end
+
+    # Verb-agnostic blocking drive shared by the HTTP verbs, URL.data and the
+    # IMAP verbs.
+    # Attaches `req` to `session`'s reused IO.select loop, pumps it until the
+    # request completes, and wraps the outcome in a URL::Response. The caller
+    # supplies a fully configured Request and its TransferState; this only owns
+    # the add/run/remove lifecycle and the busy flag, so HTTP and SMTP share
+    # exactly the same hybrid shared/fresh-session machinery.
+    def _drive_sync(session, url, req, state)
       loop = session._sync_loop
       session.event_loop = loop
 
-      req, state = _build_request(session, method, url, body, opts, on_chunk)
       session.add(req)
       session._busy = true
 
@@ -115,26 +126,88 @@ class URL
       [req, state]
     end
 
-    # Pass option pairs through to libcurl. Most map straight to a CURLOPT_*;
-    # :netrc is the exception — we translate the friendly Ruby value to the
-    # CURL_NETRC_* level integer here so the C side stays a flat pass-through.
-    def _apply_opts(req, opts)
-      opts.each do |k, v|
-        v = _netrc_level(v) if k == :netrc
-        req.setopt(k, v)
+    # Build the URL::Request for an SMTP/SMTPS send. The envelope (MAIL FROM /
+    # RCPT TO) and the upload toggle go through the flat setopt primitives; the
+    # message body is streamed through the read callback, chunked entirely in
+    # Ruby (String#byteslice + a tracked offset), never relying on C to slice.
+    def _build_mail_request(session, server_url, from, recipients, body, opts)
+      opts[:timeout_ms] = DEFAULT_TIMEOUT_MS unless opts.key?(:timeout_ms)
+
+      url_str = _stringify_url(server_url, nil)
+      req     = URL::Request._open(session, url_str)
+
+      req.setopt(:upload, true)
+      req.setopt(:mail_from, from.to_s)
+      req.setopt(:mail_rcpt, recipients.map(&:to_s))
+      _apply_opts(req, opts)
+
+      payload = body.to_s
+      offset  = 0
+      req.on_read do |max|
+        if offset >= payload.bytesize
+          ""                              # EOF: tell libcurl the upload is done
+        else
+          chunk   = payload.byteslice(offset, max)
+          offset += chunk.bytesize
+          chunk
+        end
       end
+
+      state = URL::TransferState.new
+      req.on_data   { |chunk| state.append_body(chunk) }
+      req.on_header { |line|  state.append_header(line) }
+
+      [req, state]
     end
 
-    # Map a :netrc option value to libcurl's CURL_NETRC_* level:
-    #   true / :optional -> 1 (use .netrc, fall back to the request),
-    #   :required        -> 2 (use .netrc only),
-    #   anything else    -> 0 (ignore .netrc).
-    def _netrc_level(v)
-      case v
-      when true, :optional then 1
-      when :required       then 2
-      else                      0
+    # Build a URL::Request for an IMAP/IMAPS command. The mailbox is the URL
+    # path (imaps://host/INBOX); `command`, when given, is handed to libcurl as
+    # CURLOPT_CUSTOMREQUEST and runs after curl's own LOGIN/SELECT — exactly the
+    # `curl -X '<command>'` flow. `url_suffix` lets a verb append IMAP URL parts
+    # (e.g. ";UID=<n>") so a plain transfer fetches a message via the write
+    # callback. on_chunk, when supplied, streams the body instead of buffering.
+    def _build_imap_request(session, mailbox_url, command, opts, url_suffix = nil, on_chunk = nil)
+      opts[:timeout_ms] = DEFAULT_TIMEOUT_MS unless opts.key?(:timeout_ms)
+
+      url_str = _stringify_url(mailbox_url, nil)
+      url_str = "#{url_str}#{url_suffix}" if url_suffix
+      req     = URL::Request._open(session, url_str)
+
+      req.setopt(:custom_request, command) if command
+      _apply_opts(req, opts)
+
+      state = URL::TransferState.new
+      if on_chunk
+        req.on_data { |chunk| on_chunk.call(chunk) }
+      else
+        req.on_data { |chunk| state.append_body(chunk) }
       end
+      req.on_header { |line| state.append_header(line) }
+
+      [req, state]
+    end
+
+    # Drive an IMAP command to completion and return its URL::Response. IMAP
+    # success is CURLE_OK; a NO/BAD tagged reply surfaces as a non-zero
+    # error_code (e.g. CURLE_QUOTE_ERROR), which we turn into a clear
+    # URL::Error so callers get an unambiguous result rather than a silent
+    # empty response.
+    def _drive_imap(session, mailbox_url, req, state)
+      resp = _drive_sync(session, mailbox_url, req, state)
+      if resp.error_code != 0
+        raise URL::Error, "IMAP command failed: #{resp.error_message}"
+      end
+      resp
+    end
+
+    # Shared front of an IMAP verb: pick the shared session (or a fresh one when
+    # re-entrant), build the request, drive it. Centralises the session choice
+    # so each verb arm is a one-liner that just names its IMAP command.
+    def _imap(mailbox_url, command, opts, url_suffix = nil, on_chunk = nil)
+      session = shared
+      session = open if session._busy?
+      req, state = _build_imap_request(session, mailbox_url, command, opts, url_suffix, on_chunk)
+      _drive_imap(session, mailbox_url, req, state)
     end
 
     def _response_from(url, req, state)
@@ -148,6 +221,28 @@ class URL
         content_type:  req.content_type,
         error_code:    state.error_code,
       )
+    end
+
+    # Guard that the embedded libcurl was built with the URL's scheme. Called by
+    # the RFC-verb arms after they've matched a scheme they implement, so an
+    # unbuilt protocol (e.g. imaps on a libcurl without it) raises a clear error
+    # before any connection attempt.
+    def _require_protocol!(url)
+      scheme = _scheme_of(url)
+      return if supports?(scheme)
+      raise URL::Error, "protocol not available: #{scheme}"
+    end
+
+    # Lowercased scheme of a URL given as a String or a URI-like object (one
+    # responding to #scheme). Used to gate the RFC verbs against the
+    # compiled-in protocol list.
+    def _scheme_of(url)
+      s = if url.respond_to?(:scheme)
+            url.scheme
+          else
+            URI.parse(url.to_s).scheme
+          end
+      s.to_s.downcase
     end
 
     def _stringify_url(url, params = nil)
@@ -175,6 +270,25 @@ class URL
         end
       end
       pairs.join("&")
+    end
+
+    # Apply user-supplied curl options to the request. Only :netrc needs
+    # massaging — its friendly value is mapped to libcurl's enum here so the C
+    # setopt stays a flat int pass-through; everything else is verbatim.
+    def _apply_opts(req, opts)
+      opts.each do |k, v|
+        v = _netrc_level(v) if k == :netrc
+        req.setopt(k, v)
+      end
+    end
+
+    # CURLOPT_NETRC enum: ignored(0) / optional(1) / required(2).
+    def _netrc_level(v)
+      case v
+      when true, :optional then 1
+      when :required       then 2
+      else                      0   # false / nil / anything else => ignored
+      end
     end
   end
 
