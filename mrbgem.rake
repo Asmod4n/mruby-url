@@ -80,6 +80,12 @@ MRuby::Gem::Specification.new('mruby-url') do |spec|
         spec.linker.libraries     << 'libcurl'
         spec.cc.defines           << 'CURL_STATICLIB'
 
+        # mrb_url.c includes C11 <threads.h> (call_once). MSVC only exposes it
+        # — and recognizes the _Noreturn it declares thrd_exit with — under
+        # /std:c11; other Windows compilers take -std=c11. Without it the build
+        # fails with C2054/C2085 on _Noreturn.
+        spec.cc.flags << (is_msvc ? '/std:c11' : '-std=c11')
+
         spec.linker.libraries.concat %w[
           ws2_32 crypt32 wldap32 normaliz advapi32 iphlpapi secur32 bcrypt
         ]
