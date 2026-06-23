@@ -121,3 +121,9 @@ assert('URL.get inside a callback transparently uses a fresh session') do
   assert_true nested.success?
   assert_equal 'GET', nested.json['method']
 end
+
+assert('netrc options pass through; optional + missing file falls back') do
+  r = URL.get("#{$base}/echo", netrc: true, netrc_file: "/nonexistent-netrc-xyz")
+  assert_true r.success?
+  assert_equal 'GET', r.json['method']
+end

@@ -342,6 +342,8 @@ murl_lc_easy_setopt(mrb_state* mrb, mrb_value mod)
   else if (opt == MRB_SYM(cainfo))             rc = curl_easy_setopt(h, CURLOPT_CAINFO, mrb_string_cstr(mrb, val));
   else if (opt == MRB_SYM(accept_encoding))    rc = curl_easy_setopt(h, CURLOPT_ACCEPT_ENCODING, mrb_string_cstr(mrb, val));
   else if (opt == MRB_SYM(userpwd))            rc = curl_easy_setopt(h, CURLOPT_USERPWD, mrb_string_cstr(mrb, val));
+  else if (opt == MRB_SYM(netrc))              rc = curl_easy_setopt(h, CURLOPT_NETRC, (long)mrb_as_int(mrb, val));
+  else if (opt == MRB_SYM(netrc_file))         rc = curl_easy_setopt(h, CURLOPT_NETRC_FILE, mrb_string_cstr(mrb, val));
   else if (opt == MRB_SYM(proxy))              rc = curl_easy_setopt(h, CURLOPT_PROXY, mrb_string_cstr(mrb, val));
   else if (opt == MRB_SYM(cookiefile))         rc = curl_easy_setopt(h, CURLOPT_COOKIEFILE, mrb_string_cstr(mrb, val));
   else if (opt == MRB_SYM(cookiejar))          rc = curl_easy_setopt(h, CURLOPT_COOKIEJAR, mrb_string_cstr(mrb, val));

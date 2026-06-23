@@ -95,7 +95,7 @@ class URL
       end
 
       req.setopt(:post_fields, body) if body
-      opts.each { |k, v| req.setopt(k, v) }
+      _apply_opts(req, opts)
 
       merged = auto_hdrs
       if user_hdrs
@@ -113,6 +113,28 @@ class URL
       req.on_header { |line| state.append_header(line) }
 
       [req, state]
+    end
+
+    # Pass option pairs through to libcurl. Most map straight to a CURLOPT_*;
+    # :netrc is the exception — we translate the friendly Ruby value to the
+    # CURL_NETRC_* level integer here so the C side stays a flat pass-through.
+    def _apply_opts(req, opts)
+      opts.each do |k, v|
+        v = _netrc_level(v) if k == :netrc
+        req.setopt(k, v)
+      end
+    end
+
+    # Map a :netrc option value to libcurl's CURL_NETRC_* level:
+    #   true / :optional -> 1 (use .netrc, fall back to the request),
+    #   :required        -> 2 (use .netrc only),
+    #   anything else    -> 0 (ignore .netrc).
+    def _netrc_level(v)
+      case v
+      when true, :optional then 1
+      when :required       then 2
+      else                      0
+      end
     end
 
     def _response_from(url, req, state)
