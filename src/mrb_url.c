@@ -50,6 +50,7 @@ typedef struct murl_easy_t {
   mrb_value          self;
   CURL*              curl;
   struct curl_slist* req_headers;
+  struct curl_slist* mail_rcpt;
 } murl_easy_t;
 
 static void
@@ -59,6 +60,7 @@ murl_easy_free(mrb_state* mrb, void* p)
   murl_easy_t* e = (murl_easy_t*)p;
   if (e->curl)        curl_easy_cleanup(e->curl);
   if (e->req_headers) curl_slist_free_all(e->req_headers);
+  if (e->mail_rcpt)   curl_slist_free_all(e->mail_rcpt);
   mrb_free(mrb, e);
 }
 
@@ -302,6 +304,7 @@ murl_lc_easy_init(mrb_state* mrb, mrb_value mod)
   e->self           = self;
   e->curl           = NULL;
   e->req_headers    = NULL;
+  e->mail_rcpt      = NULL;
 
   CURL* h = curl_easy_init();
   if (unlikely(!h)) mrb_raise(mrb, E_RUNTIME_ERROR, "curl_easy_init failed");
@@ -342,8 +345,6 @@ murl_lc_easy_setopt(mrb_state* mrb, mrb_value mod)
   else if (opt == MRB_SYM(cainfo))             rc = curl_easy_setopt(h, CURLOPT_CAINFO, mrb_string_cstr(mrb, val));
   else if (opt == MRB_SYM(accept_encoding))    rc = curl_easy_setopt(h, CURLOPT_ACCEPT_ENCODING, mrb_string_cstr(mrb, val));
   else if (opt == MRB_SYM(userpwd))            rc = curl_easy_setopt(h, CURLOPT_USERPWD, mrb_string_cstr(mrb, val));
-  else if (opt == MRB_SYM(netrc))              rc = curl_easy_setopt(h, CURLOPT_NETRC, (long)mrb_as_int(mrb, val));
-  else if (opt == MRB_SYM(netrc_file))         rc = curl_easy_setopt(h, CURLOPT_NETRC_FILE, mrb_string_cstr(mrb, val));
   else if (opt == MRB_SYM(proxy))              rc = curl_easy_setopt(h, CURLOPT_PROXY, mrb_string_cstr(mrb, val));
   else if (opt == MRB_SYM(cookiefile))         rc = curl_easy_setopt(h, CURLOPT_COOKIEFILE, mrb_string_cstr(mrb, val));
   else if (opt == MRB_SYM(cookiejar))          rc = curl_easy_setopt(h, CURLOPT_COOKIEJAR, mrb_string_cstr(mrb, val));
@@ -356,6 +357,10 @@ murl_lc_easy_setopt(mrb_state* mrb, mrb_value mod)
   else if (opt == MRB_SYM(ssl_verify_host))    rc = curl_easy_setopt(h, CURLOPT_SSL_VERIFYHOST, mrb_bool(val) ? 2L : 0L);
   else if (opt == MRB_SYM(max_redirs))         rc = curl_easy_setopt(h, CURLOPT_MAXREDIRS, (long)mrb_as_int(mrb, val));
   else if (opt == MRB_SYM(nobody))             rc = curl_easy_setopt(h, CURLOPT_NOBODY, (long)mrb_bool(val));
+  else if (opt == MRB_SYM(upload))             rc = curl_easy_setopt(h, CURLOPT_UPLOAD, (long)mrb_bool(val));
+  else if (opt == MRB_SYM(mail_from))          rc = curl_easy_setopt(h, CURLOPT_MAIL_FROM, mrb_string_cstr(mrb, val));
+  else if (opt == MRB_SYM(netrc))              rc = curl_easy_setopt(h, CURLOPT_NETRC, (long)mrb_as_int(mrb, val));
+  else if (opt == MRB_SYM(netrc_file))         rc = curl_easy_setopt(h, CURLOPT_NETRC_FILE, mrb_string_cstr(mrb, val));
   else if (opt == MRB_SYM(post_fields)) {
     mrb_value s = mrb_str_to_str(mrb, val);
     curl_easy_setopt(h, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)RSTRING_LEN(s));
@@ -378,6 +383,24 @@ murl_lc_easy_setopt(mrb_state* mrb, mrb_value mod)
       e->req_headers = next;
     }
     rc = curl_easy_setopt(h, CURLOPT_HTTPHEADER, e->req_headers);
+  }
+  else if (opt == MRB_SYM(mail_rcpt)) {
+    /* Accept a Ruby Array of recipient strings; build the slist here and free
+     * any previous one. The decision of which recipients stays in Ruby. */
+    mrb_value arr = mrb_ensure_array_type(mrb, val);
+    if (e->mail_rcpt) {
+      curl_slist_free_all(e->mail_rcpt);
+      e->mail_rcpt = NULL;
+    }
+    mrb_int n = RARRAY_LEN(arr);
+    for (mrb_int i = 0; i < n; i++) {
+      mrb_value addr = mrb_ary_ref(mrb, arr, i);
+      struct curl_slist* next =
+        curl_slist_append(e->mail_rcpt, mrb_string_cstr(mrb, addr));
+      if (unlikely(!next)) mrb_raise(mrb, E_RUNTIME_ERROR, "curl_slist_append failed");
+      e->mail_rcpt = next;
+    }
+    rc = curl_easy_setopt(h, CURLOPT_MAIL_RCPT, e->mail_rcpt);
   }
   else {
     mrb_raisef(mrb, E_ARGUMENT_ERROR, "unsupported option: :%n", opt);
@@ -703,6 +726,26 @@ mrb_mruby_url_gem_init(mrb_state* mrb)
   mrb_define_module_function_id(mrb, lc, MRB_SYM(multi_strerror),      murl_lc_multi_strerror,      MRB_ARGS_REQ(1));
 
   mrb_define_const_id(mrb, lc, MRB_SYM(SOCKET_TIMEOUT), mrb_convert_int(mrb, CURL_SOCKET_TIMEOUT));
+
+  /* Publish the compiled-in protocol list as URL::Libcurl::PROTOCOLS, a frozen
+   * Array of lowercased Strings. Pure marshalling of curl_version_info()'s
+   * NULL-terminated ->protocols array; the dispatch that consumes it is Ruby. */
+  {
+    curl_version_info_data* vi = curl_version_info(CURLVERSION_NOW);
+    mrb_value protos = mrb_ary_new(mrb);
+    if (vi && vi->protocols) {
+      for (const char* const* p = vi->protocols; *p != NULL; p++) {
+        mrb_value s = mrb_str_new_cstr(mrb, *p);
+        char* buf = RSTRING_PTR(s);
+        mrb_int len = RSTRING_LEN(s);
+        for (mrb_int i = 0; i < len; i++) {
+          if (buf[i] >= 'A' && buf[i] <= 'Z') buf[i] = (char)(buf[i] - 'A' + 'a');
+        }
+        mrb_ary_push(mrb, protos, mrb_obj_freeze(mrb, s));
+      }
+    }
+    mrb_define_const_id(mrb, lc, MRB_SYM(PROTOCOLS), mrb_obj_freeze(mrb, protos));
+  }
 
   struct RClass* easy_cls =
     mrb_define_class_under_id(mrb, lc, MRB_SYM(Easy), mrb->object_class);
