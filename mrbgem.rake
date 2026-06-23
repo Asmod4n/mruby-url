@@ -89,5 +89,10 @@ MRuby::Gem::Specification.new('mruby-url') do |spec|
     # manager or Homebrew, and many other things on the box already depend
     # on it. Look it up via pkg-config rather than vendoring.
     spec.search_package 'libcurl'
+
+    # C11 call_once (gem_init) lives in libpthread on glibc < 2.34; -pthread
+    # pulls it in there and is a harmless no-op on modern glibc and macOS.
+    spec.cc.flags     << '-pthread'
+    spec.linker.flags << '-pthread'
   end
 end
