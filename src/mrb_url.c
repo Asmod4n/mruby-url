@@ -36,6 +36,7 @@
 #include <curl/curl.h>
 #include <stddef.h>
 #include <stdlib.h>
+#include <threads.h>
 
 /* =========================================================================
  * URL::Libcurl::Easy  (CDATA = murl_easy_t, wraps CURL*)
@@ -701,10 +702,31 @@ murl_lc_multi_strerror(mrb_state* mrb, mrb_value mod)
  * Gem entry points
  * ========================================================================= */
 
+/* libcurl's global init/cleanup are process-global, not per-mrb_state, and are
+ * not safe to churn. curl_global_init brings up the TLS backend and (on
+ * Windows) Winsock, which must come up once before any other thread runs and be
+ * torn down once after every handle is gone. Tying them to gem_init / gem_final
+ * would re-run them for every VM: a race when VMs are created on multiple
+ * threads, and worse, one VM's gem_final could pull the TLS/Winsock layer out
+ * from under a transfer still live in another VM.
+ *
+ * So we init exactly once via C11 call_once (race-free even across concurrently
+ * created mrb_states) and defer the matching cleanup to atexit, which runs once
+ * after all VMs are gone. Per-mrb_state handle teardown still happens in
+ * gem_final below. */
+static once_flag murl_global_once = ONCE_FLAG_INIT;
+
+static void
+murl_global_init(void)
+{
+  curl_global_init(CURL_GLOBAL_DEFAULT);
+  atexit(curl_global_cleanup);
+}
+
 void
 mrb_mruby_url_gem_init(mrb_state* mrb)
 {
-  curl_global_init(CURL_GLOBAL_DEFAULT);
+  call_once(&murl_global_once, murl_global_init);
 
   struct RClass* url_cls = mrb_define_class_id(mrb, MRB_SYM(URL), mrb->object_class);
 
@@ -824,5 +846,7 @@ mrb_mruby_url_gem_final(mrb_state* mrb)
 {
   mrb_objspace_each_objects(mrb, murl_disarm_callbacks, NULL);
   mrb_objspace_each_objects(mrb, murl_cleanup_curl,     NULL);
-  curl_global_cleanup();
+  /* curl_global_cleanup is process-global; it runs once at atexit (see
+   * murl_global_init), not per-mrb_state, so a dying VM never tears down the
+   * TLS/Winsock layer while another VM's transfer is still live. */
 }
