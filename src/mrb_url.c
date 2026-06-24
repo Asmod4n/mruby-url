@@ -168,7 +168,7 @@ murl_dispatch_str_cb(murl_easy_t* e, mrb_sym ivsym, const char* ptr, size_t tota
   mrb_value  cb  = mrb_iv_get(mrb, e->self, ivsym);
   if (!mrb_proc_p(cb)) return total;
 
-  mrb_int ai = mrb_gc_arena_save(mrb);
+  int ai = mrb_gc_arena_save(mrb);
   cb_str_args a = { cb, ptr, total };
   mrb_bool err = FALSE;
   mrb_value ret = mrb_protect_error(mrb, call_with_str_body, &a, &err);
@@ -177,7 +177,6 @@ murl_dispatch_str_cb(murl_easy_t* e, mrb_sym ivsym, const char* ptr, size_t tota
   if (unlikely(err)) {
     if (mrb->exc == NULL) {
       mrb->exc = mrb_obj_ptr(ret);
-      mrb_gc_protect(mrb, ret);
     }
     return 0;
   }
@@ -228,7 +227,7 @@ murl_read_cb(char* buffer, size_t size, size_t nitems, void* userdata)
   mrb_value cb = mrb_iv_get(mrb, e->self, MRB_IVSYM(on_read));
   if (!mrb_proc_p(cb)) return 0;  /* nothing to send */
 
-  mrb_int ai = mrb_gc_arena_save(mrb);
+  int ai = mrb_gc_arena_save(mrb);
   cb_read_args a = { cb, max };
   mrb_bool err = FALSE;
   mrb_value ret = mrb_protect_error(mrb, call_read_body, &a, &err);
@@ -236,7 +235,6 @@ murl_read_cb(char* buffer, size_t size, size_t nitems, void* userdata)
   if (unlikely(err)) {
     if (mrb->exc == NULL) {
       mrb->exc = mrb_obj_ptr(ret);
-      mrb_gc_protect(mrb, ret);
     }
     mrb_gc_arena_restore(mrb, ai);
     return CURL_READFUNC_ABORT;
