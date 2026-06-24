@@ -107,7 +107,7 @@ murl_multi_free(mrb_state* mrb, void* p)
   if (unlikely(!p)) return;
   murl_multi_t* m = (murl_multi_t*)p;
   if (m->multi) curl_multi_cleanup(m->multi);
-  free(m->sock_ev);
+  mrb_free(mrb, m->sock_ev);
   mrb_free(mrb, m);
 }
 
@@ -166,7 +166,7 @@ murl_dispatch_str_cb(murl_easy_t* e, mrb_sym ivsym, const char* ptr, size_t tota
 {
   mrb_state* mrb = e->mrb;
   mrb_value  cb  = mrb_iv_get(mrb, e->self, ivsym);
-  if (mrb_nil_p(cb)) return total;
+  if (!mrb_proc_p(cb)) return total;
 
   mrb_int ai = mrb_gc_arena_save(mrb);
   cb_str_args a = { cb, ptr, total };
@@ -226,7 +226,7 @@ murl_read_cb(char* buffer, size_t size, size_t nitems, void* userdata)
   if (unlikely(max == 0)) return 0;
 
   mrb_value cb = mrb_iv_get(mrb, e->self, MRB_IVSYM(on_read));
-  if (mrb_nil_p(cb)) return 0;  /* nothing to send */
+  if (!mrb_proc_p(cb)) return 0;  /* nothing to send */
 
   mrb_int ai = mrb_gc_arena_save(mrb);
   cb_read_args a = { cb, max };
@@ -266,9 +266,9 @@ murl_socket_cb(CURL* easy, curl_socket_t fd, int what, void* userp, void* socket
   if (m->sock_ev_len == m->sock_ev_cap) {
     int new_cap = m->sock_ev_cap ? m->sock_ev_cap * 2 : 8;
     murl_socket_event* p =
-      (murl_socket_event*)realloc(m->sock_ev, (size_t)new_cap * sizeof(*p));
-    if (unlikely(!p)) return -1;  /* surfaced via curl_multi_socket_action's rc */
-    m->sock_ev     = p;
+      (murl_socket_event*)mrb_realloc_simple(m->mrb, m->sock_ev, (size_t)new_cap * sizeof(*p));
+    if (unlikely(!p)) return -1;   /* curl -> CURLM_ABORTED_BY_CALLBACK; no longjmp through libcurl */
+    m->sock_ev = p;
     m->sock_ev_cap = new_cap;
   }
 
