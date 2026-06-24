@@ -11,10 +11,10 @@
 **   - write / header / read callbacks on an Easy: thin trampolines that read a
 **     block off the Easy's ivars (@on_data/@on_header/@on_read), copy bytes,
 **     and invoke Ruby under mrb_protect_error.
-**   - socket / timer callbacks on a Multi: STORE-ONLY. They must do no mruby
-**     work, because they run inside curl_multi_socket_action; they just record
-**     into plain C buffers, which Ruby drains afterwards via multi_take_events
-**     / multi_take_timeout.
+**   - socket / timer callbacks on a Multi: thin trampolines too — they read a
+**     block off the Multi's ivars (@on_socket / @on_timer) and invoke Ruby under
+**     mrb_protect_error, returning -1 (CURLM_ABORTED_BY_CALLBACK) on a raise so
+**     nothing longjmps through libcurl.
 **
 ** CDATA handle types:
 **   URL::Libcurl::Easy   wraps CURL*   (GC -> curl_easy_cleanup)
@@ -80,25 +80,16 @@ murl_easy_get(mrb_state* mrb, mrb_value self)
 /* =========================================================================
  * URL::Libcurl::Multi  (CDATA = murl_multi_t, wraps CURLM*)
  *
- * Socket changes are recorded by murl_socket_cb (store-only, no mruby) and
- * drained by multi_take_events. The timer is recorded by murl_timer_cb and
- * drained by multi_take_timeout. Plain C only inside libcurl: no GC, no
- * longjmp through libcurl.
+ * murl_socket_cb / murl_timer_cb are thin trampolines to Ruby blocks stored on
+ * the Multi (@on_socket / @on_timer), invoked under mrb_protect_error so a raise
+ * becomes a -1 return (CURLM_ABORTED_BY_CALLBACK) instead of a longjmp through
+ * libcurl.
  * ========================================================================= */
 
-typedef struct murl_socket_event {
-  curl_socket_t fd;
-  int           what;
-} murl_socket_event;
-
 typedef struct murl_multi_t {
-  mrb_state*         mrb;
-  mrb_value          self;
-  CURLM*             multi;
-  long               pending_timeout_ms;  /* -2 = unset, else libcurl's value */
-  murl_socket_event* sock_ev;
-  int                sock_ev_len;
-  int                sock_ev_cap;
+  mrb_state* mrb;
+  mrb_value  self;
+  CURLM*     multi;
 } murl_multi_t;
 
 static void
@@ -107,7 +98,6 @@ murl_multi_free(mrb_state* mrb, void* p)
   if (unlikely(!p)) return;
   murl_multi_t* m = (murl_multi_t*)p;
   if (m->multi) curl_multi_cleanup(m->multi);
-  mrb_free(mrb, m->sock_ev);
   mrb_free(mrb, m);
 }
 
@@ -251,37 +241,89 @@ murl_read_cb(char* buffer, size_t size, size_t nitems, void* userdata)
 }
 
 /* =========================================================================
- * Store-only socket / timer callbacks (run inside curl_multi_socket_action)
+ * socket / timer callbacks (run inside curl_multi_socket_action): thin
+ * trampolines to the Multi's @on_socket / @on_timer Ruby blocks, invoked under
+ * mrb_protect_error. A raise is stashed and turned into a -1 return
+ * (CURLM_ABORTED_BY_CALLBACK), so nothing longjmps through libcurl.
  * ========================================================================= */
+
+typedef struct cb_socket_args {
+  mrb_value cb;
+  mrb_int   fd;
+  mrb_sym   what;
+} cb_socket_args;
+
+static mrb_value
+call_socket_body(mrb_state* mrb, void* data)
+{
+  cb_socket_args* a = (cb_socket_args*)data;
+  mrb_value argv[2] = { mrb_int_value(mrb, a->fd), mrb_symbol_value(a->what) };
+  return mrb_yield_argv(mrb, a->cb, 2, argv);
+}
 
 static int
 murl_socket_cb(CURL* easy, curl_socket_t fd, int what, void* userp, void* socketp)
 {
   (void)easy;
   (void)socketp;
-  murl_multi_t* m = (murl_multi_t*)userp;
+  murl_multi_t* m   = (murl_multi_t*)userp;
+  mrb_state*    mrb = m->mrb;
+  mrb_value     cb  = mrb_iv_get(mrb, m->self, MRB_IVSYM(on_socket));
+  if (!mrb_proc_p(cb)) return 0;
 
-  if (m->sock_ev_len == m->sock_ev_cap) {
-    int new_cap = m->sock_ev_cap ? m->sock_ev_cap * 2 : 8;
-    murl_socket_event* p =
-      (murl_socket_event*)mrb_realloc_simple(m->mrb, m->sock_ev, (size_t)new_cap * sizeof(*p));
-    if (unlikely(!p)) return -1;   /* curl -> CURLM_ABORTED_BY_CALLBACK; no longjmp through libcurl */
-    m->sock_ev = p;
-    m->sock_ev_cap = new_cap;
+  mrb_sym wsym;
+  switch (what) {
+  case CURL_POLL_IN:     wsym = MRB_SYM(in);     break;
+  case CURL_POLL_OUT:    wsym = MRB_SYM(out);    break;
+  case CURL_POLL_INOUT:  wsym = MRB_SYM(inout);  break;
+  case CURL_POLL_REMOVE: wsym = MRB_SYM(remove); break;
+  default: return 0;
   }
 
-  m->sock_ev[m->sock_ev_len].fd   = fd;
-  m->sock_ev[m->sock_ev_len].what = what;
-  m->sock_ev_len++;
+  int ai = mrb_gc_arena_save(mrb);
+  cb_socket_args a = { cb, (mrb_int)fd, wsym };
+  mrb_bool err = FALSE;
+  mrb_value ret = mrb_protect_error(mrb, call_socket_body, &a, &err);
+  mrb_gc_arena_restore(mrb, ai);
+
+  if (unlikely(err)) {
+    if (mrb->exc == NULL) mrb->exc = mrb_obj_ptr(ret);
+    return -1;
+  }
   return 0;
+}
+
+typedef struct cb_timer_args {
+  mrb_value cb;
+  mrb_int   ms;
+} cb_timer_args;
+
+static mrb_value
+call_timer_body(mrb_state* mrb, void* data)
+{
+  cb_timer_args* a = (cb_timer_args*)data;
+  return mrb_yield(mrb, a->cb, mrb_int_value(mrb, a->ms));
 }
 
 static int
 murl_timer_cb(CURLM* multi, long timeout_ms, void* userp)
 {
   (void)multi;
-  murl_multi_t* m = (murl_multi_t*)userp;
-  m->pending_timeout_ms = timeout_ms;
+  murl_multi_t* m   = (murl_multi_t*)userp;
+  mrb_state*    mrb = m->mrb;
+  mrb_value     cb  = mrb_iv_get(mrb, m->self, MRB_IVSYM(on_timer));
+  if (!mrb_proc_p(cb)) return 0;
+
+  int ai = mrb_gc_arena_save(mrb);
+  cb_timer_args a = { cb, (mrb_int)timeout_ms };
+  mrb_bool err = FALSE;
+  mrb_value ret = mrb_protect_error(mrb, call_timer_body, &a, &err);
+  mrb_gc_arena_restore(mrb, ai);
+
+  if (unlikely(err)) {
+    if (mrb->exc == NULL) mrb->exc = mrb_obj_ptr(ret);
+    return -1;
+  }
   return 0;
 }
 
@@ -480,10 +522,6 @@ murl_lc_multi_init(mrb_state* mrb, mrb_value mod)
   m->mrb                  = mrb;
   m->self                 = self;
   m->multi                = NULL;
-  m->pending_timeout_ms   = -2;
-  m->sock_ev              = NULL;
-  m->sock_ev_len          = 0;
-  m->sock_ev_cap          = 0;
 
   CURLM* h = curl_multi_init();
   if (unlikely(!h)) mrb_raise(mrb, E_RUNTIME_ERROR, "curl_multi_init failed");
@@ -628,61 +666,6 @@ murl_lc_multi_info_read(mrb_state* mrb, mrb_value mod)
 }
 
 /* =========================================================================
- * multi_take_events(multi) -> [[fd_int, :in|:out|:inout|:remove], ...]
- *   Drain + clear the store-only socket-event buffer.
- * ========================================================================= */
-
-static mrb_value
-murl_lc_multi_take_events(mrb_state* mrb, mrb_value mod)
-{
-  (void)mod;
-  mrb_value multi_obj;
-  mrb_get_args(mrb, "o", &multi_obj);
-
-  murl_multi_t* m = murl_multi_get(mrb, multi_obj);
-
-  int n = m->sock_ev_len;
-  m->sock_ev_len = 0;
-
-  mrb_value arr = mrb_ary_new_capa(mrb, n);
-  for (int i = 0; i < n; i++) {
-    mrb_sym sym;
-    switch (m->sock_ev[i].what) {
-    case CURL_POLL_IN:     sym = MRB_SYM(in);     break;
-    case CURL_POLL_OUT:    sym = MRB_SYM(out);    break;
-    case CURL_POLL_INOUT:  sym = MRB_SYM(inout);  break;
-    case CURL_POLL_REMOVE: sym = MRB_SYM(remove); break;
-    default: continue;
-    }
-    mrb_value pair = mrb_ary_new_capa(mrb, 2);
-    mrb_ary_push(mrb, pair, mrb_int_value(mrb, (mrb_int)m->sock_ev[i].fd));
-    mrb_ary_push(mrb, pair, mrb_symbol_value(sym));
-    mrb_ary_push(mrb, arr, pair);
-  }
-  return arr;
-}
-
-/* =========================================================================
- * multi_take_timeout(multi) -> ms_int | nil
- *   Take + clear the store-only pending timeout.
- * ========================================================================= */
-
-static mrb_value
-murl_lc_multi_take_timeout(mrb_state* mrb, mrb_value mod)
-{
-  (void)mod;
-  mrb_value multi_obj;
-  mrb_get_args(mrb, "o", &multi_obj);
-
-  murl_multi_t* m = murl_multi_get(mrb, multi_obj);
-
-  long ms = m->pending_timeout_ms;
-  m->pending_timeout_ms = -2;
-  if (ms == -2) return mrb_nil_value();
-  return mrb_convert_long(mrb, ms);
-}
-
-/* =========================================================================
  * multi_strerror(int) -> str
  * ========================================================================= */
 
@@ -741,8 +724,6 @@ mrb_mruby_url_gem_init(mrb_state* mrb)
   mrb_define_module_function_id(mrb, lc, MRB_SYM(multi_remove),        murl_lc_multi_remove,        MRB_ARGS_REQ(2));
   mrb_define_module_function_id(mrb, lc, MRB_SYM(multi_socket_action), murl_lc_multi_socket_action, MRB_ARGS_ARG(1, 2));
   mrb_define_module_function_id(mrb, lc, MRB_SYM(multi_info_read),     murl_lc_multi_info_read,     MRB_ARGS_REQ(1));
-  mrb_define_module_function_id(mrb, lc, MRB_SYM(multi_take_events),   murl_lc_multi_take_events,   MRB_ARGS_REQ(1));
-  mrb_define_module_function_id(mrb, lc, MRB_SYM(multi_take_timeout),  murl_lc_multi_take_timeout,  MRB_ARGS_REQ(1));
   mrb_define_module_function_id(mrb, lc, MRB_SYM(multi_strerror),      murl_lc_multi_strerror,      MRB_ARGS_REQ(1));
 
   mrb_define_const_id(mrb, lc, MRB_SYM(SOCKET_TIMEOUT), mrb_convert_int(mrb, CURL_SOCKET_TIMEOUT));

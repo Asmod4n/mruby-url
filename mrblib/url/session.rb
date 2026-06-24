@@ -9,6 +9,12 @@
 # Libcurl primitives (multi_init/multi_add/multi_socket_action/…); the
 # orchestration below is all Ruby.
 
+# The Multi handle carries libcurl's socket/timer callbacks as Ruby blocks; the
+# C trampolines read @on_socket / @on_timer off it (mirrors Easy#on_data).
+class URL::Libcurl::Multi
+  attr_writer :on_socket, :on_timer
+end
+
 class URL
   # Allocate a session wrapping a fresh CURLM. The multi handle's GC frees the
   # underlying CURLM*; its socket/timer callbacks are wired by multi_init.
@@ -21,11 +27,23 @@ class URL
   end
 
   def initialize
-    @multi         = URL::Libcurl.multi_init
-    @handles       = {}        # request.object_id => URL::Request (keeps it alive)
-    @by_easy       = {}        # easy.object_id    => URL::Request (info_read map)
-    @event_loop    = nil
-    @_timer_handle = nil
+    @multi           = URL::Libcurl.multi_init
+    @handles         = {}        # request.object_id => URL::Request (keeps it alive)
+    @by_easy         = {}        # easy.object_id    => URL::Request (info_read map)
+    @event_loop      = nil
+    @_timer_handle   = nil
+    @pending_timeout = nil
+
+    # libcurl's socket/timer callbacks call straight back into these blocks (run
+    # under mrb_protect_error in C). on_socket replays each fd change to the
+    # event loop; on_timer records the timeout that socket_action's drain loop
+    # and _flush_pending_timer consume — no C-side buffering.
+    @multi.on_socket = lambda do |fd, what|
+      _socket_ready(fd, what) if @event_loop
+    end
+    @multi.on_timer = lambda do |ms|
+      @pending_timeout = ms
+    end
 
     # The proc an event loop invokes when a watched fd becomes ready: drive the
     # transfer, reap completions, drop them from the multi. Mirrors the old C
@@ -77,17 +95,21 @@ class URL
   def socket_action(fd = URL::Libcurl::SOCKET_TIMEOUT, ev = nil)
     fd = fd.fileno if fd.respond_to?(:fileno)
 
+    # on_socket fires _socket_ready during the call; on_timer records the new
+    # timeout into @pending_timeout. libcurl can ask to be re-driven immediately
+    # by reporting a 0ms timeout, so drain that here before arming the timer.
+    @pending_timeout = nil
     running = URL::Libcurl.multi_socket_action(@multi, fd, ev)
-    timeout = URL::Libcurl.multi_take_timeout(@multi)
+    timeout = @pending_timeout
 
     drain_limit = 64
     while timeout == 0 && drain_limit > 0
       drain_limit -= 1
+      @pending_timeout = nil
       running = URL::Libcurl.multi_socket_action(@multi, URL::Libcurl::SOCKET_TIMEOUT, nil)
-      timeout = URL::Libcurl.multi_take_timeout(@multi)
+      timeout = @pending_timeout
     end
 
-    _flush_pending_sockets
     _flush_pending_timer(timeout)
 
     running
@@ -130,19 +152,6 @@ class URL
     end
   end
   private :_reap_done
-
-  # Replay each recorded socket change to the event loop. URL#_socket_ready
-  # (socket_glue.rb) owns the fd -> IO map and calls watch/unwatch.
-  def _flush_pending_sockets
-    events = URL::Libcurl.multi_take_events(@multi)
-    return if events.empty?
-    return if @event_loop.nil?
-
-    events.each do |pair|
-      _socket_ready(pair[0], pair[1])
-    end
-  end
-  private :_flush_pending_sockets
 
   # Arm/cancel the event loop's timer from the timeout libcurl reported.
   #   nil  -> unset: leave any existing timer alone
