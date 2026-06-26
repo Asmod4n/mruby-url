@@ -38,10 +38,12 @@
 #     so the C extension raises mruby's preallocated NoMemoryError directly the
 #     moment libcurl reports it, before the code ever reaches Ruby.
 #
-# HTTP status is a separate axis from CURLcodes. A completed response — even 500 —
-# is CURLE_OK at the libcurl level, so `resp.error` is nil for it; you reach for
-# `resp.success?` / `resp.server_error?`, or `resp.raise_for_status!`, which
-# raises URL::HttpReturnedError (libcurl's own name for "HTTP returned >= 400").
+# An HTTP error status is surfaced as a value too, right alongside the CURLcodes:
+# when the transfer itself succeeded (CURLE_OK) but the HTTP status is >= 400,
+# resp.error holds a URL::HttpReturnedError — libcurl's own name for that case,
+# CURLE_HTTP_RETURNED_ERROR. Like every other error here it is a value, not a
+# raise; resp.raise_for_status! is the opt-in that raises whatever resp.error
+# holds.
 
 class URL
   # Base for everything this gem raises directly. Usage mistakes and the

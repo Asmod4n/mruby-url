@@ -99,31 +99,34 @@ class URL::Response
     json_lazy.into(target)
   end
 
-  # The transport outcome as a *value*: nil when libcurl carried the transfer to
-  # completion — even with an HTTP error status, which is the HTTP layer's
-  # concern (see #raise_for_status!) — or the exception object for libcurl's
-  # CURLcode otherwise (a URL::TransferError subclass, or a reused built-in such
-  # as SocketError for a DNS failure). Nothing is raised; you inspect it, or
-  # `raise resp.error` to cross into exception flow yourself. (Usage errors —
-  # unsupported scheme, bad args — still raise at the call.)
+  # The error as a *value*: nil on a clean success, otherwise an exception object
+  # you can inspect or raise yourself — nothing is raised for you. It is set for
+  # both kinds of failure:
+  #   * a transport/CURLcode failure (timeout, DNS, TLS, refused connection) — the
+  #     matching URL::TransferError subclass, or a reused built-in such as
+  #     SocketError for a DNS failure;
+  #   * an HTTP error status (>= 400) even though libcurl itself returned OK — a
+  #     URL::HttpReturnedError (libcurl's own CURLE_HTTP_RETURNED_ERROR meaning).
+  # Usage errors (unsupported scheme, bad args) still raise at the call.
   def error
-    return nil if @error_code == 0
-    @error ||= URL._transfer_error(self, @error_code, error_message)
+    return @error if @error
+    @error =
+      if @error_code != 0
+        URL._transfer_error(self, @error_code, error_message)
+      elsif @code && @code >= 400
+        URL::HttpReturnedError.new(
+          "HTTP #{@code} for #{@effective_url}",
+          response: self, curl_code: 22, curl_message: URL::Request.strerror(22)
+        )
+      end
   end
 
-  # Raise when the response is not a clean success: libcurl's transport error if
-  # the transfer itself failed, otherwise URL::HttpReturnedError for an HTTP
-  # status >= 400 (libcurl's own CURLE_HTTP_RETURNED_ERROR meaning). Returns self
-  # on success, so it chains: resp.raise_for_status!.json
+  # Cross into exception flow on demand: raise whatever #error holds (a transport
+  # failure or an HTTP status >= 400), or return self when the response is a clean
+  # success — so it chains: resp.raise_for_status!.json
   def raise_for_status!
-    if e = error
-      raise e
-    elsif @code && @code >= 400
-      raise URL::HttpReturnedError.new(
-        "HTTP #{@code} for #{@effective_url}",
-        response: self, curl_code: 22, curl_message: URL::Request.strerror(22)
-      )
-    end
+    e = error
+    raise e if e
     self
   end
 
