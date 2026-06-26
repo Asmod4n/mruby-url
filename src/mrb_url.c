@@ -203,7 +203,7 @@ static mrb_value
 call_read_body(mrb_state* mrb, void* data)
 {
   cb_read_args* a = (cb_read_args*)data;
-  return mrb_yield(mrb, a->cb, mrb_int_value(mrb, (mrb_int)a->max));
+  return mrb_yield(mrb, a->cb, mrb_convert_size_t(mrb, a->max));
 }
 
 static size_t
@@ -223,10 +223,10 @@ murl_read_cb(char* buffer, size_t size, size_t nitems, void* userdata)
   mrb_value ret = mrb_protect_error(mrb, call_read_body, &a, &err);
 
   if (unlikely(err)) {
+    mrb_gc_arena_restore(mrb, ai);
     if (mrb->exc == NULL) {
       mrb->exc = mrb_obj_ptr(ret);
     }
-    mrb_gc_arena_restore(mrb, ai);
     return CURL_READFUNC_ABORT;
   }
 
@@ -248,9 +248,9 @@ murl_read_cb(char* buffer, size_t size, size_t nitems, void* userdata)
  * ========================================================================= */
 
 typedef struct cb_socket_args {
-  mrb_value cb;
-  mrb_int   fd;
-  mrb_sym   what;
+  mrb_value     cb;
+  curl_socket_t fd;
+  mrb_sym       what;
 } cb_socket_args;
 
 static mrb_value
@@ -281,13 +281,15 @@ murl_socket_cb(CURL* easy, curl_socket_t fd, int what, void* userp, void* socket
   }
 
   int ai = mrb_gc_arena_save(mrb);
-  cb_socket_args a = { cb, (mrb_int)fd, wsym };
+  cb_socket_args a = { cb, fd, wsym };
   mrb_bool err = FALSE;
   mrb_value ret = mrb_protect_error(mrb, call_socket_body, &a, &err);
   mrb_gc_arena_restore(mrb, ai);
 
   if (unlikely(err)) {
-    if (mrb->exc == NULL) mrb->exc = mrb_obj_ptr(ret);
+    if (mrb->exc == NULL) {
+      mrb->exc = mrb_obj_ptr(ret);
+    }
     return -1;
   }
   return 0;
@@ -295,14 +297,14 @@ murl_socket_cb(CURL* easy, curl_socket_t fd, int what, void* userp, void* socket
 
 typedef struct cb_timer_args {
   mrb_value cb;
-  mrb_int   ms;
+  long      ms;
 } cb_timer_args;
 
 static mrb_value
 call_timer_body(mrb_state* mrb, void* data)
 {
   cb_timer_args* a = (cb_timer_args*)data;
-  return mrb_yield(mrb, a->cb, mrb_int_value(mrb, a->ms));
+  return mrb_yield(mrb, a->cb, mrb_convert_long(mrb, a->ms));
 }
 
 static int
@@ -315,13 +317,15 @@ murl_timer_cb(CURLM* multi, long timeout_ms, void* userp)
   if (!mrb_proc_p(cb)) return 0;
 
   int ai = mrb_gc_arena_save(mrb);
-  cb_timer_args a = { cb, (mrb_int)timeout_ms };
+  cb_timer_args a = { cb, timeout_ms };
   mrb_bool err = FALSE;
   mrb_value ret = mrb_protect_error(mrb, call_timer_body, &a, &err);
   mrb_gc_arena_restore(mrb, ai);
 
   if (unlikely(err)) {
-    if (mrb->exc == NULL) mrb->exc = mrb_obj_ptr(ret);
+    if (mrb->exc == NULL) {
+      mrb->exc = mrb_obj_ptr(ret);
+    }
     return -1;
   }
   return 0;
@@ -659,7 +663,7 @@ murl_lc_multi_info_read(mrb_state* mrb, mrb_value mod)
 
     mrb_value pair = mrb_ary_new_capa(mrb, 2);
     mrb_ary_push(mrb, pair, e->self);
-    mrb_ary_push(mrb, pair, mrb_int_value(mrb, (mrb_int)msg->data.result));
+    mrb_ary_push(mrb, pair, mrb_convert_int(mrb, msg->data.result));
     return pair;
   }
   return mrb_nil_value();
@@ -695,19 +699,19 @@ murl_lc_multi_strerror(mrb_state* mrb, mrb_value mod)
  * created mrb_states) and defer the matching cleanup to atexit, which runs once
  * after all VMs are gone. Per-mrb_state handle teardown still happens in
  * gem_final below. */
-static once_flag murl_global_once = ONCE_FLAG_INIT;
+static once_flag g_once = ONCE_FLAG_INIT;
+static mtx_t     g_lock;              /* mtx_t has NO static initializer in C11 */
+static unsigned  g_refs = 0;
 
-static void
-murl_global_init(void)
-{
-  curl_global_init(CURL_GLOBAL_DEFAULT);
-  atexit(curl_global_cleanup);
-}
+static void init_lock(void) { mtx_init(&g_lock, mtx_plain); }
 
 void
 mrb_mruby_url_gem_init(mrb_state* mrb)
 {
-  call_once(&murl_global_once, murl_global_init);
+  call_once(&g_once, init_lock);
+  mtx_lock(&g_lock);
+  if (g_refs++ == 0) curl_global_init(CURL_GLOBAL_DEFAULT);
+  mtx_unlock(&g_lock);
 
   struct RClass* url_cls = mrb_define_class_id(mrb, MRB_SYM(URL), mrb->object_class);
 
@@ -825,7 +829,8 @@ mrb_mruby_url_gem_final(mrb_state* mrb)
 {
   mrb_objspace_each_objects(mrb, murl_disarm_callbacks, NULL);
   mrb_objspace_each_objects(mrb, murl_cleanup_curl,     NULL);
-  /* curl_global_cleanup is process-global; it runs once at atexit (see
-   * murl_global_init), not per-mrb_state, so a dying VM never tears down the
-   * TLS/Winsock layer while another VM's transfer is still live. */
+
+  mtx_lock(&g_lock);
+  if (--g_refs == 0) curl_global_cleanup();
+  mtx_unlock(&g_lock);
 }
