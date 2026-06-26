@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            ruby: '3.3'
+          - os: macos-latest
+            ruby: '3.3'
+          # mswin = the MSVC-built Ruby. It sets up the Visual Studio environment
+          # (VSINSTALLDIR), so mruby's Toolchain.guess selects :visualcpp and the
+          # gem builds the vendored libcurl against Schannel — the same path the
+          # gem ships for Windows.
+          - os: windows-latest
+            ruby: mswin
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # deps/curl is a submodule (the vendored libcurl source used for the
+          # Windows build). mruby itself is NOT vendored — `rake` clones HEAD.
+          submodules: recursive
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ matrix.ruby }}
+
+      # test/server.ruby (the HTTP/SMTP/IMAP fixture) needs webrick, which is no
+      # longer a default gem on Ruby 3.x. rake is a default gem already.
+      - name: Install test-server gem
+        run: gem install webrick
+
+      - name: Linux build deps (system libcurl via pkg-config)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libcurl4-openssl-dev pkg-config
+
+      - name: macOS build deps (Homebrew libcurl via pkg-config)
+        if: runner.os == 'macOS'
+        run: |
+          brew install curl pkg-config
+          # curl is keg-only on macOS (the OS ships its own), so point pkg-config
+          # at the Homebrew one for `spec.search_package 'libcurl'`.
+          echo "PKG_CONFIG_PATH=$(brew --prefix curl)/lib/pkgconfig" >> "$GITHUB_ENV"
+
+      # Windows needs no extra step: the mswin Ruby provides MSVC, and CMake
+      # (used by mrbgem.rake to build the vendored libcurl) is preinstalled on
+      # the windows-latest runner.
+
+      - name: rake test
+        run: rake test
