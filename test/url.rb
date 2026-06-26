@@ -73,10 +73,11 @@ assert('status codes classify correctly') do
 end
 
 assert('raise_for_status!') do
-  err = assert_raise(URL::HTTPError) do
+  err = assert_raise(URL::HttpReturnedError) do
     URL.get("#{$base}/status/500").raise_for_status!
   end
   assert_equal 500, err.response.code
+  assert_equal 22,  err.curl_code          # CURLE_HTTP_RETURNED_ERROR
 end
 
 assert('timeout produces decorated error') do
@@ -84,6 +85,28 @@ assert('timeout produces decorated error') do
   assert_true r.error?
   assert_equal 28, r.error_code           # CURLE_OPERATION_TIMEDOUT
   assert_include r.error_message, 'timed out'
+end
+
+assert('resp.error is the transport error as a value, nil otherwise') do
+  ok = URL.get("#{$base}/echo")
+  assert_nil ok.error                                  # success -> no error value
+
+  # An HTTP error status is NOT a transport error: libcurl carried the response
+  # back fine (CURLE_OK), so resp.error is nil. The status is its own axis,
+  # surfaced by server_error? / raise_for_status!.
+  http = URL.get("#{$base}/status/500")
+  assert_nil  http.error
+  assert_true http.server_error?
+
+  # A genuine below-the-response failure shows up as the matching URL:: value.
+  trans = URL.get("#{$base}/slow/2000", timeout_ms: 100)
+  assert_kind_of URL::OperationTimedout, trans.error   # CURLE_OPERATION_TIMEDOUT
+  assert_kind_of URL::TransferError, trans.error       # ...and the family base
+  assert_equal 28,    trans.error.curl_code
+  assert_equal trans, trans.error.response
+  # ...and it is a *value*, not raised — but you can still raise it yourself.
+  raised = assert_raise(URL::OperationTimedout) { raise trans.error }
+  assert_equal trans.error, raised
 end
 
 assert('gzip route reachable') do
@@ -128,6 +151,53 @@ assert('URL.get inside a callback transparently uses a fresh session') do
   assert_kind_of URL::Response, nested
   assert_true nested.success?
   assert_equal 'GET', nested.json['method']
+end
+
+# ---- Parallel fan-out -------------------------------------------------------
+
+assert('URL.parallel runs requests concurrently, keyed, with on_complete') do
+  seen = {}
+  results = URL.parallel do |p|
+    p.get("#{$base}/echo", params: { n: '1' }, key: :a)
+    p.post("#{$base}/echo", json: { x: 2 },    key: :b)
+    p.get("#{$base}/status/404",                key: :c)
+    p.on_complete { |key, resp| seen[key] = resp.code }
+  end
+
+  assert_equal 3, results.size
+  assert_kind_of URL::Response, results[:a]
+  assert_true  results[:a].success?
+  assert_equal '1',    results[:a].json['query']['n']
+  assert_equal 'POST', results[:b].json['method']
+  assert_true  results[:c].client_error?
+  assert_equal 404, results[:c].code
+  assert_nil   results[:c].error                     # 404 is CURLE_OK: no transport error
+  assert_raise(URL::HttpReturnedError) { results[:c].raise_for_status! }
+  assert_equal 3,   seen.size
+  assert_equal 404, seen[:c]
+end
+
+assert('URL.parallel defaults keys to submission index; duplicate URLs stay distinct') do
+  results = URL.parallel do |p|
+    p.get("#{$base}/echo")
+    p.get("#{$base}/echo")
+  end
+  assert_equal [0, 1], results.keys.sort
+  assert_true results[0].success?
+  assert_true results[1].success?
+end
+
+assert('URL.parallel yields answers as they arrive (fast lands before slow)') do
+  order = []
+  results = URL.parallel do |p|
+    p.get("#{$base}/slow/300", key: :slow)
+    p.get("#{$base}/echo",     key: :fast)
+    p.on_complete { |key, _resp| order << key }
+  end
+  assert_equal 2, results.size
+  # Ran concurrently on one session: the instant echo completes before the 300ms
+  # one, so on_complete sees :fast first — serial dispatch would give :slow.
+  assert_equal :fast, order.first
 end
 
 # ---- SMTPS via URL.send: the upload/read path on an RFC-named verb ---------
