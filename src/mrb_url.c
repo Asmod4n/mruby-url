@@ -657,6 +657,16 @@ murl_lc_multi_info_read(mrb_state* mrb, mrb_value mod)
   while ((msg = curl_multi_info_read(m->multi, &remaining)) != NULL) {
     if (msg->msg != CURLMSG_DONE) continue;
 
+    /* Out of memory is the one CURLcode we never marshal back as a value:
+     * building the wrapper in Ruby might itself allocate. Mirror mruby's own
+     * allocator (mrb_realloc) — flag the VM out-of-memory and raise the
+     * preallocated NoMemoryError (mrb->nomem_err) directly, so OOM never
+     * reaches Ruby as a plain code. */
+    if (unlikely(msg->data.result == CURLE_OUT_OF_MEMORY)) {
+      mrb->gc.out_of_memory = TRUE;
+      mrb_exc_raise(mrb, mrb_obj_value(mrb->nomem_err));
+    }
+
     murl_easy_t* e = NULL;
     curl_easy_getinfo(msg->easy_handle, CURLINFO_PRIVATE, &e);
     if (unlikely(!e)) continue;
@@ -690,15 +700,18 @@ murl_lc_multi_strerror(mrb_state* mrb, mrb_value mod)
 /* libcurl's global init/cleanup are process-global, not per-mrb_state, and are
  * not safe to churn. curl_global_init brings up the TLS backend and (on
  * Windows) Winsock, which must come up once before any other thread runs and be
- * torn down once after every handle is gone. Tying them to gem_init / gem_final
- * would re-run them for every VM: a race when VMs are created on multiple
- * threads, and worse, one VM's gem_final could pull the TLS/Winsock layer out
- * from under a transfer still live in another VM.
+ * torn down once after every handle is gone. Tying them naively to gem_init /
+ * gem_final would re-run them for every VM: a race when VMs are created on
+ * multiple threads, and worse, one VM's gem_final could pull the TLS/Winsock
+ * layer out from under a transfer still live in another VM.
  *
- * So we init exactly once via C11 call_once (race-free even across concurrently
- * created mrb_states) and defer the matching cleanup to atexit, which runs once
- * after all VMs are gone. Per-mrb_state handle teardown still happens in
- * gem_final below. */
+ * So we refcount. A C11 call_once builds the mutex exactly once (mtx_t has no
+ * static initializer), and under that mutex gem_init runs curl_global_init only
+ * on the 0->1 transition and gem_final runs curl_global_cleanup only on the
+ * 1->0 transition. The mutex serialises those two calls across concurrently
+ * created mrb_states; the count keeps the global layer up for as long as any VM
+ * is using it, then tears it down once the last one is gone. Per-mrb_state
+ * handle teardown still happens in gem_final below. */
 static once_flag g_once = ONCE_FLAG_INIT;
 static mtx_t     g_lock;              /* mtx_t has NO static initializer in C11 */
 static unsigned  g_refs = 0;

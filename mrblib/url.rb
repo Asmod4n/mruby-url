@@ -7,7 +7,9 @@
 #   URL.default_loop=   - plug in a platform event loop once at startup
 #   URL::Response       - what the verbs return
 #   URL::EventLoop      - subclass to integrate a native event loop
-#   URL::Error / URL::HTTPError
+#   URL::Error          - usage errors raise it; the per-CURLcode transfer-error
+#                         family (Response#error) descends from it — see
+#                         mrblib/url/errors.rb
 #
 # The internal plumbing (request dispatch, the built-in IO.select loop,
 # transfer buffering, the Request callback setters) lives under mrblib/url/.
@@ -16,26 +18,15 @@
 # URL::IOSelectLoop subclasses — are defined before the plumbing loads.
 
 # ============================================================================
-#  URL::Error / URL::HTTPError
+#  Errors
+#
+#  The taxonomy — URL::Error (usage errors) and the per-CURLcode
+#  URL::TransferError family returned as a value by Response#error — lives in
+#  mrblib/url/errors.rb, which loads after this file. We only open URL here so
+#  the user-facing classes below (EventLoop, Response) have their namespace.
 # ============================================================================
 
-class URL
-  class Error < StandardError; end
-
-  class HTTPError < Error
-    attr_reader :response
-
-    def initialize(response)
-      @response = response
-      msg = if response.error_code != 0
-              "transport error: #{response.error_message}"
-            else
-              "HTTP #{response.code} #{response.effective_url}"
-            end
-      super(msg)
-    end
-  end
-end
+class URL; end
 
 # ============================================================================
 #  URL::EventLoop — subclass and implement four primitives
@@ -108,9 +99,32 @@ class URL::Response
     json_lazy.into(target)
   end
 
+  # The transport outcome as a *value*: nil when libcurl carried the transfer to
+  # completion — even with an HTTP error status, which is the HTTP layer's
+  # concern (see #raise_for_status!) — or the exception object for libcurl's
+  # CURLcode otherwise (a URL::TransferError subclass, or a reused built-in such
+  # as SocketError for a DNS failure). Nothing is raised; you inspect it, or
+  # `raise resp.error` to cross into exception flow yourself. (Usage errors —
+  # unsupported scheme, bad args — still raise at the call.)
+  def error
+    return nil if @error_code == 0
+    @error ||= URL._transfer_error(self, @error_code, error_message)
+  end
+
+  # Raise when the response is not a clean success: libcurl's transport error if
+  # the transfer itself failed, otherwise URL::HttpReturnedError for an HTTP
+  # status >= 400 (libcurl's own CURLE_HTTP_RETURNED_ERROR meaning). Returns self
+  # on success, so it chains: resp.raise_for_status!.json
   def raise_for_status!
-    return self unless error?
-    raise URL::HTTPError.new(self)
+    if e = error
+      raise e
+    elsif @code && @code >= 400
+      raise URL::HttpReturnedError.new(
+        "HTTP #{@code} for #{@effective_url}",
+        response: self, curl_code: 22, curl_message: URL::Request.strerror(22)
+      )
+    end
+    self
   end
 
   def content_length
@@ -191,6 +205,57 @@ class URL::Response
       end
     end
     result
+  end
+end
+
+# ============================================================================
+#  URL::Batch — the request builder yielded by URL.parallel
+#
+#  Inside `URL.parallel { |p| ... }` you get one of these as `p`. Queue requests
+#  with the same verbs you'd call on URL (get/head/delete/options/post/put/
+#  patch), each tagged with an optional key: (defaults to its submission index,
+#  so duplicate URLs stay distinct). Register on_complete to receive each
+#  response as its transfer lands. The driving + result collection live in
+#  URL._drive_parallel (mrblib/url/dispatch.rb).
+# ============================================================================
+
+class URL::Batch
+  def initialize
+    @entries     = []
+    @on_complete = nil
+  end
+
+  def get(url, key: nil, **opts, &block);                _add(:GET,     url, nil,  key, opts, block); end
+  def head(url, key: nil, **opts, &block);               _add(:HEAD,    url, nil,  key, opts, block); end
+  def delete(url, body = nil, key: nil, **opts, &block); _add(:DELETE,  url, body, key, opts, block); end
+  def options(url, key: nil, **opts, &block);            _add(:OPTIONS, url, nil,  key, opts, block); end
+  def post(url, body = nil, key: nil, **opts, &block);   _add(:POST,    url, body, key, opts, block); end
+  def put(url, body = nil, key: nil, **opts, &block);    _add(:PUT,     url, body, key, opts, block); end
+  def patch(url, body = nil, key: nil, **opts, &block);  _add(:PATCH,   url, body, key, opts, block); end
+
+  # Called with (key, URL::Response) as each transfer finishes — in completion
+  # order, not submission order.
+  def on_complete(&block)
+    @on_complete = block
+    self
+  end
+
+  # Internal: consumed by URL._drive_parallel.
+  attr_reader :entries
+  def completion_block; @on_complete; end
+
+  private
+
+  def _add(method, url, body, key, opts, on_chunk)
+    @entries << {
+      method:   method,
+      url:      url,
+      body:     body,
+      key:      key.nil? ? @entries.size : key,
+      opts:     opts,
+      on_chunk: on_chunk,
+    }
+    self
   end
 end
 
@@ -341,6 +406,35 @@ class URL
       else
         raise URL::Error, "fetch not available for #{_scheme_of(url)}"
       end
+    end
+
+    # ----------------------------------------------------------------------
+    #  Parallel fan-out
+    # ----------------------------------------------------------------------
+
+    # Run several requests concurrently on one session and collect them as they
+    # finish. Inside the block, queue requests on the yielded URL::Batch (same
+    # verbs as URL), each tagged with an optional key: (defaults to its
+    # submission index, so duplicate URLs stay distinct). Returns a Hash of
+    # { key => URL::Response } once all complete; register p.on_complete to also
+    # receive each response the moment its transfer lands.
+    #
+    #   results = URL.parallel do |p|
+    #     p.get("https://a.example/feed",   key: :feed)
+    #     p.post("https://b.example/login", key: :login, json: { ... })
+    #     p.on_complete { |key, resp| warm(key, resp) }
+    #   end
+    #   results[:feed].json
+    #
+    # Runs on URL.shared by default — so the connection pool, TLS sessions and
+    # HTTP/2 multiplexing carry over — falling back to a throwaway session when
+    # called re-entrantly from inside a callback. Runtime failures are values
+    # like everywhere else: each Response's #error is set, nothing is raised.
+    def parallel
+      raise ArgumentError, "URL.parallel requires a block" unless block_given?
+      batch = Batch.new
+      yield batch
+      _drive_parallel(batch.entries, batch.completion_block)
     end
   end
 

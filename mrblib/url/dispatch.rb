@@ -66,6 +66,51 @@ class URL
       end
     end
 
+    # Drive a batch of requests concurrently on one session and collect their
+    # responses. Reuses the shared session (so the connection pool, TLS sessions
+    # and HTTP/2 multiplexing carry over) unless it's mid-callback, in which case
+    # a throwaway one is used — the same hybrid rule the blocking verbs follow.
+    # All requests are added up front, then one IO.select loop drives them
+    # together; each response is handed to on_complete (key, resp) the moment its
+    # transfer finishes, and the full { key => URL::Response } Hash is returned
+    # once all are done. Like the verbs, a runtime failure is a Response whose
+    # resp.error is set — never a raise.
+    def _drive_parallel(entries, on_complete)
+      return {} if entries.empty?
+
+      session = shared
+      session = open if session._busy?
+
+      loop = session._sync_loop
+      session.event_loop = loop
+
+      by_req  = {}
+      results = {}
+
+      entries.each do |e|
+        req, state = _build_request(session, e[:method], e[:url], e[:body], e[:opts], e[:on_chunk])
+        by_req[req.object_id] = [e[:key], e[:url], req, state]
+        session.add(req)
+      end
+
+      session._busy = true
+      begin
+        loop.run_n(entries.size) do |req, code|
+          entry = by_req[req.object_id]
+          next unless entry
+          key, url, r, state = entry
+          state.error_code = code if code != 0
+          resp = _response_from(url, r, state)
+          results[key] = resp
+          on_complete.call(key, resp) if on_complete
+        end
+        results
+      ensure
+        session._busy = false
+        by_req.each_value { |(_k, _u, r, _s)| session.remove(r) rescue nil }
+      end
+    end
+
     def _build_request(session, method, url, body, opts, on_chunk)
       params    = opts.delete(:params)
       json_body = opts.delete(:json)
@@ -187,27 +232,17 @@ class URL
       [req, state]
     end
 
-    # Drive an IMAP command to completion and return its URL::Response. IMAP
-    # success is CURLE_OK; a NO/BAD tagged reply surfaces as a non-zero
-    # error_code (e.g. CURLE_QUOTE_ERROR), which we turn into a clear
-    # URL::Error so callers get an unambiguous result rather than a silent
-    # empty response.
-    def _drive_imap(session, mailbox_url, req, state)
-      resp = _drive_sync(session, mailbox_url, req, state)
-      if resp.error_code != 0
-        raise URL::Error, "IMAP command failed: #{resp.error_message}"
-      end
-      resp
-    end
-
     # Shared front of an IMAP verb: pick the shared session (or a fresh one when
     # re-entrant), build the request, drive it. Centralises the session choice
-    # so each verb arm is a one-liner that just names its IMAP command.
+    # so each verb arm is a one-liner that just names its IMAP command. A NO/BAD
+    # reply is a runtime error like any other — it comes back as a Response whose
+    # error_code is non-zero (so resp.error holds a URL::TransportError), not as
+    # a raise.
     def _imap(mailbox_url, command, opts, url_suffix = nil, on_chunk = nil)
       session = shared
       session = open if session._busy?
       req, state = _build_imap_request(session, mailbox_url, command, opts, url_suffix, on_chunk)
-      _drive_imap(session, mailbox_url, req, state)
+      _drive_sync(session, mailbox_url, req, state)
     end
 
     def _response_from(url, req, state)
