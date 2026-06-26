@@ -87,16 +87,18 @@ assert('timeout produces decorated error') do
   assert_include r.error_message, 'timed out'
 end
 
-assert('resp.error is the transport error as a value, nil otherwise') do
+assert('resp.error is set on failure (transport or HTTP) as a value, nil on success') do
   ok = URL.get("#{$base}/echo")
   assert_nil ok.error                                  # success -> no error value
 
-  # An HTTP error status is NOT a transport error: libcurl carried the response
-  # back fine (CURLE_OK), so resp.error is nil. The status is its own axis,
-  # surfaced by server_error? / raise_for_status!.
+  # An HTTP error status is surfaced as a value too: resp.error holds an
+  # HttpReturnedError. Nothing is raised — it is a value like everything else.
   http = URL.get("#{$base}/status/500")
-  assert_nil  http.error
-  assert_true http.server_error?
+  assert_kind_of URL::HttpReturnedError, http.error
+  assert_kind_of URL::TransferError, http.error        # ...and the family base
+  assert_equal 500,  http.error.response.code
+  assert_equal 22,   http.error.curl_code              # CURLE_HTTP_RETURNED_ERROR
+  assert_true  http.server_error?
 
   # A genuine below-the-response failure shows up as the matching URL:: value.
   trans = URL.get("#{$base}/slow/2000", timeout_ms: 100)
@@ -171,8 +173,7 @@ assert('URL.parallel runs requests concurrently, keyed, with on_complete') do
   assert_equal 'POST', results[:b].json['method']
   assert_true  results[:c].client_error?
   assert_equal 404, results[:c].code
-  assert_nil   results[:c].error                     # 404 is CURLE_OK: no transport error
-  assert_raise(URL::HttpReturnedError) { results[:c].raise_for_status! }
+  assert_kind_of URL::HttpReturnedError, results[:c].error  # HTTP error as a value, in the batch too
   assert_equal 3,   seen.size
   assert_equal 404, seen[:c]
 end
