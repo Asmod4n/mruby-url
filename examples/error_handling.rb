@@ -40,10 +40,10 @@ BASE = (ARGV[0] && !ARGV[0].empty?) ? ARGV[0] : "https://httpbingo.org"
 # Warm the connection once. The very first TLS handshake to a cold public test
 # server can lag; doing it up front (and on URL.shared, which pools the
 # connection) keeps the timed examples below honest. The result is ignored.
-URL.get("#{BASE}/get", timeout_ms: 20000)
+URL("#{BASE}/get").get(timeout_ms: 20000)
 
 puts "1. the basic shape — make the request, then look at resp.error"
-resp = URL.get("#{BASE}/get", timeout_ms: 15000)
+resp = URL("#{BASE}/get").get(timeout_ms: 15000)
 if resp.error
   puts "   failed: #{resp.error.class} - #{resp.error.message}"
 else
@@ -53,7 +53,7 @@ end
 puts
 puts "2. an HTTP error status is a value, not a raise"
 # /status/<n> replies with exactly status <n>.
-resp = URL.get("#{BASE}/status/503", timeout_ms: 15000)
+resp = URL("#{BASE}/status/503").get(timeout_ms: 15000)
 err  = resp.error
 puts "   #{err.class}  curl_code=#{err.curl_code}"
 puts "   code=#{resp.code}  server_error?=#{resp.server_error?}"
@@ -64,14 +64,14 @@ puts
 puts "3. transport failures map to one class per libcurl error —"
 puts "   and where mruby already ships the right class, we reuse it."
 # A DNS failure is a plain SocketError, exactly what mruby-socket itself raises.
-resp = URL.get("https://no-such-host.invalid/")
+resp = URL("https://no-such-host.invalid/").get
 puts "   #{resp.error.class}  (is_a? SocketError -> #{resp.error.is_a?(SocketError)})"
 puts "   #{resp.error.message}"
 
 puts
 puts "4. a timeout is URL::OperationTimedout (libcurl CURLE_OPERATION_TIMEDOUT)"
 # /delay/<n> waits n seconds before replying; we allow only 0.8s.
-resp = URL.get("#{BASE}/delay/10", timeout_ms: 800)
+resp = URL("#{BASE}/delay/10").get(timeout_ms: 800)
 puts "   #{resp.error.class}  curl_code=#{resp.error.curl_code}"
 puts "   #{resp.error.message}"
 
@@ -80,7 +80,7 @@ puts "5. a TLS failure surfaces as one of the URL::Ssl* classes"
 # Which one — PeerFailedVerification (curl 60) vs SslConnectError (curl 35) —
 # depends on your libcurl's TLS backend (OpenSSL tends to report 60 for an
 # expired cert; others report 35). Both mean "the TLS handshake was rejected".
-resp = URL.get("https://expired.badssl.com/", timeout_ms: 15000)
+resp = URL("https://expired.badssl.com/").get(timeout_ms: 15000)
 puts "   #{resp.error.class}  curl_code=#{resp.error.curl_code}"
 puts "   #{resp.error.message}"
 
@@ -89,7 +89,7 @@ puts "6. dispatch on the error with case/when"
 # The family shares a base (URL::TransferError) and reuses built-ins, so you can
 # match a specific curl error, a reused built-in, the HTTP case, or the base.
 def classify(url, **opts)
-  resp = URL.get(url, **opts)
+  resp = URL(url).get(**opts)
   case resp.error
   when nil                    then "ok (#{resp.code})"
   when URL::HttpReturnedError then "http #{resp.code}"
@@ -108,7 +108,7 @@ puts "7. opt INTO exceptions with raise_for_status!"
 # It raises whatever resp.error holds (HTTP *or* transport) and otherwise returns
 # self, so it chains: raise_for_status!.json
 begin
-  data = URL.get("#{BASE}/status/500", timeout_ms: 15000).raise_for_status!.json
+  data = URL("#{BASE}/status/500").get(timeout_ms: 15000).raise_for_status!.json
   puts "   got #{data.size} keys"
 rescue URL::HttpReturnedError => e
   puts "   HTTP error: #{e.response.code}"

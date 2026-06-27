@@ -1,32 +1,54 @@
 # mruby-url
 
-A URL client for mruby, backed by an embedded libcurl. A high-level,
-blocking HTTP(S) client sits on top; the same top-level `URL` class also
-exposes non-HTTP protocols (SMTP(S) send, IMAP(S) commands) through
-RFC-verb-named methods, and a small integration class for driving transfers
-on a real event loop.
+A URL client for mruby backed by an embedded libcurl. **Every scheme libcurl
+can be built with is reachable** — `http(s)`, `ftp(s)`, `sftp`, `scp`,
+`file`, `dict`, `gopher(s)`, `pop3(s)`, `imap(s)`, `smtp(s)`, `ldap(s)`,
+`mqtt(s)`, `rtsp`, `telnet`, `tftp`, `ws(s)` — exposed through one small
+surface where each scheme has the verbs that fit it. Errors are values, the
+connection / TLS-session cache is shared across requests, and dependencies
+land where you'd expect them on Linux/macOS/Windows.
 
 ```ruby
-URL.get("https://example.com").body                                   # quick
-URL.get("https://api.example.com/users", params: { limit: 10 }).json
-URL.post("https://api.example.com/users", json: { name: "Alice" }).raise_for_status!.json
+URL("https://example.com").get.body
+URL("https://api.example.com/users").get(params: { limit: 10 }).json
+URL("https://api.example.com/users").post(json: { name: "Alice" }).raise_for_status!.json
 
-# Stream a big response instead of buffering it:
-URL.get("https://huge.example.com/file") { |chunk| File.open("out", "ab") { |f| f.write(chunk) } }
+# Streaming a big response
+URL("https://huge.example.com/file").get { |chunk| sink << chunk }
+
+# Other protocols use the same shape
+URL("ftp://host/pub/").list.lines
+URL("sftp://host/path/big.bin").upload(File.open("big.bin", "rb"))
+URL("imaps://user:pw@mail/INBOX").fetch(uid: 42).body
+URL("wss://echo.websocket.org").connect { |ws| ws.send_text("hi"); puts ws.receive.data }
 ```
 
-> **Status:** HTTP(S) is complete and covered by the test suite; SMTP(S)
-> send and IMAP(S) verbs are implemented and tested against in-tree fixture
-> servers. The high-level API is settling toward a tagged release — expect
-> only minor changes from here. Which protocols are actually available
-> depends on the libcurl this gem was built against; check at runtime with
-> `URL.supports?`.
+> **Status:** every scheme is implemented and covered by fixture-server
+> integration tests. The high-level API is settling toward a tagged release.
+> Which protocols are actually available at runtime depends on the libcurl
+> this gem was built against — check with `URL.supports?("scheme")`.
 
-Why `URL`? Because libcurl speaks many protocols and they all have a URL in
-common. HTTP is the first thing exposed; SMTP and IMAP are in, and FTP,
-POP3, MQTT, WebSocket and friends slot in under the same class over time —
-each as a method named after the protocol's own verb, dispatched on the URL
-scheme (see [Non-HTTP protocols](#non-http-protocols)).
+## Calling URL
+
+`URL(uri)` dispatches on the scheme and returns the right wrapper:
+`URL::HTTP`, `URL::Transfer`, `URL::Gopher`, `URL::Dict`, `URL::IMAP`,
+`URL::POP3`, `URL::SMTP`, `URL::LDAP`, `URL::MQTT`, `URL::RTSP`, `URL::WS`.
+Each class carries only the verbs that fit the protocol; an unknown or
+unbuilt scheme raises `URL::Error` from `URL(uri)` itself, before any
+connection attempt.
+
+```ruby
+# Build once, call repeatedly:
+api = URL("https://api.example.com/users")
+api.get(params: { limit: 10 })
+api.post(json: payload)
+
+# One-shot class method when you know the scheme up front, no factory:
+URL::HTTP.get("https://x", json: {...})
+URL::Transfer.upload("sftp://h/path", io)     # ftp(s) / sftp / scp / file / tftp / telnet
+URL::IMAP.fetch("imaps://h/INBOX", uid: 7)
+URL::WS.connect("wss://h/sock") { |ws| ws.send_text("hi") }
+```
 
 ## Defaults
 
@@ -55,7 +77,7 @@ Every HTTP call gets these unless you override them:
 ## Response
 
 ```ruby
-r = URL.get("https://example.com/api")
+r = URL("https://example.com/api").get
 
 r.code              # => 200
 r.body              # => "..."
@@ -82,15 +104,15 @@ class Config
   native_ext_type :@region,  String
 end
 
-URL.get(".../config").into(Config.new)   # fill an instance
-URL.get(".../config").into(Config)       # populate class-level @api_key / @region
+URL(".../config").get.into(Config.new)   # fill an instance
+URL(".../config").get.into(Config)       # populate class-level @api_key / @region
 ```
 
 For array responses, drop down to mruby-fast-json directly so you control
 how each instance is constructed:
 
 ```ruby
-URL.get(".../users").json_lazy.array_each do |doc|
+URL(".../users").get.json_lazy.array_each do |doc|
   u = User.new
   doc.into(u)
   process(u)
@@ -103,7 +125,7 @@ Pass a block to a one-shot to receive body chunks as they arrive instead of
 buffering. Useful for big downloads, video, LLM token streams.
 
 ```ruby
-URL.get("https://huge.example/file") do |chunk|
+URL("https://huge.example/file").get do |chunk|
   File.open("out", "ab") { |f| f.write(chunk) }
 end
 ```
@@ -114,41 +136,100 @@ end
 
 The high-level verbs reuse one shared session per `mrb_state`
 (`URL.shared`), so libcurl's connection pool, TLS sessions and HTTP/2
-streams persist across calls. That session can only drive one transfer at a
-time, so a call made from *inside* a streaming/callback (where the shared
-session is mid-flight) would be re-entrant. mruby-url detects that and
-transparently runs the nested call on a throwaway session — so this just
-works:
+streams persist across calls. That session can only drive one transfer at
+a time, so a call made from *inside* a streaming/callback (where the
+shared session is mid-flight) would be re-entrant. mruby-url detects that
+and transparently runs the nested call on a throwaway session — and a
+process-wide `CURLSH` (`URL::Libcurl::SHARE`) means the throwaway shares
+the **same connection cache and TLS-session-ticket cache** as the shared
+session, so a nested call to a host you already opened resumes TLS (and
+often reuses the live TCP/HTTP-2 connection) instead of doing a full
+handshake. Transparent in both directions:
 
 ```ruby
-URL.get("https://a.example/stream") do |chunk|
-  enrich(chunk, URL.get("https://b.example/lookup").json)   # nested call, fresh session
+URL("https://a.example/stream").get do |chunk|
+  enrich(chunk, URL("https://b.example/lookup").get.json)
+  log(URL("https://a.example/meta").get.json)   # warm — same host as the outer call
 end
 ```
 
-## Non-HTTP protocols
+## Parallel fan-out
 
-Non-HTTP protocols are exposed as methods named after the protocol's own RFC
-verb. Each dispatches on the URL scheme and is gated behind `URL.supports?`,
-so a scheme the embedded libcurl wasn't built with raises `URL::Error`
-*before* any connection attempt.
+`URL.parallel` drives many requests concurrently on one session — the
+connection pool, TLS sessions and HTTP/2 multiplexing all carry over —
+and collects the responses keyed however you want:
 
 ```ruby
-URL::PROTOS            # => ["http", "https", "smtp", "smtps", "imap", "imaps", ...]
+results = URL.parallel do |p|
+  p.get("https://a.example/feed",  key: :feed)
+  p.post("https://b.example/login", key: :login, json: creds)
+  p.get("ftp://h/manifest.txt",     key: :manifest)
+  p.on_complete { |key, resp| warm[key] = resp }   # live, as they finish
+end
+results[:feed].json
+results[:login].json
+```
+
+Runtime failures stay values (`resp.error`); only usage errors (unknown
+scheme, missing protocol) raise. A re-entrant call from inside one of the
+on-complete handlers falls back to a throwaway session, the same way the
+blocking verbs do.
+
+## Other protocols
+
+Every scheme `URL::PROTOS` lists is reachable. Failures are values
+(`resp.error`), exactly like the HTTP verbs; only an unknown/unbuilt
+scheme raises `URL::Error` — and that comes from `URL(uri)` itself, before
+any connection attempt.
+
+```ruby
+URL("ftp://host/pub/file.txt").download.body          # ftp(s), sftp, scp,
+URL("file:///etc/hostname").download.body             #   file, dict, gopher,
+URL("sftp://user@host/path").download(                #   pop3, tftp, ldap, telnet…
+  ssh_private_keyfile: "id_ed25519",
+  ssh_knownhosts:      "known_hosts",
+).body
+
+URL("ftp://host/incoming/x.txt").upload(data)         # ftp(s), sftp, scp, tftp
+URL("ftp://host/pub/").list.lines                     # directory / message list
+URL("dict://dict.org").define("ruby").body            # DICT define
+URL("ldap://host/dc=ex,dc=com?cn?sub?(cn=*)").search  # LDAP search → LDIF body
+URL("mqtt://host/topic").publish("payload")           # MQTT publish
+URL("mqtt://host/topic").subscribe(timeout_ms: 5000)  # MQTT subscribe → #body
+
+URL("rtsp://host/stream").describe                    # RTSP OPTIONS/DESCRIBE/PLAY/…
+URL("rtsp://host/stream").options
+URL("rtsp://host/stream").play
+```
+
+`download`/`upload` and the wrappers take the same `**opts` as the HTTP
+verbs plus protocol options as needed: `:quote` (FTP/SFTP commands),
+`:dirlistonly`, `:range`, `:use_ssl`, the `:ssh_*` keys. The `s` schemes
+(ftps, pop3s, gophers, ldaps, mqtts, …) are the same calls over TLS — pass
+`ssl_verify_peer:`/`ssl_verify_host:` as usual. As with everything here,
+the dispatch, option mapping and parsing live in Ruby; the C layer only
+gained a handful of flat `setopt` pass-throughs and a blocking `easy_perform`.
+
+### Supported schemes
+
+```ruby
+URL::PROTOS            # => ["dict","file","ftp","ftps","gopher","gophers",
+                       #     "http","https","imap","imaps","ldap","ldaps",
+                       #     "mqtt","mqtts","pop3","pop3s","rtsp","scp",
+                       #     "sftp","smtp","smtps","telnet","tftp","ws","wss"]
 URL.supports?("smtps") # => true / false
 ```
 
-### SMTP(S) — `URL.send`
+### SMTP(S)
 
-`URL.send(server_url, body, from:, to:, **opts)` submits a message. `body`
-is the full RFC822 message (positional); `to:` is a String or an Array of
-recipients. The body is streamed to libcurl's read callback, chunked in
-Ruby. Returns a `URL::Response` whose `code` is the final SMTP reply (e.g.
-`250`).
+`URL("smtps://…").deliver(body, from:, to:, **opts)` submits a message.
+`body` is the full RFC822 message (or any IO / Enumerable / Fiber / Proc
+that yields the bytes — see [Upload sources](#upload-sources)); `to:` is
+a String or an Array. Returns a `URL::Response` whose `code` is the final
+SMTP reply (e.g. `250`).
 
 ```ruby
-URL.send(
-  "smtps://mail.example.com:465",
+URL("smtps://mail.example.com:465").deliver(
   "Subject: hi\r\n\r\nhello body\r\n",
   from: "me@example.com",
   to:   ["a@example.com", "b@example.com"],
@@ -156,26 +237,89 @@ URL.send(
 )
 ```
 
-> `URL.send` deliberately overrides `Object#send`. Use `URL.__send__` for
-> reflection.
+> The verb is called `deliver` (not `send`) so we never shadow
+> `Object#send`.
 
-### IMAP(S) — `move` / `store` / `expunge` / `fetch`
+### IMAP(S) — `fetch` / `move` / `store` / `expunge`
 
-The mailbox is the URL path (`imaps://user:pass@host/INBOX`); UIDs go into
-the command. Each returns a `URL::Response`; a `NO`/`BAD` tagged reply is
-raised as `URL::Error`.
+The mailbox is the URL path (`imaps://user:pw@host/INBOX`); UIDs go into
+the command. Each returns a `URL::Response`; a `NO`/`BAD` tagged reply
+shows up as `resp.error` (a `URL::TransferError`), not a raise.
 
 ```ruby
-base = "imaps://user:pass@imap.example.com/INBOX"
+mbox = URL("imaps://user:pw@imap.example.com/INBOX")
 
-URL.fetch(base, uid: 7)                          # UID FETCH 7 BODY[] -> Response#body
-URL.fetch(base, uid: 7) { |chunk| sink(chunk) }  # ...or stream it
+mbox.fetch(uid: 7).body                       # UID FETCH 7 BODY[]
+mbox.fetch(uid: 7) { |chunk| sink(chunk) }    # ...or stream
 
-URL.store(base, uid: 7, flags: "\\Deleted")      # UID STORE 7 +FLAGS (\Deleted)
-URL.store(base, uid: 7, flags: "\\Seen", op: "-")# remove a flag (op: "+"/"-"/"")
-URL.expunge(base)                                # delete = store(\Deleted) then expunge
-URL.move(base, uid: 7, to: "Archive")            # UID MOVE 7 Archive
+mbox.store(uid: 7, flags: "\\Deleted")        # UID STORE 7 +FLAGS (\Deleted)
+mbox.store(uid: 7, flags: "\\Seen", op: "-")  # remove a flag (op: "+"/"-"/"")
+mbox.expunge                                  # delete = store(\Deleted) then expunge
+mbox.move(uid: 7, to: "Archive")              # UID MOVE 7 Archive
 ```
+
+### Upload sources
+
+`upload` duck-types whatever you hand it — no need to slurp a file into
+memory first:
+
+```ruby
+URL("ftp://h/x").upload("the body bytes")                      # String
+
+File.open("big.bin", "rb") do |f|                              # IO/File:
+  URL("sftp://h/path/big.bin").upload(f)                       #   streams via #read(max)
+end                                                            #   sets CURLOPT_INFILESIZE
+
+URL("ftp://h/feed.csv").upload(rows.lazy.map(&:to_csv))        # any Enumerable
+
+URL("ftp://h/log").upload(->(max) { source.read(max) })        # Proc / Lambda
+
+fib = Fiber.new { Fiber.yield "a"; Fiber.yield "b"; "done\n" } # Fiber yielding chunks
+URL("ftp://h/x").upload(fib)
+```
+
+We never close a `File`, exhaust a `Socket`, rewind, or clean up after a
+`Fiber` — open/close stays your responsibility. The same streaming reader
+is used by SMTP `deliver`, so a mail body can be any of those too.
+
+## WebSocket
+
+`URL("ws://…").connect` (or `URL("wss://…").connect`) opens the
+connection and returns a `URL::WebSocket` once the upgrade handshake
+completes. Messages are sent and received whole — fragmentation and
+oversized frames are reassembled for you, and inbound PINGs are answered
+automatically.
+
+```ruby
+URL("wss://echo.websocket.org").connect do |ws|
+  ws.send_text("hello")
+  msg = ws.receive            # => URL::WebSocket::Message (text? / binary? / close?)
+  puts msg.data
+  ws.each { |m| handle(m) }   # iterate until the peer closes
+end
+```
+
+A failed handshake is a **value, not a raise** — same two-tier model as
+the HTTP verbs. `connect` always returns a `URL::WebSocket`; check
+`ws.open?` and read `ws.error` (a `URL::TransferError`, e.g.
+`URL::WebSocketError` naming the HTTP status when the server answered
+with a page instead of a 101 upgrade). The block is only entered for a
+live socket:
+
+```ruby
+ws = URL("wss://example.com/socket").connect
+ws.open?   # => false
+ws.error   # => #<URL::WebSocketError: websocket upgrade refused: server
+           #    replied HTTP 200 (expected 101 Switching Protocols) ...>
+```
+
+Without a block, `connect` returns the socket and you close it yourself
+(`ws.close(status: 1000)`). `#receive(timeout: 5)` returns `nil` if no
+message arrives in time; `#send_*` / `#receive` on a closed socket are
+no-ops returning `nil`. The C layer only adds two framing primitives
+(`curl_ws_send` / `curl_ws_recv`); all message-level logic lives in
+`mrblib/url/websocket.rb`. Only genuine usage errors raise: a non-ws
+scheme, or a libcurl built without WebSocket support (needs 7.86+).
 
 ## Tuning the shared session
 
@@ -213,7 +357,7 @@ Install one instance process-wide and the verbs become fire-and-forget
 
 ```ruby
 URL.default_loop = MyGlibLoop.new
-URL.get("https://example.com/ping")   # attaches to the loop, returns nil
+URL("https://example.com/ping").get   # attaches to the loop, returns nil
 ```
 
 or set it per session via `session.event_loop = my_loop`.
@@ -299,35 +443,6 @@ On Linux/macOS the gem finds libcurl via `pkg-config`. On Windows it builds
 the vendored `deps/curl` with CMake and links it statically against Schannel
 (no OpenSSL); `mrbgem.rake` handles this.
 
-## Other protocols
-
-Every scheme the embedded libcurl was built with (see `URL::PROTOS`) is reachable
-through a small, scheme-agnostic surface. Failures are values (`resp.error`),
-exactly like the HTTP verbs; only an unbuilt/unknown scheme raises.
-
-```ruby
-URL.download("ftp://host/pub/file.txt").body          # ftp, ftps, sftp, scp,
-URL.download("file:///etc/hostname").body             #   file, dict, gopher,
-URL.download("sftp://user@host/path",                 #   pop3, tftp, ldap, http…
-            ssh_private_keyfile: "id_ed25519",
-            ssh_knownhosts: "known_hosts").body
-URL.upload("ftp://host/incoming/x.txt", data)         # ftp(s), sftp, scp, tftp
-URL.list("ftp://host/pub/").lines                     # directory / message list
-URL.lookup("dict://dict.org", "ruby").body            # DICT define
-URL.search("ldap://host/dc=ex,dc=com?cn?sub?(cn=*)")  # LDAP search → LDIF body
-URL.publish("mqtt://host/topic", "payload")           # MQTT publish
-URL.subscribe("mqtt://host/topic", timeout_ms: 5000)  # MQTT subscribe → #body
-URL.rtsp("rtsp://host/stream", request: :describe)    # RTSP (OPTIONS/DESCRIBE/…)
-```
-
-`download`/`upload` take the same `**opts` as the HTTP verbs plus protocol
-options as needed: `:quote` (FTP/SFTP commands), `:dirlistonly`, `:range`,
-`:use_ssl`, the `:ssh_*` keys, and `:rtsp_*`. The `s` schemes (ftps, pop3s,
-gophers, ldaps, mqtts, …) are the same calls over TLS — pass
-`ssl_verify_peer:`/`ssl_verify_host:` as usual. As with everything here, the
-dispatch, option mapping and parsing live in Ruby; the C layer only gained a
-handful of flat `setopt` pass-throughs and a blocking `easy_perform`.
-
 ## Design notes
 
 - **C is an FFI-thin binding only.** `src/mrb_url.c` does only what a generic
@@ -376,46 +491,11 @@ handful of flat `setopt` pass-throughs and a blocking `easy_perform`.
 - Redirect chains: parsed `Response#headers` keeps only the final response;
   the full sequence stays in `#raw_headers`.
 
-## WebSocket
-
-`URL.websocket` opens a `ws://` / `wss://` connection and returns a
-`URL::WebSocket` once the upgrade handshake completes. Messages are sent and
-received whole — fragmentation and oversized frames are reassembled for you,
-and inbound PINGs are answered automatically.
-
-```ruby
-URL.websocket("wss://echo.websocket.org") do |ws|
-  ws.send_text("hello")
-  msg = ws.receive            # => URL::WebSocket::Message (text? / binary? / close?)
-  puts msg.data
-  ws.each { |m| handle(m) }   # iterate until the peer closes
-end
-```
-
-A failed handshake is a **value, not a raise** — same two-tier model as the HTTP
-verbs. `URL.websocket` always returns a `URL::WebSocket`; check `ws.open?` and
-read `ws.error` (a `URL::TransferError`, e.g. `URL::WebSocketError` naming the
-HTTP status when the server answered with a page instead of a 101 upgrade). The
-block is only entered for a live socket:
-
-```ruby
-ws = URL.websocket("wss://example.com/socket")
-ws.open?   # => false
-ws.error   # => #<URL::WebSocketError: websocket upgrade refused: server
-           #    replied HTTP 200 (expected 101 Switching Protocols) ...>
-```
-
-Without a block, `URL.websocket` returns the socket and you close it yourself
-(`ws.close(status: 1000)`). `#receive(timeout: 5)` returns `nil` if no message
-arrives in time; `#send_*` / `#receive` on a closed socket are no-ops returning
-`nil`. The C layer only adds two framing primitives (`curl_ws_send` /
-`curl_ws_recv`); all message-level logic lives in `mrblib/url/websocket.rb`.
-Only genuine usage errors raise: a non-ws scheme, or a libcurl built without
-WebSocket support (needs 7.86+).
-
 ## Roadmap
 
-Everything libcurl can do is in scope. Every scheme libcurl is built with —
-http(s), ftp(s), sftp, scp, file, dict, gopher(s), pop3(s), imap(s), smtp(s),
-ldap(s), mqtt(s), rtsp, telnet, tftp, ws(s) — is now reachable; further work is
-filling in protocol-specific conveniences as they're needed.
+Every scheme libcurl is built with is exposed; further work is
+protocol-specific conveniences as they come up (richer RTSP transport
+negotiation, MQTT-over-WebSockets glue, FTP active-mode helpers, …),
+plus whatever falls out of CI feedback on the less-exercised TLS variants.
+The C surface is intentionally tiny and meant to stay that way — new
+behaviour lives in `mrblib/` next to the existing dispatch.

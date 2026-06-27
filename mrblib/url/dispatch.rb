@@ -484,7 +484,7 @@ class URL
   # --- per-session bookkeeping used by the blocking dispatch ---
 
   # True while this session's blocking loop is driving a transfer. Lets the
-  # verbs notice a re-entrant call (a URL.get from inside a callback): the
+  # verbs notice a re-entrant call (a URL("https://x").get from inside a callback): the
   # session can't drive a second transfer, so a throwaway one is used for
   # that nested fetch instead.
   def _busy?
