@@ -36,7 +36,20 @@
 #include <curl/curl.h>
 #include <stddef.h>
 #include <stdlib.h>
+#include <string.h>
 #include <threads.h>
+
+/* libcurl grew the WebSocket framing API (curl_ws_send / curl_ws_recv) and the
+ * CURLWS_* flags in 7.86.0. When the embedded libcurl is older the two
+ * primitives below compile to a single NotImplementedError stub and the flag
+ * constants publish as 0, so loading the gem never fails — only an actual ws://
+ * call does, with a clear message. */
+#if defined(LIBCURL_VERSION_NUM) && LIBCURL_VERSION_NUM >= 0x075600
+#  define MURL_HAVE_WEBSOCKETS 1
+#  define MURL_WS_FLAG(name) CURLWS_##name
+#else
+#  define MURL_WS_FLAG(name) 0
+#endif
 
 /* =========================================================================
  * URL::Libcurl::Easy  (CDATA = murl_easy_t, wraps CURL*)
@@ -490,6 +503,12 @@ murl_lc_easy_getinfo(mrb_state* mrb, mrb_value mod)
     murl_easy_check(mrb, curl_easy_getinfo(h, CURLINFO_CONTENT_TYPE, &ct));
     return ct ? mrb_str_new_cstr(mrb, ct) : mrb_nil_value();
   }
+  else if (info == MRB_SYM(activesocket)) {
+    curl_socket_t sock = CURL_SOCKET_BAD;
+    murl_easy_check(mrb, curl_easy_getinfo(h, CURLINFO_ACTIVESOCKET, &sock));
+    if (sock == CURL_SOCKET_BAD) return mrb_nil_value();
+    return mrb_int_value(mrb, (mrb_int)sock);
+  }
 
   mrb_raisef(mrb, E_ARGUMENT_ERROR, "unsupported info: :%n", info);
   return mrb_nil_value();
@@ -508,6 +527,108 @@ murl_lc_easy_strerror(mrb_state* mrb, mrb_value mod)
   const char* s = curl_easy_strerror((CURLcode)code);
   return s ? mrb_str_new_cstr(mrb, s) : mrb_nil_value();
 }
+
+/* =========================================================================
+ * easy_perform(easy) -> CURLcode int
+ *
+ * Blocking single-transfer drive. Used by the WebSocket connect path: with
+ * CONNECT_ONLY=2 set, curl_easy_perform runs the upgrade handshake and returns,
+ * leaving the connection (and its active socket) on the easy handle so the ws
+ * framing primitives below can use it. Returns the CURLcode as a value (0 ==
+ * CURLE_OK) so Ruby decides what a failure means — never raises on a transfer
+ * error; a callback-stashed exception still propagates.
+ * ========================================================================= */
+
+static mrb_value
+murl_lc_easy_perform(mrb_state* mrb, mrb_value mod)
+{
+  (void)mod;
+  mrb_value easy_obj;
+  mrb_get_args(mrb, "o", &easy_obj);
+  murl_easy_t* e = murl_easy_get(mrb, easy_obj);
+
+  CURLcode rc = curl_easy_perform(e->curl);
+  if (unlikely(mrb->exc != NULL)) mrb_exc_raise(mrb, mrb_obj_value(mrb->exc));
+  return mrb_convert_int(mrb, rc);
+}
+
+/* =========================================================================
+ * WebSocket framing primitives (curl_ws_recv / curl_ws_send).
+ *
+ * Thin marshalling only: copy bytes across the boundary and hand libcurl's
+ * frame flags back as a plain int. All message-level policy — fragment
+ * reassembly, text/binary/ping/pong/close dispatch, the send loop — lives in
+ * Ruby (URL::WebSocket). These run on a CONNECT_ONLY=2 Easy after the upgrade
+ * handshake has completed; the Ruby side selects on the active socket between
+ * calls, so CURLE_AGAIN is marshalled to nil rather than raised.
+ * ========================================================================= */
+
+#ifdef MURL_HAVE_WEBSOCKETS
+
+/* easy_ws_recv(easy, buflen) -> [String, flags_int, bytesleft_int] | nil
+ *   nil means CURLE_AGAIN (nothing readable yet); the caller waits on the fd. */
+static mrb_value
+murl_lc_easy_ws_recv(mrb_state* mrb, mrb_value mod)
+{
+  (void)mod;
+  mrb_value easy_obj;
+  mrb_int   buflen;
+  mrb_get_args(mrb, "oi", &easy_obj, &buflen);
+  if (unlikely(buflen <= 0)) mrb_raise(mrb, E_ARGUMENT_ERROR, "buflen must be positive");
+
+  murl_easy_t* e = murl_easy_get(mrb, easy_obj);
+
+  mrb_value buf = mrb_str_new(mrb, NULL, (mrb_int)buflen);
+  size_t recv = 0;
+  const struct curl_ws_frame* meta = NULL;
+  CURLcode rc = curl_ws_recv(e->curl, RSTRING_PTR(buf), (size_t)buflen, &recv, &meta);
+
+  if (rc == CURLE_AGAIN) return mrb_nil_value();
+  murl_easy_check(mrb, rc);
+
+  mrb_str_resize(mrb, buf, (mrb_int)recv);
+  int        flags     = meta ? meta->flags     : 0;
+  curl_off_t bytesleft = meta ? meta->bytesleft : 0;
+
+  mrb_value out = mrb_ary_new_capa(mrb, 3);
+  mrb_ary_push(mrb, out, buf);
+  mrb_ary_push(mrb, out, mrb_int_value(mrb, flags));
+  mrb_ary_push(mrb, out, mrb_int_value(mrb, (mrb_int)bytesleft));
+  return out;
+}
+
+/* easy_ws_send(easy, str, flags_int, fragsize=0) -> sent_count | nil
+ *   nil means CURLE_AGAIN (the socket isn't writable yet). */
+static mrb_value
+murl_lc_easy_ws_send(mrb_state* mrb, mrb_value mod)
+{
+  (void)mod;
+  mrb_value easy_obj, data;
+  mrb_int   flags;
+  mrb_int   fragsize = 0;
+  mrb_get_args(mrb, "oSi|i", &easy_obj, &data, &flags, &fragsize);
+
+  murl_easy_t* e = murl_easy_get(mrb, easy_obj);
+
+  size_t sent = 0;
+  CURLcode rc = curl_ws_send(e->curl, RSTRING_PTR(data), (size_t)RSTRING_LEN(data),
+                             &sent, (curl_off_t)fragsize, (unsigned int)flags);
+  if (rc == CURLE_AGAIN) return mrb_nil_value();
+  murl_easy_check(mrb, rc);
+  return mrb_convert_size_t(mrb, sent);
+}
+
+#else  /* libcurl built without WebSocket support */
+
+static mrb_value
+murl_lc_ws_unsupported(mrb_state* mrb, mrb_value mod)
+{
+  (void)mod;
+  mrb_raise(mrb, E_NOTIMP_ERROR, "embedded libcurl built without WebSocket support");
+  return mrb_nil_value();
+}
+
+#endif
 
 /* =========================================================================
  * multi_init -> Multi
@@ -734,6 +855,26 @@ mrb_mruby_url_gem_init(mrb_state* mrb)
   mrb_define_module_function_id(mrb, lc, MRB_SYM(easy_setopt),   murl_lc_easy_setopt,   MRB_ARGS_REQ(3));
   mrb_define_module_function_id(mrb, lc, MRB_SYM(easy_getinfo),  murl_lc_easy_getinfo,  MRB_ARGS_REQ(2));
   mrb_define_module_function_id(mrb, lc, MRB_SYM(easy_strerror), murl_lc_easy_strerror, MRB_ARGS_REQ(1));
+  mrb_define_module_function_id(mrb, lc, MRB_SYM(easy_perform),  murl_lc_easy_perform,  MRB_ARGS_REQ(1));
+
+#ifdef MURL_HAVE_WEBSOCKETS
+  mrb_define_module_function_id(mrb, lc, MRB_SYM(easy_ws_recv), murl_lc_easy_ws_recv, MRB_ARGS_REQ(2));
+  mrb_define_module_function_id(mrb, lc, MRB_SYM(easy_ws_send), murl_lc_easy_ws_send, MRB_ARGS_ARG(3, 1));
+#else
+  mrb_define_module_function_id(mrb, lc, MRB_SYM(easy_ws_recv), murl_lc_ws_unsupported, MRB_ARGS_ANY());
+  mrb_define_module_function_id(mrb, lc, MRB_SYM(easy_ws_send), murl_lc_ws_unsupported, MRB_ARGS_ANY());
+#endif
+
+  /* WebSocket frame flags (CURLWS_*), published so the Ruby URL::WebSocket can
+   * map its :text/:binary/:ping/:pong/:close symbols to the bitmask and back.
+   * Each is 0 when the embedded libcurl predates the WebSocket API. */
+  mrb_define_const_id(mrb, lc, MRB_SYM(WS_TEXT),   mrb_int_value(mrb, MURL_WS_FLAG(TEXT)));
+  mrb_define_const_id(mrb, lc, MRB_SYM(WS_BINARY), mrb_int_value(mrb, MURL_WS_FLAG(BINARY)));
+  mrb_define_const_id(mrb, lc, MRB_SYM(WS_CONT),   mrb_int_value(mrb, MURL_WS_FLAG(CONT)));
+  mrb_define_const_id(mrb, lc, MRB_SYM(WS_CLOSE),  mrb_int_value(mrb, MURL_WS_FLAG(CLOSE)));
+  mrb_define_const_id(mrb, lc, MRB_SYM(WS_PING),   mrb_int_value(mrb, MURL_WS_FLAG(PING)));
+  mrb_define_const_id(mrb, lc, MRB_SYM(WS_PONG),   mrb_int_value(mrb, MURL_WS_FLAG(PONG)));
+  mrb_define_const_id(mrb, lc, MRB_SYM(WS_OFFSET), mrb_int_value(mrb, MURL_WS_FLAG(OFFSET)));
 
   mrb_define_module_function_id(mrb, lc, MRB_SYM(multi_init),          murl_lc_multi_init,          MRB_ARGS_NONE());
   mrb_define_module_function_id(mrb, lc, MRB_SYM(multi_setopt),        murl_lc_multi_setopt,        MRB_ARGS_REQ(3));

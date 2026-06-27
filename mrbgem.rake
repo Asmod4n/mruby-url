@@ -45,7 +45,13 @@ MRuby::Gem::Specification.new('mruby-url') do |spec|
           "-DCMAKE_INSTALL_PREFIX=\"#{curl_inst}\"",
           "-DBUILD_SHARED_LIBS=OFF",
           "-DBUILD_CURL_EXE=OFF",
-          "-DCURL_USE_LIBPSL=OFF"
+          "-DCURL_USE_LIBPSL=OFF",
+          # WebSocket (ws://, and wss:// since Schannel gives us SSL below).
+          # Default-OFF in current curl, but state it explicitly so the gem's
+          # URL.websocket keeps working even if a future curl flips the default
+          # or HTTP_ONLY-style logic creeps in. Force-disabled only under
+          # CURL_DISABLE_HTTP / HTTP_ONLY, neither of which we set.
+          "-DCURL_DISABLE_WEBSOCKETS=OFF"
         ]
 
         if is_msvc

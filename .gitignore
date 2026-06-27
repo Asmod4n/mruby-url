@@ -63,3 +63,4 @@ test/smtp_port
 test/smtp_received
 test/imap_port
 test/imap_received
+test/ws_port
