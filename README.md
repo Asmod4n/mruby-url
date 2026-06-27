@@ -350,6 +350,22 @@ handful of flat `setopt` pass-throughs and a blocking `easy_perform`.
   `curl_global_cleanup` is deferred to `atexit` — not tied to `mrb_state`
   lifecycle, so spinning VMs up and down never races or tears down the
   TLS/Winsock layer under a live transfer.
+- **Connection / TLS session reuse across sessions** is wired through
+  libcurl's `CURLSH`. One `URL::Libcurl::SHARE` is created per VM in
+  `gem_init` and every `easy_init` attaches via `CURLOPT_SHARE`, so the
+  shared session **and** any throwaway session (created when the shared
+  one is busy mid-callback — see below) use one TCP-connection cache and
+  one TLS-session-ticket cache. A request fired from inside a callback
+  therefore resumes TLS (and often the live TCP/HTTP/2 connection) of
+  the original session instead of doing a full handshake. We share
+  `CONNECT` + `SSL_SESSION` only — `DNS`/`PSL` are auto-shared at the
+  multi level, `COOKIE`/`HSTS` are documented thread-unsafe and we set
+  them per-easy. Lock callbacks are deliberately unset; libcurl guards
+  every cache use with `if(share->lockfunc)`, so unset is the cheap
+  no-op for single-threaded mruby. Cleanup is a three-pass walk in
+  `gem_final` — disarm callbacks, clean every easy/multi (each detaches
+  itself from the share), then `curl_share_cleanup` — so the share is
+  the last thing to go.
 - `URL::Request` is private (`#initialize` undef'd; `_open` factory). The
   verbs use it internally. If you get one back from `info_read` you can call
   `#response_code`, `#effective_url`, `#total_time`, `#content_type`,
