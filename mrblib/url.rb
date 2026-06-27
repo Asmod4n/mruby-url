@@ -441,14 +441,23 @@ class URL
       _run_transfer(url, opts, on_chunk, nil)
     end
 
-    # Upload `data` (a String) to a URL of any upload-capable scheme (ftp(s),
-    # sftp, scp, tftp). The body is streamed through libcurl's read callback,
-    # chunked in Ruby. Returns a URL::Response.
+    # Upload `data` to a URL of any upload-capable scheme (ftp(s), sftp, scp,
+    # tftp). `data` is duck-typed (see _upload_reader); the gem accepts:
+    #   * a String
+    #   * any IO-like object — File, StringIO, Tempfile, Socket — pulled with
+    #     #read(max) so the body streams straight from disk / the socket
+    #   * a Fiber that yields String chunks on each resume(max)
+    #   * a Proc/Lambda/Method — call(max) returns the next chunk
+    #   * any Enumerable — each chunk is reslized to honour libcurl's max
+    # The caller owns the source: we never close a File, exhaust a Socket,
+    # rewind a StringIO, or clean up after a Fiber. Returns a URL::Response.
     #
-    #   URL.upload("ftp://host/incoming/x.txt", File.read("x.txt"))
+    #   URL.upload("ftp://host/incoming/x.txt", "the body bytes")
+    #   File.open("big.bin", "rb") { |f| URL.upload("sftp://h/path/big.bin", f) }
+    #   URL.upload("ftp://h/items.csv", csv_rows.lazy.map(&:to_s))
     def upload(url, data, **opts)
       _require_protocol!(url)
-      _run_transfer(url, opts, nil, data.to_s)
+      _run_transfer(url, opts, nil, data)
     end
 
     # Directory listing (FTP/SFTP) or message-id listing (POP3): a transfer with

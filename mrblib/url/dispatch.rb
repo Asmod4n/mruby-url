@@ -181,22 +181,13 @@ class URL
       url_str = _stringify_url(server_url, nil)
       req     = URL::Request._open(session, url_str)
 
+      _, reader = _upload_reader(body)
       req.setopt(:upload, true)
       req.setopt(:mail_from, from.to_s)
       req.setopt(:mail_rcpt, recipients.map(&:to_s))
       _apply_opts(req, opts)
 
-      payload = body.to_s
-      offset  = 0
-      req.on_read do |max|
-        if offset >= payload.bytesize
-          ""                              # EOF: tell libcurl the upload is done
-        else
-          chunk   = payload.byteslice(offset, max)
-          offset += chunk.bytesize
-          chunk
-        end
-      end
+      req.on_read(&reader)
 
       state = URL::TransferState.new
       req.on_data   { |chunk| state.append_body(chunk) }
@@ -293,26 +284,16 @@ class URL
       req     = URL::Request._open(session, url_str)
 
       if upload_data
+        size, reader = _upload_reader(upload_data)
         req.setopt(:upload, true)
-        req.setopt(:infilesize, upload_data.bytesize)
+        req.setopt(:infilesize, size) if size
       end
       _apply_opts(req, opts)
       req.headers = user_hdrs if user_hdrs && !user_hdrs.empty?
 
       state = URL::TransferState.new
 
-      if upload_data
-        offset = 0
-        req.on_read do |max|
-          if offset >= upload_data.bytesize
-            ""
-          else
-            chunk   = upload_data.byteslice(offset, max)
-            offset += chunk.bytesize
-            chunk
-          end
-        end
-      end
+      req.on_read(&reader) if upload_data
 
       if on_chunk
         req.on_data { |c| on_chunk.call(c) }
@@ -332,6 +313,90 @@ class URL
       tlen = (body.getbyte(0) << 8) | body.getbyte(1)
       return body if body.bytesize < 2 + tlen
       body.byteslice(2 + tlen, body.bytesize - 2 - tlen)
+    end
+
+    # Turn an upload body into a [size, reader] pair the read callback can drive.
+    # `body` is duck-typed (most specific wins):
+    #   1. responds_to?(:read)   — IO-like (File / StringIO / Socket / Tempfile)
+    #                              — chunks pulled from body.read(max). Size from
+    #                              #size or #stat when available; otherwise libcurl
+    #                              uploads as a stream and stops on "".
+    #   2. responds_to?(:resume) — Fiber-like — each resume(max) yields the next
+    #                              chunk (String). Stop when alive? is false or it
+    #                              returns nil / non-String.
+    #   3. responds_to?(:call)   — Proc/Lambda/Method — call(max) returns chunk.
+    #   4. responds_to?(:each)   — Enumerable — chunks come via to_enum.next; we
+    #                              buffer and slice to honour max.
+    #   5. fallback              — String (via to_s) — byteslice + offset.
+    # In the streaming variants size is unknown up front, so CURLOPT_INFILESIZE
+    # is skipped; libcurl will use chunked encoding where the protocol allows it.
+    # The body is NOT closed for the caller — opening/closing stays your job,
+    # just like every other Ruby IO.
+    def _upload_reader(body)
+      if body.respond_to?(:read)
+        size = begin
+                 body.respond_to?(:size) ? body.size :
+                 body.respond_to?(:stat) ? body.stat.size : nil
+               rescue StandardError
+                 nil
+               end
+        reader = lambda do |max|
+          chunk = body.read(max)
+          chunk.nil? ? "" : chunk        # nil = EOF
+        end
+        [size, reader]
+
+      elsif body.respond_to?(:resume)
+        reader = lambda do |max|
+          break "" if body.respond_to?(:alive?) && !body.alive?
+          chunk = body.resume(max) rescue nil
+          chunk.is_a?(String) ? chunk : ""
+        end
+        [nil, reader]
+
+      elsif body.respond_to?(:call)
+        reader = lambda do |max|
+          chunk = body.call(max)
+          chunk.is_a?(String) ? chunk : ""
+        end
+        [nil, reader]
+
+      elsif body.respond_to?(:each)
+        en  = body.to_enum
+        buf = String.new
+        eof = false
+        reader = lambda do |max|
+          while buf.bytesize < max && !eof
+            begin
+              buf << en.next.to_s
+            rescue StopIteration
+              eof = true
+            end
+          end
+          if buf.empty?
+            ""
+          else
+            take = buf.byteslice(0, max)
+            buf  = buf.byteslice(take.bytesize, buf.bytesize - take.bytesize) || String.new
+            take
+          end
+        end
+        [nil, reader]
+
+      else
+        payload = body.to_s
+        offset  = 0
+        reader  = lambda do |max|
+          if offset >= payload.bytesize
+            ""
+          else
+            chunk   = payload.byteslice(offset, max)
+            offset += chunk.bytesize
+            chunk
+          end
+        end
+        [payload.bytesize, reader]
+      end
     end
 
     def _response_from(url, req, state)

@@ -500,6 +500,46 @@ proto_assert('URL.upload ftp round-trip', 'ftp', $ftp_port) do
   URL.upload("#{base}/uploaded.txt", "payload-123\n")
   assert_equal "payload-123\n", URL.download("#{base}/uploaded.txt").body
 end
+
+proto_assert('URL.upload accepts an IO (File)', 'ftp', $ftp_port) do
+  base = "ftp://user:pass@127.0.0.1:#{$ftp_port}"
+  path = "/tmp/mruby-url-upload-#{Process.pid rescue 0}.txt"
+  body = "from-file-io\nline2\n"
+  File.open(path, "wb") { |f| f.write(body) }
+  File.open(path, "rb") { |f| URL.upload("#{base}/io.txt", f) }
+  (File.unlink(path) rescue nil)
+  assert_equal body, URL.download("#{base}/io.txt").body
+end
+
+proto_assert('URL.upload accepts a Proc (chunked source)', 'ftp', $ftp_port) do
+  base   = "ftp://user:pass@127.0.0.1:#{$ftp_port}"
+  chunks = ["from-proc-", "second-", "third-end\n"]
+  expect = chunks.join
+  proc   = lambda { |_max| chunks.shift || "" }
+  URL.upload("#{base}/proc.txt", proc)
+  assert_equal expect, URL.download("#{base}/proc.txt").body
+end
+
+proto_assert('URL.upload accepts an Enumerable (Array of chunks)', 'ftp', $ftp_port) do
+  base   = "ftp://user:pass@127.0.0.1:#{$ftp_port}"
+  parts  = ["enum-a-", "enum-b-", "enum-c-end\n"]
+  URL.upload("#{base}/enum.txt", parts)
+  assert_equal parts.join, URL.download("#{base}/enum.txt").body
+end
+
+proto_assert('URL.upload accepts a Fiber yielding chunks', 'ftp', $ftp_port) do
+  base = "ftp://user:pass@127.0.0.1:#{$ftp_port}"
+  expect = "fib-A-fib-B-fib-C-end\n"
+  fib = Fiber.new do
+    Fiber.yield "fib-A-"
+    Fiber.yield "fib-B-"
+    Fiber.yield "fib-C-end\n"
+    nil
+  end
+  URL.upload("#{base}/fib.txt", fib)
+  assert_equal expect, URL.download("#{base}/fib.txt").body
+end
+
 proto_assert('URL.download ftp missing file is a value', 'ftp', $ftp_port) do
   r = URL.download("ftp://user:pass@127.0.0.1:#{$ftp_port}/nope.txt")
   assert_false r.error.nil?
