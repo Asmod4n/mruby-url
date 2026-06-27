@@ -37,8 +37,23 @@ task :test => :mruby do
     File.unlink(f) if File.exist?(f)
   end
 
-  # MRI->MRI spawn. No cmd.exe wrapper, no Winsock init weirdness.
-  server_pid = spawn(RbConfig.ruby, server_script)
+  # MRI->MRI spawn. No cmd.exe wrapper, no Winsock init weirdness. pgroup: true
+  # makes the fixture a process-group leader, so its spawned daemons (sshd /
+  # slapd / mosquitto) join that group and we can tear the whole group down
+  # below — the daemons can never outlive the tests, even on SIGKILL.
+  group_kill =
+    begin
+      Process.kill(0, 0)  # probe; on Windows process-group signals don't apply
+      true
+    rescue
+      false
+    end
+  server_pid =
+    if group_kill
+      spawn(RbConfig.ruby, server_script, pgroup: true)
+    else
+      spawn(RbConfig.ruby, server_script)
+    end
 
   begin
     50.times do
@@ -52,8 +67,16 @@ task :test => :mruby do
       sh "rake all test"
     end
   ensure
+    # Kill the whole process group (negative pid) so every spawned daemon dies
+    # with the fixture; fall back to the single pid where groups aren't usable.
     begin
-      Process.kill("KILL", server_pid)
+      if group_kill
+        Process.kill("TERM", -server_pid) rescue nil  # let at_exit reap first
+        sleep 0.3
+        Process.kill("KILL", -server_pid) rescue nil
+      else
+        Process.kill("KILL", server_pid)
+      end
       Process.wait(server_pid)
     rescue
       # already gone
