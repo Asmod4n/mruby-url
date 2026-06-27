@@ -101,10 +101,14 @@ MRuby::Gem::Specification.new('mruby-url') do |spec|
     spec.cc.flags     << '-pthread'
     spec.linker.flags << '-pthread'
 
-    # Apple clang ships no C11 <threads.h>. Put our pthreads-backed shim
-    # (src/compat/threads.h, a 1:1 subset of the C11 interface) on the include
-    # path so <threads.h> resolves on macOS; Linux keeps using the real header.
-    if RUBY_PLATFORM =~ /darwin/
+    # Use C11 <threads.h> when the toolchain actually has it; otherwise (Apple
+    # clang, or any C99-only toolchain) fall back to our pthreads-backed shim
+    # in src/compat (a 1:1 subset of the C11 interface). search_header probes the
+    # compiler's real header search path (gcc/clang run `cc -Wp,-v`), so this is
+    # platform- and standard-independent rather than a hardcoded OS check. The
+    # shim is POSIX (pthreads), which is why it lives in this non-Windows branch;
+    # Windows always has <threads.h> via MSVC/MinGW and is handled above.
+    unless spec.cc.search_header('threads.h')
       spec.cc.include_paths << "#{spec.dir}/src/compat"
     end
   end
