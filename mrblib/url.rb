@@ -1,38 +1,32 @@
 # mrblib/url.rb
 #
-# One CURLM per request. URL.get / URL.post / etc. each create a fresh
-# isolated session. No session is ever shared across requests, so a write
-# callback that calls URL.get starts a completely independent transfer.
+# Public surface of mruby-url. Everything a user is meant to call lives here:
 #
-# Platform integration: set URL.default_loop= once at app startup with a
-# URL::EventLoop subclass driven by your native event loop (GLib, etc.).
-# That loop is attached to every new session created by the high-level
-# verbs. If no default loop is set, IOSelectLoop is used for synchronous
-# blocking requests.
-
-JSON.zero_copy_parsing = true
+#   URL.get / .head / .delete / .options / .post / .put / .patch
+#   URL.shared          - the reused per-state session (tune its pool)
+#   URL.default_loop=   - plug in a platform event loop once at startup
+#   URL::Response       - what the verbs return
+#   URL::EventLoop      - subclass to integrate a native event loop
+#   URL::Error          - usage errors raise it; the per-CURLcode transfer-error
+#                         family (Response#error) descends from it — see
+#                         mrblib/url/errors.rb
+#
+# The internal plumbing (request dispatch, the built-in IO.select loop,
+# transfer buffering, the Request callback setters) lives under mrblib/url/.
+# Dir.glob sorts "url.rb" before "url/...", so this file loads first and the
+# user-facing classes here — including URL::EventLoop, which the internal
+# URL::IOSelectLoop subclasses — are defined before the plumbing loads.
 
 # ============================================================================
-#  URL::Error / URL::HTTPError
+#  Errors
+#
+#  The taxonomy — URL::Error (usage errors) and the per-CURLcode
+#  URL::TransferError family returned as a value by Response#error — lives in
+#  mrblib/url/errors.rb, which loads after this file. We only open URL here so
+#  the user-facing classes below (EventLoop, Response) have their namespace.
 # ============================================================================
 
-class URL
-  class Error < StandardError; end
-
-  class HTTPError < Error
-    attr_reader :response
-
-    def initialize(response)
-      @response = response
-      msg = if response.error_code != 0
-              "transport error: #{response.error_message}"
-            else
-              "HTTP #{response.code} #{response.effective_url}"
-            end
-      super(msg)
-    end
-  end
-end
+class URL; end
 
 # ============================================================================
 #  URL::EventLoop — subclass and implement four primitives
@@ -62,174 +56,6 @@ class URL::EventLoop
 
   def cancel_timer(handle)
     raise NotImplementedError, "#{self.class}#cancel_timer"
-  end
-end
-
-# Session instances drive libcurl; the C socket/timer callbacks read
-# @event_loop off the session. #event_loop= is the public setter for users
-# plugging in their own loop; the high-level verbs set it internally.
-class URL
-  def event_loop
-    @event_loop
-  end
-
-  def event_loop=(loop)
-    unless loop.nil? || loop.is_a?(EventLoop)
-      raise TypeError, "expected a URL::EventLoop, got #{loop.class}"
-    end
-    @event_loop = loop
-  end
-
-  # --- internal session bookkeeping (not part of the request API) ---
-
-  # True while this session's blocking loop is driving a transfer. Lets the
-  # high-level verbs notice a re-entrant call (a URL.get from inside a
-  # callback): the session can't drive a second transfer, so a throwaway one
-  # is used for that nested fetch instead.
-  def _busy?
-    @running ? true : false
-  end
-
-  def _busy=(flag)
-    @running = flag
-    flag
-  end
-
-  # IOSelectLoop bound to this session, created once and reused across
-  # blocking calls so libcurl's socket registrations survive between requests.
-  def _sync_loop
-    @sync_loop ||= IOSelectLoop.new(self)
-  end
-end
-
-# ============================================================================
-#  URL::Request — block-style on_data / on_header setters
-# ============================================================================
-
-class URL::Request
-  def on_data(&block)
-    @on_data = block
-    self
-  end
-
-  def on_header(&block)
-    @on_header = block
-    self
-  end
-end
-
-# ============================================================================
-#  URL::TransferState  (internal)
-# ============================================================================
-
-class URL::TransferState
-  attr_accessor :error_code
-  attr_reader   :body, :raw_headers
-
-  def initialize
-    @body        = String.new
-    @raw_headers = []
-    @error_code  = 0
-  end
-
-  def append_body(chunk);  @body << chunk;       end
-  def append_header(line); @raw_headers << line; end
-end
-
-# ============================================================================
-#  URL::IOSelectLoop
-#
-#  Synchronous pull-driven loop used when no platform loop is available.
-#  Each call to #run pumps a single request to completion.
-# ============================================================================
-
-class URL::IOSelectLoop < URL::EventLoop
-  def initialize(session)
-    @session    = session
-    @watching   = {}   # fd_int => { io:, readiness: }
-    @timeout_ms = -1
-  end
-
-  def watch(io, readiness, &_block)
-    fd = io.fileno
-    @watching[fd] = { io: io, readiness: readiness }
-    fd
-  end
-
-  def unwatch(handle)
-    @watching.delete(handle)
-  end
-
-  def arm_timer(ms, &_block)
-    @timeout_ms = ms
-    :timer
-  end
-
-  def cancel_timer(_handle)
-    @timeout_ms = -1
-  end
-
-  def run(&on_complete)
-    @session.socket_action
-    @session.info_read { |req, code| on_complete&.call(req, code) }
-
-    until @watching.empty? && @timeout_ms < 0
-      reads  = []
-      writes = []
-      @watching.each_value do |w|
-        reads  << w[:io] if w[:readiness] == :in  || w[:readiness] == :inout
-        writes << w[:io] if w[:readiness] == :out || w[:readiness] == :inout
-      end
-
-      sel_timeout = @timeout_ms < 0 ? nil : @timeout_ms / 1000.0
-      r, w, _e = IO.select(reads, writes, nil, sel_timeout)
-
-      if r.nil? && w.nil?
-        @session.socket_action
-      else
-        r&.each { |io| @session.socket_action(io, :in)  }
-        w&.each { |io| @session.socket_action(io, :out) }
-      end
-
-      @session.info_read { |req, code| on_complete&.call(req, code) }
-    end
-  end
-
-  # Drive the session until `target` completes (or the loop falls idle),
-  # rather than until every socket is gone. Required for the reused shared
-  # session, whose kept-alive sockets can outlive any single request.
-  def run_until(target, &on_complete)
-    finished = false
-    drain = lambda do |req, code|
-      finished = true if req.equal?(target)
-      on_complete.call(req, code) if on_complete
-    end
-
-    @session.socket_action
-    @session.info_read(&drain)
-
-    until finished
-      reads  = []
-      writes = []
-      @watching.each_value do |w|
-        reads  << w[:io] if w[:readiness] == :in  || w[:readiness] == :inout
-        writes << w[:io] if w[:readiness] == :out || w[:readiness] == :inout
-      end
-
-      break if reads.empty? && writes.empty? && @timeout_ms < 0
-
-      sel_timeout = @timeout_ms < 0 ? nil : @timeout_ms / 1000.0
-      r, w, _e = IO.select(reads, writes, nil, sel_timeout)
-
-      if r.nil? && w.nil?
-        @session.socket_action
-      else
-        r&.each { |io| @session.socket_action(io, :in)  }
-        w&.each { |io| @session.socket_action(io, :out) }
-      end
-
-      @session.info_read(&drain)
-    end
   end
 end
 
@@ -273,9 +99,35 @@ class URL::Response
     json_lazy.into(target)
   end
 
+  # The error as a *value*: nil on a clean success, otherwise an exception object
+  # you can inspect or raise yourself — nothing is raised for you. It is set for
+  # both kinds of failure:
+  #   * a transport/CURLcode failure (timeout, DNS, TLS, refused connection) — the
+  #     matching URL::TransferError subclass, or a reused built-in such as
+  #     SocketError for a DNS failure;
+  #   * an HTTP error status (>= 400) even though libcurl itself returned OK — a
+  #     URL::HttpReturnedError (libcurl's own CURLE_HTTP_RETURNED_ERROR meaning).
+  # Usage errors (unsupported scheme, bad args) still raise at the call.
+  def error
+    return @error if @error
+    @error =
+      if @error_code != 0
+        URL._transfer_error(self, @error_code, error_message)
+      elsif @code && @code >= 400
+        URL::HttpReturnedError.new(
+          "HTTP #{@code} for #{@effective_url}",
+          response: self, curl_code: 22, curl_message: URL::Request.strerror(22)
+        )
+      end
+  end
+
+  # Cross into exception flow on demand: raise whatever #error holds (a transport
+  # failure or an HTTP status >= 400), or return self when the response is a clean
+  # success — so it chains: resp.raise_for_status!.json
   def raise_for_status!
-    return self unless error?
-    raise URL::HTTPError.new(self)
+    e = error
+    raise e if e
+    self
   end
 
   def content_length
@@ -360,12 +212,68 @@ class URL::Response
 end
 
 # ============================================================================
-#  URL — high-level HTTP verbs
+#  URL::Batch — the request builder yielded by URL.parallel
 #
-#  Each call creates a fresh isolated session (one CURLM per request).
-#  If a platform event loop has been set via URL.default_loop=, the session
-#  is attached to it and the call returns immediately (fire-and-forget).
-#  Otherwise an IOSelectLoop is created and the call blocks until done.
+#  Inside `URL.parallel { |p| ... }` you get one of these as `p`. Queue requests
+#  with the same verbs you'd call on URL (get/head/delete/options/post/put/
+#  patch), each tagged with an optional key: (defaults to its submission index,
+#  so duplicate URLs stay distinct). Register on_complete to receive each
+#  response as its transfer lands. The driving + result collection live in
+#  URL._drive_parallel (mrblib/url/dispatch.rb).
+# ============================================================================
+
+class URL::Batch
+  def initialize
+    @entries     = []
+    @on_complete = nil
+  end
+
+  def get(url, key: nil, **opts, &block);                _add(:GET,     url, nil,  key, opts, block); end
+  def head(url, key: nil, **opts, &block);               _add(:HEAD,    url, nil,  key, opts, block); end
+  def delete(url, body = nil, key: nil, **opts, &block); _add(:DELETE,  url, body, key, opts, block); end
+  def options(url, key: nil, **opts, &block);            _add(:OPTIONS, url, nil,  key, opts, block); end
+  def post(url, body = nil, key: nil, **opts, &block);   _add(:POST,    url, body, key, opts, block); end
+  def put(url, body = nil, key: nil, **opts, &block);    _add(:PUT,     url, body, key, opts, block); end
+  def patch(url, body = nil, key: nil, **opts, &block);  _add(:PATCH,   url, body, key, opts, block); end
+
+  # Called with (key, URL::Response) as each transfer finishes — in completion
+  # order, not submission order.
+  def on_complete(&block)
+    @on_complete = block
+    self
+  end
+
+  # Internal: consumed by URL._drive_parallel.
+  attr_reader :entries
+  def completion_block; @on_complete; end
+
+  private
+
+  def _add(method, url, body, key, opts, on_chunk)
+    @entries << {
+      method:   method,
+      url:      url,
+      body:     body,
+      key:      key.nil? ? @entries.size : key,
+      opts:     opts,
+      on_chunk: on_chunk,
+    }
+    self
+  end
+end
+
+# ============================================================================
+#  URL — the high-level verbs (the one API users call)
+#
+#  Blocking by default: each verb drives URL.shared (a session reused across
+#  calls so libcurl's connection pool, TLS sessions and HTTP/2 streams
+#  persist) and returns a URL::Response. A verb called from inside a callback
+#  can't reuse the busy session, so it transparently runs on a throwaway one.
+#
+#  Set URL.default_loop= with a URL::EventLoop subclass to drive transfers on
+#  a native loop instead; the verbs then fire-and-forget and return nil.
+#
+#  The dispatch behind these verbs lives in mrblib/url/dispatch.rb.
 # ============================================================================
 
 class URL
@@ -373,9 +281,18 @@ class URL
   DEFAULT_TIMEOUT_MS      = 30_000
   DEFAULT_FOLLOW_LOCATION = true
 
+  # The protocol schemes compiled into the embedded libcurl (lowercased), e.g.
+  # "http", "https", "smtp", "smtps". Published from C as a frozen Array.
+  PROTOS = URL::Libcurl::PROTOCOLS
+
   class << self
-    # Set once at startup with a platform-driven EventLoop instance.
-    # All non-blocking verbs will attach new sessions to this loop.
+    # True when the embedded libcurl was built with support for `proto`
+    # (case-insensitive), e.g. URL.supports?("smtps").
+    def supports?(proto)
+      PROTOS.include?(proto.to_s.downcase)
+    end
+    # Set once at startup with a platform-driven EventLoop instance; the
+    # verbs then attach new sessions to it and return immediately.
     def default_loop=(loop)
       unless loop.is_a?(EventLoop)
         raise TypeError, "expected a URL::EventLoop, got #{loop.class}"
@@ -402,149 +319,138 @@ class URL
     def put(url, body = nil, **opts, &block);    _fire(:PUT,     url, body, opts, &block); end
     def patch(url, body = nil, **opts, &block);  _fire(:PATCH,   url, body, opts, &block); end
 
-    def _fire(method, url, body, opts, &on_chunk)
-      if @default_loop
-        _fire_async(method, url, body, opts, &on_chunk)
+    # ----------------------------------------------------------------------
+    #  RFC-verb dispatch (non-HTTP protocols)
+    #
+    #  Each method below is named after the protocol's RFC verb (lowercased)
+    #  and dispatches on the URL scheme to that protocol's implementation,
+    #  gated on URL.supports?(scheme). A scheme with no arm — or an arm whose
+    #  protocol libcurl wasn't built with — raises URL::Error before any
+    #  connection attempt. The arms themselves live in dispatch.rb; the verbs
+    #  here are the public surface.
+    # ----------------------------------------------------------------------
+
+    # send — submit/send a message. (Deliberately overrides Object#send; use
+    # URL.__send__ for reflection. SMTP submission has no single issuable RFC
+    # verb — curl runs MAIL/RCPT/DATA for us.) For smtp/smtps this is the
+    # mail-send path: `server_url` carries the scheme (e.g.
+    # "smtps://mail.example.com:465"); `body` is the full RFC822 message
+    # (positional); `from:`/`to:` are the envelope (to: a String or an Array).
+    # The body is streamed to libcurl's read callback, chunked in Ruby. Extra
+    # **opts (ssl_verify_peer:, userpwd:, timeout_ms:, …) pass straight through
+    # to setopt. Blocking, like the verbs: returns a URL::Response whose `code`
+    # is the final SMTP reply (e.g. 250).
+    def send(server_url, body, from:, to:, **opts)
+      case _scheme_of(server_url)
+      when "smtp", "smtps"
+        _require_protocol!(server_url)
+        session    = shared
+        session    = open if session._busy?
+        recipients = to.is_a?(Array) ? to : [to]
+        req, state = _build_mail_request(session, server_url, from, recipients, body, opts)
+        _drive_sync(session, server_url, req, state)
       else
-        _fire_sync(method, url, body, opts, &on_chunk)
+        raise URL::Error, "send not available for #{_scheme_of(server_url)}"
       end
     end
 
-    # Non-blocking: attach to the platform loop and return immediately.
-    # The session lives until info_read sees the request complete, at which
-    # point the action block calls session.remove and lets GC clean up.
-    def _fire_async(method, url, body, opts, &on_chunk)
-      session = open
-      session.event_loop = @default_loop
-      req, _state = _build_request(session, method, url, body, opts, on_chunk)
-      session.add(req)
-      session.socket_action
-      nil
-    end
-
-    # Blocking. Reuse the shared session, except when it's already mid-flight
-    # because we were called from inside one of its callbacks — then it can't
-    # drive a second transfer, so this nested fetch gets a throwaway session.
-    def _fire_sync(method, url, body, opts, &on_chunk)
-      session = shared
-      session = open if session._busy?
-
-      loop = session._sync_loop
-      session.event_loop = loop
-
-      req, state = _build_request(session, method, url, body, opts, on_chunk)
-      session.add(req)
-      session._busy = true
-
-      begin
-        loop.run_until(req) do |r, code|
-          state.error_code = code if r.equal?(req) && code != 0
-        end
-        _response_from(url, req, state)
-      ensure
-        session._busy = false
-        session.remove(req) rescue nil
-      end
-    end
-
-    def _build_request(session, method, url, body, opts, on_chunk)
-      params    = opts.delete(:params)
-      json_body = opts.delete(:json)
-      form_body = opts.delete(:form)
-      auth      = opts.delete(:auth)
-      bearer    = opts.delete(:bearer)
-      user_hdrs = opts.delete(:headers)
-
-      auto_hdrs = {}
-
-      if json_body
-        body = JSON.dump(json_body)
-        auto_hdrs["Content-Type"] = "application/json"
-        auto_hdrs["Accept"]       = "application/json"
-      elsif form_body
-        body = _encode_form(form_body)
-        auto_hdrs["Content-Type"] = "application/x-www-form-urlencoded"
-      end
-
-      auto_hdrs["Authorization"] = "Bearer #{bearer}" if bearer
-
-      opts[:timeout_ms]      = DEFAULT_TIMEOUT_MS      unless opts.key?(:timeout_ms)
-      opts[:follow_location] = DEFAULT_FOLLOW_LOCATION unless opts.key?(:follow_location)
-      opts[:user_agent]      = DEFAULT_USER_AGENT       unless opts.key?(:user_agent)
-
-      if auth
-        user, pass = auth.is_a?(Array) ? auth : auth.to_s.split(":", 2)
-        opts[:userpwd] = "#{user}:#{pass}"
-      end
-
-      url_str = _stringify_url(url, params)
-      req     = URL::Request._open(session, url_str)
-
-      case method
-      when :GET    then # nothing
-      when :HEAD   then req.setopt(:nobody, true)
-      else              req.setopt(:custom_request, method.to_s)
-      end
-
-      req.setopt(:post_fields, body) if body
-      opts.each { |k, v| req.setopt(k, v) }
-
-      merged = auto_hdrs
-      if user_hdrs
-        merged = auto_hdrs.dup
-        user_hdrs.each { |k, v| merged[k.to_s] = v }
-      end
-      req.headers = merged unless merged.empty?
-
-      state = URL::TransferState.new
-      if on_chunk
-        req.on_data { |chunk| on_chunk.call(chunk) }
+    # UID MOVE (RFC 6851) — move message `uid:` to mailbox `to:`. The source
+    # mailbox is the URL path (imaps://host/INBOX); the uid goes into the
+    # command, not the URL. Returns a URL::Response; raises URL::Error on a
+    # NO/BAD reply.
+    def move(url, uid:, to:, **opts)
+      case _scheme_of(url)
+      when "imap", "imaps"
+        _require_protocol!(url)
+        _imap(url, "UID MOVE #{uid} #{to}", opts)
       else
-        req.on_data { |chunk| state.append_body(chunk) }
+        raise URL::Error, "move not available for #{_scheme_of(url)}"
       end
-      req.on_header { |line| state.append_header(line) }
-
-      [req, state]
     end
 
-    def _response_from(url, req, state)
-      URL::Response.new(
-        url:           url,
-        effective_url: req.effective_url,
-        code:          req.response_code,
-        body:          state.body,
-        raw_headers:   state.raw_headers,
-        total_time:    req.total_time,
-        content_type:  req.content_type,
-        error_code:    state.error_code,
-      )
-    end
-
-    def _stringify_url(url, params = nil)
-      base = url.respond_to?(:href) ? url.href : URI.parse(url.to_s).href
-      return base if params.nil? || params.empty?
-      qs = _encode_kv(params)
-      base_without_frag, frag = base.split("#", 2)
-      sep    = base_without_frag.include?("?") ? "&" : "?"
-      result = "#{base_without_frag}#{sep}#{qs}"
-      result = "#{result}##{frag}" if frag
-      result
-    end
-
-    def _encode_form(form)
-      _encode_kv(form)
-    end
-
-    def _encode_kv(h)
-      pairs = []
-      h.each do |k, v|
-        ks = URI.encode(k.to_s)
-        case v
-        when Array then v.each { |vv| pairs << "#{ks}=#{URI.encode(vv.to_s)}" }
-        else            pairs << "#{ks}=#{URI.encode(v.to_s)}"
-        end
+    # UID STORE (RFC 3501 §6.4.6) — change flags on message `uid:`. `op:` is
+    # "+" (add, the default), "-" (remove) or "" (replace); `flags:` is the
+    # flag string, e.g. "\\Deleted". Returns a URL::Response; raises on failure.
+    def store(url, uid:, flags:, op: "+", **opts)
+      case _scheme_of(url)
+      when "imap", "imaps"
+        _require_protocol!(url)
+        _imap(url, "UID STORE #{uid} #{op}FLAGS (#{flags})", opts)
+      else
+        raise URL::Error, "store not available for #{_scheme_of(url)}"
       end
-      pairs.join("&")
     end
+
+    # EXPUNGE (RFC 3501 §6.4.3) — permanently remove \Deleted-flagged messages
+    # from the mailbox in the URL path. Returns a URL::Response; raises on
+    # failure. Deleting a message is the documented two-step idiom:
+    # store(uid:, flags: "\\Deleted") then expunge(url).
+    def expunge(url, **opts)
+      case _scheme_of(url)
+      when "imap", "imaps"
+        _require_protocol!(url)
+        _imap(url, "EXPUNGE", opts)
+      else
+        raise URL::Error, "expunge not available for #{_scheme_of(url)}"
+      end
+    end
+
+    # UID FETCH (RFC 3501 §6.4.5) — fetch message `uid:` from the mailbox in
+    # the URL path. Implemented as a plain transfer against the IMAP URL with
+    # ";UID=<uid>" appended, so curl issues "UID FETCH <uid> BODY[]" itself and
+    # hands the message bytes to the write callback. The message is returned in
+    # the Response body, or streamed to `&block` if one is given. Raises on a
+    # NO/BAD reply.
+    def fetch(url, uid:, **opts, &block)
+      case _scheme_of(url)
+      when "imap", "imaps"
+        _require_protocol!(url)
+        _imap(url, nil, opts, ";UID=#{uid}", block)
+      else
+        raise URL::Error, "fetch not available for #{_scheme_of(url)}"
+      end
+    end
+
+    # ----------------------------------------------------------------------
+    #  Parallel fan-out
+    # ----------------------------------------------------------------------
+
+    # Run several requests concurrently on one session and collect them as they
+    # finish. Inside the block, queue requests on the yielded URL::Batch (same
+    # verbs as URL), each tagged with an optional key: (defaults to its
+    # submission index, so duplicate URLs stay distinct). Returns a Hash of
+    # { key => URL::Response } once all complete; register p.on_complete to also
+    # receive each response the moment its transfer lands.
+    #
+    #   results = URL.parallel do |p|
+    #     p.get("https://a.example/feed",   key: :feed)
+    #     p.post("https://b.example/login", key: :login, json: { ... })
+    #     p.on_complete { |key, resp| warm(key, resp) }
+    #   end
+    #   results[:feed].json
+    #
+    # Runs on URL.shared by default — so the connection pool, TLS sessions and
+    # HTTP/2 multiplexing carry over — falling back to a throwaway session when
+    # called re-entrantly from inside a callback. Runtime failures are values
+    # like everywhere else: each Response's #error is set, nothing is raised.
+    def parallel
+      raise ArgumentError, "URL.parallel requires a block" unless block_given?
+      batch = Batch.new
+      yield batch
+      _drive_parallel(batch.entries, batch.completion_block)
+    end
+  end
+
+  # Per-session event loop. Users only touch this for bring-your-own-loop
+  # integration; the verbs set it internally.
+  def event_loop
+    @event_loop
+  end
+
+  def event_loop=(loop)
+    unless loop.nil? || loop.is_a?(EventLoop)
+      raise TypeError, "expected a URL::EventLoop, got #{loop.class}"
+    end
+    @event_loop = loop
   end
 end

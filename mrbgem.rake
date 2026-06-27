@@ -9,8 +9,8 @@ MRuby::Gem::Specification.new('mruby-url') do |spec|
   spec.add_dependency 'mruby-fast-json'
   spec.add_dependency 'mruby-c-ext-helpers'
   spec.add_dependency 'mruby-socket'
+  spec.add_dependency 'mruby-string-ext'   # String#byteslice for Ruby-side upload chunking
   spec.add_test_dependency 'mruby-env'
-  spec.add_test_dependency 'mruby-string-ext'
   spec.add_test_dependency 'mruby-sleep'
 
   if spec.for_windows?
@@ -80,6 +80,12 @@ MRuby::Gem::Specification.new('mruby-url') do |spec|
         spec.linker.libraries     << 'libcurl'
         spec.cc.defines           << 'CURL_STATICLIB'
 
+        # mrb_url.c includes C11 <threads.h> (call_once). MSVC only exposes it
+        # — and recognizes the _Noreturn it declares thrd_exit with — under
+        # /std:c11; other Windows compilers take -std=c11. Without it the build
+        # fails with C2054/C2085 on _Noreturn.
+        spec.cc.flags << (is_msvc ? '/std:c11' : '-std=c11')
+
         spec.linker.libraries.concat %w[
           ws2_32 crypt32 wldap32 normaliz advapi32 iphlpapi secur32 bcrypt
         ]
@@ -89,5 +95,10 @@ MRuby::Gem::Specification.new('mruby-url') do |spec|
     # manager or Homebrew, and many other things on the box already depend
     # on it. Look it up via pkg-config rather than vendoring.
     spec.search_package 'libcurl'
+
+    # C11 call_once (gem_init) lives in libpthread on glibc < 2.34; -pthread
+    # pulls it in there and is a harmless no-op on modern glibc and macOS.
+    spec.cc.flags     << '-pthread'
+    spec.linker.flags << '-pthread'
   end
 end
