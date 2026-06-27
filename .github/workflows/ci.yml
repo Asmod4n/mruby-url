@@ -61,9 +61,25 @@ jobs:
           # at the Homebrew one for `spec.search_package 'libcurl'`.
           echo "PKG_CONFIG_PATH=$(brew --prefix curl)/lib/pkgconfig" >> "$GITHUB_ENV"
 
-      # Windows needs no extra step: the mswin Ruby provides MSVC, and CMake
-      # (used by mrbgem.rake to build the vendored libcurl) is preinstalled on
-      # the windows-latest runner.
+      # Windows: build with MSVC, the same as running `rake` with the project
+      # open in Visual Studio. mswin Ruby already selects the visualcpp toolchain;
+      # this guarantees a complete VS dev environment for the libcurl CMake build.
+      - name: Windows MSVC environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Windows — drop MSYS2 from INCLUDE/LIB so it can't shadow MSVC
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # setup-ruby's devkit leaks MSYS2 ucrt64 headers into INCLUDE, which
+          # collide with MSVC when CMake builds libcurl (corecrt.h/winnt.h:
+          # "No supported target architecture"). Strip them so the build sees a
+          # pristine Visual Studio toolchain.
+          $env:INCLUDE = ($env:INCLUDE -split ';' | Where-Object { $_ -and $_ -notmatch 'msys64' }) -join ';'
+          $env:LIB     = ($env:LIB     -split ';' | Where-Object { $_ -and $_ -notmatch 'msys64' }) -join ';'
+          "INCLUDE=$env:INCLUDE" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "LIB=$env:LIB"         | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: rake test
         run: rake test
