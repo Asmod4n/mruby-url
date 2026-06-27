@@ -12,6 +12,14 @@ end
 $server_port = File.read(port_file).strip.to_i
 $base        = "http://127.0.0.1:#{$server_port}"
 
+smtp_port_file = File.expand_path('smtp_port', File.dirname(__FILE__))
+$smtp_port     = File.exist?(smtp_port_file) ? File.read(smtp_port_file).strip.to_i : nil
+$smtp_received = File.expand_path('smtp_received', File.dirname(__FILE__))
+
+imap_port_file = File.expand_path('imap_port', File.dirname(__FILE__))
+$imap_port     = File.exist?(imap_port_file) ? File.read(imap_port_file).strip.to_i : nil
+$imap_received = File.expand_path('imap_received', File.dirname(__FILE__))
+
 # ---- assertions -----------------------------------------------------------
 
 assert('URL.get echo') do
@@ -65,10 +73,11 @@ assert('status codes classify correctly') do
 end
 
 assert('raise_for_status!') do
-  err = assert_raise(URL::HTTPError) do
+  err = assert_raise(URL::HttpReturnedError) do
     URL.get("#{$base}/status/500").raise_for_status!
   end
   assert_equal 500, err.response.code
+  assert_equal 22,  err.curl_code          # CURLE_HTTP_RETURNED_ERROR
 end
 
 assert('timeout produces decorated error') do
@@ -76,6 +85,30 @@ assert('timeout produces decorated error') do
   assert_true r.error?
   assert_equal 28, r.error_code           # CURLE_OPERATION_TIMEDOUT
   assert_include r.error_message, 'timed out'
+end
+
+assert('resp.error is set on failure (transport or HTTP) as a value, nil on success') do
+  ok = URL.get("#{$base}/echo")
+  assert_nil ok.error                                  # success -> no error value
+
+  # An HTTP error status is surfaced as a value too: resp.error holds an
+  # HttpReturnedError. Nothing is raised — it is a value like everything else.
+  http = URL.get("#{$base}/status/500")
+  assert_kind_of URL::HttpReturnedError, http.error
+  assert_kind_of URL::TransferError, http.error        # ...and the family base
+  assert_equal 500,  http.error.response.code
+  assert_equal 22,   http.error.curl_code              # CURLE_HTTP_RETURNED_ERROR
+  assert_true  http.server_error?
+
+  # A genuine below-the-response failure shows up as the matching URL:: value.
+  trans = URL.get("#{$base}/slow/2000", timeout_ms: 100)
+  assert_kind_of URL::OperationTimedout, trans.error   # CURLE_OPERATION_TIMEDOUT
+  assert_kind_of URL::TransferError, trans.error       # ...and the family base
+  assert_equal 28,    trans.error.curl_code
+  assert_equal trans, trans.error.response
+  # ...and it is a *value*, not raised — but you can still raise it yourself.
+  raised = assert_raise(URL::OperationTimedout) { raise trans.error }
+  assert_equal trans.error, raised
 end
 
 assert('gzip route reachable') do
@@ -120,4 +153,178 @@ assert('URL.get inside a callback transparently uses a fresh session') do
   assert_kind_of URL::Response, nested
   assert_true nested.success?
   assert_equal 'GET', nested.json['method']
+end
+
+# ---- Parallel fan-out -------------------------------------------------------
+
+assert('URL.parallel runs requests concurrently, keyed, with on_complete') do
+  seen = {}
+  results = URL.parallel do |p|
+    p.get("#{$base}/echo", params: { n: '1' }, key: :a)
+    p.post("#{$base}/echo", json: { x: 2 },    key: :b)
+    p.get("#{$base}/status/404",                key: :c)
+    p.on_complete { |key, resp| seen[key] = resp.code }
+  end
+
+  assert_equal 3, results.size
+  assert_kind_of URL::Response, results[:a]
+  assert_true  results[:a].success?
+  assert_equal '1',    results[:a].json['query']['n']
+  assert_equal 'POST', results[:b].json['method']
+  assert_true  results[:c].client_error?
+  assert_equal 404, results[:c].code
+  assert_kind_of URL::HttpReturnedError, results[:c].error  # HTTP error as a value, in the batch too
+  assert_equal 3,   seen.size
+  assert_equal 404, seen[:c]
+end
+
+assert('URL.parallel defaults keys to submission index; duplicate URLs stay distinct') do
+  results = URL.parallel do |p|
+    p.get("#{$base}/echo")
+    p.get("#{$base}/echo")
+  end
+  assert_equal [0, 1], results.keys.sort
+  assert_true results[0].success?
+  assert_true results[1].success?
+end
+
+assert('URL.parallel yields answers as they arrive (fast lands before slow)') do
+  order = []
+  results = URL.parallel do |p|
+    p.get("#{$base}/slow/300", key: :slow)
+    p.get("#{$base}/echo",     key: :fast)
+    p.on_complete { |key, _resp| order << key }
+  end
+  assert_equal 2, results.size
+  # Ran concurrently on one session: the instant echo completes before the 300ms
+  # one, so on_complete sees :fast first — serial dispatch would give :slow.
+  assert_equal :fast, order.first
+end
+
+# ---- SMTPS via URL.send: the upload/read path on an RFC-named verb ---------
+
+assert('URL.send over SMTPS delivers the envelope and body') do
+  skip "libcurl built without smtps"  unless URL.supports?("smtps")
+  skip "no smtp test server"          unless $smtp_port
+
+  resp = URL.send(
+    "smtps://127.0.0.1:#{$smtp_port}",
+    "Subject: hi\r\n\r\nhello body\r\n",   # body is positional (RFC822 message)
+    from:            "a@example.com",
+    to:              "b@example.com",
+    ssl_verify_peer: false,
+    ssl_verify_host: false,
+  )
+
+  assert_kind_of URL::Response, resp
+  assert_equal 0,   resp.error_code        # transport succeeded
+  assert_equal 250, resp.code              # final SMTP reply code
+
+  # The fixture appends the envelope + DATA body it received.
+  assert_true File.exist?($smtp_received)
+  got = File.read($smtp_received)
+  assert_include got, "FROM a@example.com"
+  assert_include got, "RCPT b@example.com"
+  assert_include got, "hello body"
+end
+
+assert('URL.send accepts an Array of recipients and gates unknown schemes') do
+  # Array recipients become the :mail_rcpt list.
+  if URL.supports?("smtps") && $smtp_port
+    resp = URL.send(
+      "smtps://127.0.0.1:#{$smtp_port}",
+      "Subject: multi\r\n\r\nbody two\r\n",
+      from:            "sender@example.com",
+      to:              ["x@example.com", "y@example.com"],
+      ssl_verify_peer: false,
+      ssl_verify_host: false,
+    )
+    assert_equal 250, resp.code
+    got = File.read($smtp_received)
+    assert_include got, "RCPT x@example.com"
+    assert_include got, "RCPT y@example.com"
+  end
+
+  # A scheme libcurl wasn't built with raises before any connection attempt.
+  err = assert_raise(URL::Error) do
+    URL.send("zzz://127.0.0.1:1", "hi", from: "a@x", to: "b@x")
+  end
+  assert_include err.message, "not available"
+end
+
+# ---- IMAPS: the RFC-verb dispatch (move / store / expunge / fetch) ---------
+
+assert('URL.store + URL.expunge perform the IMAP delete flow') do
+  skip "libcurl built without imaps" unless URL.supports?("imaps")
+  skip "no imap test server"         unless $imap_port
+
+  base = "imaps://user:pass@127.0.0.1:#{$imap_port}/INBOX"
+
+  sresp = URL.store(base, uid: 7, flags: "\\Deleted",
+                    ssl_verify_peer: false, ssl_verify_host: false)
+  assert_kind_of URL::Response, sresp
+  assert_equal 0, sresp.error_code
+
+  eresp = URL.expunge(base, ssl_verify_peer: false, ssl_verify_host: false)
+  assert_kind_of URL::Response, eresp
+  assert_equal 0, eresp.error_code
+
+  # The fixture recorded the exact command lines curl issued.
+  got = File.read($imap_received)
+  assert_include got, "UID STORE 7 +FLAGS (\\Deleted)"
+  assert_include got, "EXPUNGE"
+end
+
+assert('URL.move issues UID MOVE to the destination mailbox') do
+  skip "libcurl built without imaps" unless URL.supports?("imaps")
+  skip "no imap test server"         unless $imap_port
+
+  base = "imaps://user:pass@127.0.0.1:#{$imap_port}/INBOX"
+  resp = URL.move(base, uid: 9, to: "Archive",
+                  ssl_verify_peer: false, ssl_verify_host: false)
+  assert_kind_of URL::Response, resp
+  assert_equal 0, resp.error_code
+
+  got = File.read($imap_received)
+  assert_include got, "UID MOVE 9 Archive"
+end
+
+assert('URL.fetch returns the message body') do
+  skip "libcurl built without imaps" unless URL.supports?("imaps")
+  skip "no imap test server"         unless $imap_port
+
+  base = "imaps://user:pass@127.0.0.1:#{$imap_port}/INBOX"
+  resp = URL.fetch(base, uid: 2,
+                   ssl_verify_peer: false, ssl_verify_host: false)
+  assert_kind_of URL::Response, resp
+  assert_equal 0, resp.error_code
+  assert_include resp.body, "This is the fixture message body."
+
+  # A streaming block receives the bytes instead of buffering them.
+  streamed = ""
+  bresp = URL.fetch(base, uid: 2,
+                    ssl_verify_peer: false, ssl_verify_host: false) { |c| streamed << c }
+  assert_equal "", bresp.body
+  assert_include streamed, "This is the fixture message body."
+end
+
+assert('IMAP verbs gate unavailable / unknown schemes') do
+  # An IMAP verb on a non-IMAP scheme raises before any connection attempt.
+  err = assert_raise(URL::Error) do
+    URL.move("http://127.0.0.1:1/x", uid: 1, to: "y")
+  end
+  assert_include err.message, "not available"
+
+  err2 = assert_raise(URL::Error) do
+    URL.expunge("zzz://127.0.0.1:1/x")
+  end
+  assert_include err2.message, "not available"
+end
+
+assert('netrc options pass through; optional + missing file falls back') do
+  # :netrc maps to CURL_NETRC_OPTIONAL; a missing netrc file means no creds are
+  # loaded, so the (no-auth) echo request still succeeds.
+  r = URL.get("#{$base}/echo", netrc: true, netrc_file: "/nonexistent-netrc-xyz")
+  assert_true r.success?
+  assert_equal 'GET', r.json['method']
 end
