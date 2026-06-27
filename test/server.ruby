@@ -735,14 +735,16 @@ begin
       StrictModes no
     CFG
     FileUtils.mkdir_p('/run/sshd') rescue nil
-    if system(sshd, '-f', "#{sd}/sshd_config", '-E', "#{sd}/sshd.log")
-      sleep 0.5
-      kh = `ssh-keyscan -p #{ssh_port} -t ed25519 127.0.0.1 2>/dev/null`
-      if !kh.strip.empty?
-        File.write("#{sd}/known_hosts", kh)
-        write_port_atomic(File.join(__dir__, 'sftp_port'), ssh_port)
-        File.write(File.join(__dir__, 'sftp_meta'), "#{ssh_user}\n#{sd}/client\n#{sd}/known_hosts\n#{sd}/test.txt\n")
-      end
+    # -D keeps sshd in the foreground so it stays in our process group and gets
+    # reaped with it; without it sshd setsid()s away and would leak.
+    ssh_pid = spawn(sshd, '-D', '-f', "#{sd}/sshd_config", '-E', "#{sd}/sshd.log")
+    child_pids << ssh_pid
+    sleep 0.5
+    kh = `ssh-keyscan -p #{ssh_port} -t ed25519 127.0.0.1 2>/dev/null`
+    if !kh.strip.empty?
+      File.write("#{sd}/known_hosts", kh)
+      write_port_atomic(File.join(__dir__, 'sftp_port'), ssh_port)
+      File.write(File.join(__dir__, 'sftp_meta'), "#{ssh_user}\n#{sd}/client\n#{sd}/known_hosts\n#{sd}/test.txt\n")
     end
   end
 rescue => e
@@ -832,8 +834,18 @@ rescue => e
   $stderr.puts("mosquitto setup skipped: #{e.class}: #{e.message}")
 end
 
-# Reap the spawned daemons when this fixture is killed by rake.
-at_exit { child_pids.each { |pid| Process.kill('KILL', pid) rescue nil } }
+# Reap the spawned daemons on a clean exit / SIGTERM. This is the best-effort
+# path; the hard guarantee is rake killing this fixture's whole process group
+# (see the Rakefile), which catches daemons even on SIGKILL when at_exit can't
+# run. Also trap TERM/INT so a signalled shutdown still triggers at_exit.
+reap = lambda do
+  child_pids.each do |pid|
+    Process.kill('KILL', -pid) rescue nil   # the child's own group, if any
+    Process.kill('KILL', pid) rescue nil
+  end
+end
+at_exit(&reap)
+%w[TERM INT].each { |s| Signal.trap(s) { reap.call; exit!(0) } }
 
 # ---- announce + serve -----------------------------------------------------
 
