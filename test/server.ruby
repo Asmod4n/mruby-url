@@ -469,14 +469,16 @@ end
 # --- FTP ---
 ftp_root = File.join(Dir.tmpdir, "mruby-url-ftp-#{$$}")
 FileUtils.mkdir_p(ftp_root)
-File.write(File.join(ftp_root, 'hello.txt'), "ftp-hello\nline2\n")
-File.write(File.join(ftp_root, 'second.txt'), "second\n")
+# binwrite so newlines stay LF on Windows (text-mode File.write would turn the
+# fixture content into CRLF and the byte-exact download assertions would fail).
+File.binwrite(File.join(ftp_root, 'hello.txt'), "ftp-hello\nline2\n")
+File.binwrite(File.join(ftp_root, 'second.txt'), "second\n")
 
 # A plain file for file:// (outside ftp_root so it doesn't show up in FTP
 # listings) — record the platform-correct URL for the test to read (curl wants
 # file:///abs/path, file:///C:/... on Windows).
 file_fixture = File.join(Dir.tmpdir, "mruby-url-file-#{$$}.txt")
-File.write(file_fixture, "file-protocol-body\n")
+File.binwrite(file_fixture, "file-protocol-body\n")
 abs = file_fixture.tr('\\', '/')
 abs = "/#{abs}" unless abs.start_with?('/')
 File.write(File.join(__dir__, 'file_url'), "file://#{abs}")
@@ -717,7 +719,7 @@ begin
     sd = File.join(proto_dir, 'ssh'); FileUtils.mkdir_p(sd)
     system('ssh-keygen', '-q', '-t', 'ed25519', '-f', "#{sd}/host", '-N', '', out: File::NULL, err: File::NULL)
     system('ssh-keygen', '-q', '-t', 'ed25519', '-f', "#{sd}/client", '-N', '', out: File::NULL, err: File::NULL)
-    File.write("#{sd}/test.txt", "sftp-hello\nrow2\n")
+    File.binwrite("#{sd}/test.txt", "sftp-hello\nrow2\n")
     File.write("#{sd}/authorized_keys", File.read("#{sd}/client.pub"))
     File.chmod(0600, "#{sd}/authorized_keys")
     ssh_user = ENV['USER'] || 'root'
