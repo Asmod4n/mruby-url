@@ -25,12 +25,11 @@ jobs:
             ruby: '3.3'
           - os: macos-latest
             ruby: '3.3'
-          # mswin = the MSVC-built Ruby. It sets up the Visual Studio environment
-          # (VSINSTALLDIR), so mruby's Toolchain.guess selects :visualcpp and the
-          # gem builds the vendored libcurl against Schannel — the same path the
-          # gem ships for Windows.
+          # Windows builds with MSVC (see the windows-toolchain / MRUBY_CONFIG
+          # steps below). The Ruby flavor only runs rake + the test fixture, so a
+          # plain ucrt build is fine — we install no MinGW toolchain with it.
           - os: windows-latest
-            ruby: mswin
+            ruby: '3.3'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -41,6 +40,11 @@ jobs:
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: ${{ matrix.ruby }}
+          # Windows: do NOT install the MSYS2/MinGW devkit. That gcc toolchain
+          # both leaks its headers into INCLUDE (which breaks the MSVC libcurl
+          # build) and tempts mruby into the gcc toolchain. We build with MSVC.
+          # (Ignored on Linux/macOS.)
+          windows-toolchain: none
 
       # test/server.ruby (the HTTP/SMTP/IMAP fixture) needs webrick, which is no
       # longer a default gem on Ruby 3.x. rake is a default gem already.
@@ -61,30 +65,21 @@ jobs:
           # at the Homebrew one for `spec.search_package 'libcurl'`.
           echo "PKG_CONFIG_PATH=$(brew --prefix curl)/lib/pkgconfig" >> "$GITHUB_ENV"
 
-      # Windows: build with MSVC, the same as running `rake` with the project
-      # open in Visual Studio. mswin Ruby already selects the visualcpp toolchain;
-      # this guarantees a complete VS dev environment for the libcurl CMake build.
+      # Windows: set up the MSVC (Visual Studio) developer environment — cl, the
+      # SDK INCLUDE/LIB, VSINSTALLDIR — so the libcurl CMake build and the gem
+      # compile with MSVC. With windows-toolchain: none above, there is no MSYS2
+      # in the environment to collide with it.
       - name: Windows MSVC environment
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
 
-      # setup-ruby's devkit leaks MSYS2 ucrt64 into INCLUDE/LIB/PATH, and MSVC's
-      # cl then tries to compile MSYS2's gcc-specific corecrt.h/winnt.h while
-      # building libcurl (__UINTPTR_TYPE__ is a GCC builtin; "No supported target
-      # architecture"). Strip MSYS2 in the SAME process that runs the build —
-      # writing INCLUDE to GITHUB_ENV did not reach the CMake build reliably — so
-      # it configures and compiles against a pristine VS toolchain, exactly like
-      # running `rake` with the project open in Visual Studio.
-      - name: rake test (Windows, pristine MSVC)
+      # Force the MSVC toolchain explicitly via the dedicated build config, rather
+      # than relying on mruby's env auto-detection (which falls back to gcc when no
+      # VS environment is detected).
+      - name: Windows — use the MSVC build config
         if: runner.os == 'Windows'
         shell: pwsh
-        run: |
-          $noMsys = { param($v) ($v -split ';' | Where-Object { $_ -and $_ -notmatch 'msys64' }) -join ';' }
-          $env:INCLUDE = & $noMsys $env:INCLUDE
-          $env:LIB     = & $noMsys $env:LIB
-          $env:PATH    = & $noMsys $env:PATH
-          rake test
+        run: echo "MRUBY_CONFIG=build_config_visualcpp.rb" >> $env:GITHUB_ENV
 
       - name: rake test
-        if: runner.os != 'Windows'
         run: rake test
