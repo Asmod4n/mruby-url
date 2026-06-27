@@ -1,16 +1,17 @@
 /*
-** src/compat/threads.h — C11 <threads.h> shim for Apple platforms.
+** src/compat/threads.h — pthreads-backed C11 <threads.h> shim.
 **
-** Apple's libc/clang ship no C11 <threads.h>, so mrb_url.c's
+** Some toolchains ship no C11 <threads.h> (most notably Apple's libc/clang, and
+** C99-only toolchains), so mrb_url.c's
 **   #include <threads.h>
-** fails to compile on macOS. This file provides the exact subset of the C11
-** threads interface that mruby-url uses, mapped 1:1 onto POSIX pthreads (which
-** macOS always has).
+** fails to compile there. This file provides the exact subset of the C11
+** threads interface that mruby-url uses, mapped 1:1 onto POSIX pthreads.
 **
-** It is placed on the include path ONLY for Apple targets (see mrbgem.rake), so
-** Linux and the MinGW Windows build keep using the platform's real <threads.h>.
-** The names, types and signatures below match C11 exactly, so mrb_url.c needs
-** no changes.
+** mrbgem.rake puts it on the include path only when the compiler's real header
+** search has no <threads.h> (detected via spec.cc.search_header), so toolchains
+** that do ship one keep using it. It is POSIX (pthreads), hence the non-Windows
+** build branch. The names, types and signatures below match C11 exactly, so
+** mrb_url.c needs no changes.
 */
 #ifndef MRB_URL_COMPAT_THREADS_H
 #define MRB_URL_COMPAT_THREADS_H
