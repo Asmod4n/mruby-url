@@ -65,6 +65,7 @@ typedef struct murl_easy_t {
   CURL*              curl;
   struct curl_slist* req_headers;
   struct curl_slist* mail_rcpt;
+  struct curl_slist* quote;
 } murl_easy_t;
 
 static void
@@ -75,6 +76,7 @@ murl_easy_free(mrb_state* mrb, void* p)
   if (e->curl)        curl_easy_cleanup(e->curl);
   if (e->req_headers) curl_slist_free_all(e->req_headers);
   if (e->mail_rcpt)   curl_slist_free_all(e->mail_rcpt);
+  if (e->quote)       curl_slist_free_all(e->quote);
   mrb_free(mrb, e);
 }
 
@@ -363,6 +365,7 @@ murl_lc_easy_init(mrb_state* mrb, mrb_value mod)
   e->curl           = NULL;
   e->req_headers    = NULL;
   e->mail_rcpt      = NULL;
+  e->quote          = NULL;
 
   CURL* h = curl_easy_init();
   if (unlikely(!h)) mrb_raise(mrb, E_RUNTIME_ERROR, "curl_easy_init failed");
@@ -419,6 +422,17 @@ murl_lc_easy_setopt(mrb_state* mrb, mrb_value mod)
   else if (opt == MRB_SYM(mail_from))          rc = curl_easy_setopt(h, CURLOPT_MAIL_FROM, mrb_string_cstr(mrb, val));
   else if (opt == MRB_SYM(netrc))              rc = curl_easy_setopt(h, CURLOPT_NETRC, (long)mrb_as_int(mrb, val));
   else if (opt == MRB_SYM(netrc_file))         rc = curl_easy_setopt(h, CURLOPT_NETRC_FILE, mrb_string_cstr(mrb, val));
+  else if (opt == MRB_SYM(dirlistonly))        rc = curl_easy_setopt(h, CURLOPT_DIRLISTONLY, (long)mrb_bool(val));
+  else if (opt == MRB_SYM(ftp_create_dirs))    rc = curl_easy_setopt(h, CURLOPT_FTP_CREATE_MISSING_DIRS, (long)mrb_bool(val));
+  else if (opt == MRB_SYM(range))              rc = curl_easy_setopt(h, CURLOPT_RANGE, mrb_string_cstr(mrb, val));
+  else if (opt == MRB_SYM(infilesize))         rc = curl_easy_setopt(h, CURLOPT_INFILESIZE_LARGE, (curl_off_t)mrb_as_int(mrb, val));
+  else if (opt == MRB_SYM(ssh_knownhosts))     rc = curl_easy_setopt(h, CURLOPT_SSH_KNOWNHOSTS, mrb_string_cstr(mrb, val));
+  else if (opt == MRB_SYM(ssh_private_keyfile)) rc = curl_easy_setopt(h, CURLOPT_SSH_PRIVATE_KEYFILE, mrb_string_cstr(mrb, val));
+  else if (opt == MRB_SYM(ssh_public_keyfile)) rc = curl_easy_setopt(h, CURLOPT_SSH_PUBLIC_KEYFILE, mrb_string_cstr(mrb, val));
+  else if (opt == MRB_SYM(use_ssl))            rc = curl_easy_setopt(h, CURLOPT_USE_SSL, (long)mrb_as_int(mrb, val));
+  else if (opt == MRB_SYM(rtsp_request))       rc = curl_easy_setopt(h, CURLOPT_RTSP_REQUEST, (long)mrb_as_int(mrb, val));
+  else if (opt == MRB_SYM(rtsp_stream_uri))    rc = curl_easy_setopt(h, CURLOPT_RTSP_STREAM_URI, mrb_string_cstr(mrb, val));
+  else if (opt == MRB_SYM(rtsp_transport))     rc = curl_easy_setopt(h, CURLOPT_RTSP_TRANSPORT, mrb_string_cstr(mrb, val));
   else if (opt == MRB_SYM(post_fields)) {
     mrb_value s = mrb_str_to_str(mrb, val);
     curl_easy_setopt(h, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)RSTRING_LEN(s));
@@ -459,6 +473,25 @@ murl_lc_easy_setopt(mrb_state* mrb, mrb_value mod)
       e->mail_rcpt = next;
     }
     rc = curl_easy_setopt(h, CURLOPT_MAIL_RCPT, e->mail_rcpt);
+  }
+  else if (opt == MRB_SYM(quote)) {
+    /* Accept a Ruby Array of raw protocol commands (FTP/SFTP: "DELE x",
+     * "MKD d", "RENAME a b", …); build the slist here and free any previous
+     * one. Which commands to send is decided in Ruby. */
+    mrb_value arr = mrb_ensure_array_type(mrb, val);
+    if (e->quote) {
+      curl_slist_free_all(e->quote);
+      e->quote = NULL;
+    }
+    mrb_int n = RARRAY_LEN(arr);
+    for (mrb_int i = 0; i < n; i++) {
+      mrb_value cmd = mrb_ary_ref(mrb, arr, i);
+      struct curl_slist* next =
+        curl_slist_append(e->quote, mrb_string_cstr(mrb, cmd));
+      if (unlikely(!next)) mrb_raise(mrb, E_RUNTIME_ERROR, "curl_slist_append failed");
+      e->quote = next;
+    }
+    rc = curl_easy_setopt(h, CURLOPT_QUOTE, e->quote);
   }
   else {
     mrb_raisef(mrb, E_ARGUMENT_ERROR, "unsupported option: :%n", opt);

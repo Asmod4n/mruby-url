@@ -23,6 +23,28 @@ $imap_received = File.expand_path('imap_received', File.dirname(__FILE__))
 ws_port_file = File.expand_path('ws_port', File.dirname(__FILE__))
 $ws_port     = File.exist?(ws_port_file) ? File.read(ws_port_file).strip.to_i : nil
 
+def _port(name)
+  f = File.expand_path(name, File.dirname(__FILE__))
+  File.exist?(f) ? File.read(f).strip.to_i : nil
+end
+$ftp_port    = _port('ftp_port')
+$dict_port   = _port('dict_port')
+$gopher_port = _port('gopher_port')
+$pop3_port   = _port('pop3_port')
+$telnet_port = _port('telnet_port')
+$rtsp_port   = _port('rtsp_port')
+$tftp_port   = _port('tftp_port')
+$sftp_port   = _port('sftp_port')
+$ldap_port   = _port('ldap_port')
+$mqtt_port   = _port('mqtt_port')
+$ftps_port    = _port('ftps_port')
+$pop3s_port   = _port('pop3s_port')
+$gophers_port = _port('gophers_port')
+$ldaps_port   = _port('ldaps_port')
+$mqtts_port   = _port('mqtts_port')
+sftp_meta_f  = File.expand_path('sftp_meta', File.dirname(__FILE__))
+$sftp_meta   = File.exist?(sftp_meta_f) ? File.read(sftp_meta_f).split("\n") : nil
+
 # ---- assertions -----------------------------------------------------------
 
 assert('URL.get echo') do
@@ -381,5 +403,182 @@ if URL.supports?('ws') && $ws_port
     assert_true  ws.error.is_a?(URL::TransferError)
     assert_nil   ws.send_text('x')        # no-op on a closed socket, never raises
     assert_nil   ws.receive(timeout: 0)
+  end
+end
+
+# ---- non-HTTP protocols ---------------------------------------------------
+# Each is gated on the embedded libcurl supporting the scheme AND the fixture
+# having brought its server up (port file present), so a build/platform missing
+# either skips cleanly — the same approach curl's own suite takes.
+
+file_url_f = File.expand_path('file_url', File.dirname(__FILE__))
+$file_url  = File.exist?(file_url_f) ? File.read(file_url_f).strip : nil
+
+if URL.supports?('file') && $file_url
+  assert('URL.download file://') do
+    assert_equal "file-protocol-body\n", URL.download($file_url).body
+  end
+  assert('URL.download file:// missing is a value') do
+    r = URL.download("#{$file_url}.nope")
+    assert_false r.error.nil?
+  end
+end
+
+if URL.supports?('ftp') && $ftp_port
+  base = "ftp://user:pass@127.0.0.1:#{$ftp_port}"
+  assert('URL.download ftp') do
+    assert_equal "ftp-hello\nline2\n", URL.download("#{base}/hello.txt").body
+  end
+  assert('URL.list ftp directory') do
+    assert_equal %w[hello.txt second.txt], URL.list("#{base}/").lines.sort
+  end
+  assert('URL.upload ftp round-trip') do
+    URL.upload("#{base}/uploaded.txt", "payload-123\n")
+    assert_equal "payload-123\n", URL.download("#{base}/uploaded.txt").body
+  end
+  assert('URL.download ftp missing file is a value') do
+    r = URL.download("#{base}/nope.txt")
+    assert_false r.error.nil?
+    assert_true  r.error.is_a?(URL::TransferError)
+  end
+end
+
+if URL.supports?('dict') && $dict_port
+  assert('URL.lookup dict') do
+    r = URL.lookup("dict://127.0.0.1:#{$dict_port}", 'mruby')
+    assert_true r.error.nil?
+    assert_include r.body, 'mruby: a test definition.'
+  end
+end
+
+if URL.supports?('gopher') && $gopher_port
+  assert('URL.download gopher') do
+    r = URL.download("gopher://127.0.0.1:#{$gopher_port}/1/welcome")
+    assert_include r.body, 'selector=/welcome'
+  end
+end
+
+if URL.supports?('pop3') && $pop3_port
+  base = "pop3://u:p@127.0.0.1:#{$pop3_port}"
+  assert('URL.list pop3 messages') do
+    assert_equal ['1 26', '2 26'], URL.list("#{base}/").lines
+  end
+  assert('URL.download pop3 message') do
+    assert_equal "Subject: one\r\n\r\nbody one\r\n", URL.download("#{base}/1").body
+  end
+end
+
+if URL.supports?('telnet') && $telnet_port
+  assert('URL.download telnet banner') do
+    r = URL.download("telnet://127.0.0.1:#{$telnet_port}", timeout_ms: 3000)
+    assert_include r.body, 'telnet-banner-hello'
+  end
+end
+
+if URL.supports?('rtsp') && $rtsp_port
+  base = "rtsp://127.0.0.1:#{$rtsp_port}/stream"
+  assert('URL.rtsp OPTIONS') do
+    r = URL.rtsp(base, request: :options)
+    assert_equal 200, r.code
+    assert_include r.headers['public'], 'DESCRIBE'
+  end
+  assert('URL.rtsp DESCRIBE returns SDP') do
+    r = URL.rtsp(base, request: :describe)
+    assert_include r.body, 's=test-stream'
+  end
+end
+
+if URL.supports?('tftp') && $tftp_port
+  base = "tftp://127.0.0.1:#{$tftp_port}"
+  assert('URL.download tftp') do
+    assert_equal "tftp-hello-content\n", URL.download("#{base}/hello.txt").body
+  end
+  assert('URL.upload tftp round-trip') do
+    URL.upload("#{base}/up.txt", "tftp-up-data\n")
+    assert_equal "tftp-up-data\n", URL.download("#{base}/up.txt").body
+  end
+end
+
+if URL.supports?('sftp') && $sftp_port && $sftp_meta
+  user, key, kh, _remote = $sftp_meta
+  sd = File.dirname(key)
+  sopts = { ssh_private_keyfile: key, ssh_knownhosts: kh, userpwd: "#{user}:" }
+  base = "sftp://127.0.0.1:#{$sftp_port}#{sd}"
+  assert('URL.download sftp') do
+    assert_equal "sftp-hello\nrow2\n", URL.download("#{base}/test.txt", **sopts).body
+  end
+  assert('URL.upload sftp round-trip') do
+    URL.upload("#{base}/up.txt", "sftp-up\n", **sopts)
+    assert_equal "sftp-up\n", URL.download("#{base}/up.txt", **sopts).body
+  end
+  if URL.supports?('scp')
+    assert('URL.download scp') do
+      assert_equal "sftp-hello\nrow2\n", URL.download("scp://127.0.0.1:#{$sftp_port}#{sd}/test.txt", **sopts).body
+    end
+  end
+end
+
+if URL.supports?('ldap') && $ldap_port
+  assert('URL.search ldap') do
+    u = "ldap://127.0.0.1:#{$ldap_port}/dc=example,dc=com?cn,mail?sub?(objectClass=inetOrgPerson)"
+    r = URL.search(u)
+    assert_true r.error.nil?
+    assert_include r.body, 'alice@example.com'
+  end
+end
+
+if URL.supports?('mqtt') && $mqtt_port
+  assert('URL.publish + URL.subscribe mqtt') do
+    # The fixture retained "mqtt-retained" on test/topic; a one-shot subscribe
+    # receives it (payload extracted, keep-alive timeout normalized).
+    r = URL.subscribe("mqtt://127.0.0.1:#{$mqtt_port}/test/topic", timeout_ms: 2500)
+    assert_equal 'mqtt-retained', r.body
+    # Publishing should not error.
+    p = URL.publish("mqtt://127.0.0.1:#{$mqtt_port}/test/pub", 'hello')
+    assert_true p.error.nil?
+  end
+end
+
+# ---- TLS variants (self-signed cert; verification disabled) ----------------
+# Same protocols over implicit TLS — proving the ssl_verify_* + scheme paths.
+
+NOVERIFY = { ssl_verify_peer: false, ssl_verify_host: false }.freeze
+
+if URL.supports?('ftps') && $ftps_port
+  base = "ftps://user:pass@127.0.0.1:#{$ftps_port}"
+  assert('URL.download ftps (TLS control + data)') do
+    assert_equal "ftp-hello\nline2\n", URL.download("#{base}/hello.txt", **NOVERIFY).body
+  end
+  assert('URL.list ftps') do
+    assert_include URL.list("#{base}/", **NOVERIFY).lines, 'hello.txt'
+  end
+end
+
+if URL.supports?('pop3s') && $pop3s_port
+  assert('URL.download pop3s message') do
+    r = URL.download("pop3s://u:p@127.0.0.1:#{$pop3s_port}/1", **NOVERIFY)
+    assert_equal "Subject: one\r\n\r\nbody one\r\n", r.body
+  end
+end
+
+if URL.supports?('gopher') && $gophers_port
+  assert('URL.download gophers') do
+    r = URL.download("gophers://127.0.0.1:#{$gophers_port}/1/sec", **NOVERIFY)
+    assert_include r.body, 'selector=/sec'
+  end
+end
+
+if URL.supports?('ldaps') && $ldaps_port
+  assert('URL.search ldaps') do
+    u = "ldaps://127.0.0.1:#{$ldaps_port}/dc=example,dc=com?mail?sub?(cn=Alice)"
+    r = URL.search(u, **NOVERIFY)
+    assert_include r.body, 'alice@example.com'
+  end
+end
+
+if URL.supports?('mqtts') && $mqtts_port
+  assert('URL.subscribe mqtts') do
+    r = URL.subscribe("mqtts://127.0.0.1:#{$mqtts_port}/test/topic", timeout_ms: 2500, **NOVERIFY)
+    assert_equal 'mqtt-retained', r.body
   end
 end
