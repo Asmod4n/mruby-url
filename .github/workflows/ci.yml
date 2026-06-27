@@ -68,18 +68,23 @@ jobs:
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
 
-      - name: Windows — drop MSYS2 from INCLUDE/LIB so it can't shadow MSVC
+      # setup-ruby's devkit leaks MSYS2 ucrt64 into INCLUDE/LIB/PATH, and MSVC's
+      # cl then tries to compile MSYS2's gcc-specific corecrt.h/winnt.h while
+      # building libcurl (__UINTPTR_TYPE__ is a GCC builtin; "No supported target
+      # architecture"). Strip MSYS2 in the SAME process that runs the build —
+      # writing INCLUDE to GITHUB_ENV did not reach the CMake build reliably — so
+      # it configures and compiles against a pristine VS toolchain, exactly like
+      # running `rake` with the project open in Visual Studio.
+      - name: rake test (Windows, pristine MSVC)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          # setup-ruby's devkit leaks MSYS2 ucrt64 headers into INCLUDE, which
-          # collide with MSVC when CMake builds libcurl (corecrt.h/winnt.h:
-          # "No supported target architecture"). Strip them so the build sees a
-          # pristine Visual Studio toolchain.
-          $env:INCLUDE = ($env:INCLUDE -split ';' | Where-Object { $_ -and $_ -notmatch 'msys64' }) -join ';'
-          $env:LIB     = ($env:LIB     -split ';' | Where-Object { $_ -and $_ -notmatch 'msys64' }) -join ';'
-          "INCLUDE=$env:INCLUDE" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "LIB=$env:LIB"         | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $noMsys = { param($v) ($v -split ';' | Where-Object { $_ -and $_ -notmatch 'msys64' }) -join ';' }
+          $env:INCLUDE = & $noMsys $env:INCLUDE
+          $env:LIB     = & $noMsys $env:LIB
+          $env:PATH    = & $noMsys $env:PATH
+          rake test
 
       - name: rake test
+        if: runner.os != 'Windows'
         run: rake test
