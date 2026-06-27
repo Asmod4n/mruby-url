@@ -7,9 +7,16 @@
 # the kernel closes the write end, our read on STDIN returns, we exit.
 # No at_exit, no signal handler, no leaked process.
 
+# All run-state (port files, captured payloads, logs) lives in the throwaway
+# directory the Rakefile created and exported. Failing loudly here is fine —
+# the only supported entrypoint is `rake test`.
+STATE_DIR = ENV.fetch('MURL_TEST_STATE_DIR') do
+  abort "MURL_TEST_STATE_DIR not set — run via 'rake test', not this script directly"
+end
+
 # Redirect stderr to a log file *first*, so any failure during require or
 # server setup is captured. Without this we have no idea why the child died.
-$stderr.reopen(File.join(File.dirname(__FILE__), 'server.log'), 'w')
+$stderr.reopen(File.join(STATE_DIR, 'server.log'), 'w')
 $stderr.sync = true
 
 require 'webrick'
@@ -112,7 +119,7 @@ end
 # Self-signed cert is generated at runtime; the client (curl) is told not to
 # verify it (ssl_verify_peer:/ssl_verify_host: false in the test).
 
-received_file = File.join(__dir__, 'smtp_received')
+received_file = File.join(STATE_DIR, 'smtp_received')
 File.unlink(received_file) if File.exist?(received_file)
 
 # Self-signed RSA cert, valid now.
@@ -265,7 +272,7 @@ end
 # Self-signed cert generated above; the client (curl/mruby) is told not to
 # verify it (ssl_verify_peer:/ssl_verify_host: false in the test).
 
-imap_received_file = File.join(__dir__, 'imap_received')
+imap_received_file = File.join(STATE_DIR, 'imap_received')
 File.unlink(imap_received_file) if File.exist?(imap_received_file)
 
 IMAP_MESSAGE = "Subject: fixture mail\r\n\r\nThis is the fixture message body.\r\n".freeze
@@ -481,7 +488,7 @@ file_fixture = File.join(Dir.tmpdir, "mruby-url-file-#{$$}.txt")
 File.binwrite(file_fixture, "file-protocol-body\n")
 abs = file_fixture.tr('\\', '/')
 abs = "/#{abs}" unless abs.start_with?('/')
-File.write(File.join(__dir__, 'file_url'), "file://#{abs}")
+File.write(File.join(STATE_DIR, 'file_url'), "file://#{abs}")
 
 # `data_ssl`, when given, wraps each passive data connection in TLS (PROT P) —
 # the only extra needed to serve implicit ftps:// alongside plain ftp://.
@@ -745,8 +752,8 @@ begin
     kh = `ssh-keyscan -p #{ssh_port} -t ed25519 127.0.0.1 2>/dev/null`
     if !kh.strip.empty?
       File.write("#{sd}/known_hosts", kh)
-      write_port_atomic(File.join(__dir__, 'sftp_port'), ssh_port)
-      File.write(File.join(__dir__, 'sftp_meta'), "#{ssh_user}\n#{sd}/client\n#{sd}/known_hosts\n#{sd}/test.txt\n")
+      write_port_atomic(File.join(STATE_DIR, 'sftp_port'), ssh_port)
+      File.write(File.join(STATE_DIR, 'sftp_meta'), "#{ssh_user}\n#{sd}/client\n#{sd}/known_hosts\n#{sd}/test.txt\n")
     end
   end
 rescue => e
@@ -796,8 +803,8 @@ begin
                   '-d', '0', out: "#{ld}/slapd.log", err: "#{ld}/slapd.log")
       child_pids << pid
       sleep 0.7
-      write_port_atomic(File.join(__dir__, 'ldap_port'), ldap_port)
-      write_port_atomic(File.join(__dir__, 'ldaps_port'), ldaps_port)
+      write_port_atomic(File.join(STATE_DIR, 'ldap_port'), ldap_port)
+      write_port_atomic(File.join(STATE_DIR, 'ldaps_port'), ldaps_port)
     end
   end
 rescue => e
@@ -829,8 +836,8 @@ begin
       system(mp, '-h', '127.0.0.1', '-p', mqtt_port.to_s, '-t', 'test/topic', '-m', 'mqtt-retained', '-r',
              out: File::NULL, err: File::NULL)
     end
-    write_port_atomic(File.join(__dir__, 'mqtt_port'), mqtt_port)
-    write_port_atomic(File.join(__dir__, 'mqtts_port'), mqtts_port)
+    write_port_atomic(File.join(STATE_DIR, 'mqtt_port'), mqtt_port)
+    write_port_atomic(File.join(STATE_DIR, 'mqtts_port'), mqtts_port)
   end
 rescue => e
   $stderr.puts("mosquitto setup skipped: #{e.class}: #{e.message}")
@@ -853,22 +860,22 @@ at_exit(&reap)
 
 # server_port is written LAST so its existence means every server is up. The
 # fixture is rake's child; rake kills it in an ensure block when tests finish.
-write_port_atomic(File.join(__dir__, 'smtp_port'), smtp_port_value)
-write_port_atomic(File.join(__dir__, 'imap_port'), imap_port_value)
-write_port_atomic(File.join(__dir__, 'ws_port'),   ws_port_value)
-write_port_atomic(File.join(__dir__, 'ftp_port'),    ftp_srv.addr[1])
-write_port_atomic(File.join(__dir__, 'dict_port'),   dict_srv.addr[1])
-write_port_atomic(File.join(__dir__, 'gopher_port'), gopher_srv.addr[1])
-write_port_atomic(File.join(__dir__, 'pop3_port'),   pop3_srv.addr[1])
-write_port_atomic(File.join(__dir__, 'telnet_port'), telnet_srv.addr[1])
-write_port_atomic(File.join(__dir__, 'rtsp_port'),   rtsp_srv.addr[1])
-write_port_atomic(File.join(__dir__, 'tftp_port'),   tftp_port_value)
-write_port_atomic(File.join(__dir__, 'ftps_port'),    ftps_srv.addr[1])
-write_port_atomic(File.join(__dir__, 'pop3s_port'),   pop3s_srv.addr[1])
-write_port_atomic(File.join(__dir__, 'gophers_port'), gophers_srv.addr[1])
+write_port_atomic(File.join(STATE_DIR, 'smtp_port'), smtp_port_value)
+write_port_atomic(File.join(STATE_DIR, 'imap_port'), imap_port_value)
+write_port_atomic(File.join(STATE_DIR, 'ws_port'),   ws_port_value)
+write_port_atomic(File.join(STATE_DIR, 'ftp_port'),    ftp_srv.addr[1])
+write_port_atomic(File.join(STATE_DIR, 'dict_port'),   dict_srv.addr[1])
+write_port_atomic(File.join(STATE_DIR, 'gopher_port'), gopher_srv.addr[1])
+write_port_atomic(File.join(STATE_DIR, 'pop3_port'),   pop3_srv.addr[1])
+write_port_atomic(File.join(STATE_DIR, 'telnet_port'), telnet_srv.addr[1])
+write_port_atomic(File.join(STATE_DIR, 'rtsp_port'),   rtsp_srv.addr[1])
+write_port_atomic(File.join(STATE_DIR, 'tftp_port'),   tftp_port_value)
+write_port_atomic(File.join(STATE_DIR, 'ftps_port'),    ftps_srv.addr[1])
+write_port_atomic(File.join(STATE_DIR, 'pop3s_port'),   pop3s_srv.addr[1])
+write_port_atomic(File.join(STATE_DIR, 'gophers_port'), gophers_srv.addr[1])
 
 port      = server.config[:Port]
-port_file = File.join(__dir__, 'server_port')
+port_file = File.join(STATE_DIR, 'server_port')
 write_port_atomic(port_file, port)
 
 server.start

@@ -5,26 +5,31 @@
 # hold the pipe open. When this process exits, the write end closes,
 # the child's STDIN.read returns, and the child exits. No cleanup.
 
-port_file = File.expand_path('server_port', File.dirname(__FILE__))
+$state_dir = ENV['MURL_TEST_STATE_DIR']
+unless $state_dir && File.directory?($state_dir)
+  return "MURL_TEST_STATE_DIR not set or missing — run via 'rake test', not mrbtest directly"
+end
+
+port_file = File.join($state_dir, 'server_port')
 unless File.exist?(port_file)
   return "#{port_file} missing — run via 'rake test', not mrbtest directly"
 end
 $server_port = File.read(port_file).strip.to_i
 $base        = "http://127.0.0.1:#{$server_port}"
 
-smtp_port_file = File.expand_path('smtp_port', File.dirname(__FILE__))
+smtp_port_file = File.join($state_dir, 'smtp_port')
 $smtp_port     = File.exist?(smtp_port_file) ? File.read(smtp_port_file).strip.to_i : nil
-$smtp_received = File.expand_path('smtp_received', File.dirname(__FILE__))
+$smtp_received = File.join($state_dir, 'smtp_received')
 
-imap_port_file = File.expand_path('imap_port', File.dirname(__FILE__))
+imap_port_file = File.join($state_dir, 'imap_port')
 $imap_port     = File.exist?(imap_port_file) ? File.read(imap_port_file).strip.to_i : nil
-$imap_received = File.expand_path('imap_received', File.dirname(__FILE__))
+$imap_received = File.join($state_dir, 'imap_received')
 
-ws_port_file = File.expand_path('ws_port', File.dirname(__FILE__))
+ws_port_file = File.join($state_dir, 'ws_port')
 $ws_port     = File.exist?(ws_port_file) ? File.read(ws_port_file).strip.to_i : nil
 
 def _port(name)
-  f = File.expand_path(name, File.dirname(__FILE__))
+  f = File.join($state_dir, name)
   File.exist?(f) ? File.read(f).strip.to_i : nil
 end
 
@@ -53,7 +58,7 @@ $pop3s_port   = _port('pop3s_port')
 $gophers_port = _port('gophers_port')
 $ldaps_port   = _port('ldaps_port')
 $mqtts_port   = _port('mqtts_port')
-sftp_meta_f  = File.expand_path('sftp_meta', File.dirname(__FILE__))
+sftp_meta_f  = File.join($state_dir, 'sftp_meta')
 $sftp_meta   = File.exist?(sftp_meta_f) ? File.read(sftp_meta_f).split("\n") : nil
 
 # ---- assertions -----------------------------------------------------------
@@ -481,7 +486,7 @@ end
 # embedded libcurl lacks the scheme or the fixture's server for it didn't come
 # up — instead of silently vanishing. Same idea as curl's own suite.
 
-file_url_f = File.expand_path('file_url', File.dirname(__FILE__))
+file_url_f = File.join($state_dir, 'file_url')
 $file_url  = File.exist?(file_url_f) ? File.read(file_url_f).strip : nil
 
 proto_assert('URL.download file://', 'file', $file_url) do
