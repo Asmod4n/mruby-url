@@ -6,7 +6,7 @@
 #
 # Requires an embedded libcurl built with WebSocket support (7.86+).
 
-ws = URL.websocket("wss://echo.websocket.org")
+ws = URL("wss://echo.websocket.org").connect
 
 # A failed handshake is a value, not a raise — inspect it and stop.
 unless ws.open?

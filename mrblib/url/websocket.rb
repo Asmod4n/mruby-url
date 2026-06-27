@@ -8,7 +8,7 @@
 # the partial-send continuation loop, and blocking on the socket between calls —
 # lives here in memory-safe Ruby, in keeping with the gem's FFI-thin-C rule.
 #
-# You get one from URL.websocket(url); see mrblib/url/dispatch.rb for the
+# You get one from URL("wss://h").connect; see mrblib/url/dispatch.rb for the
 # connect path that drives the upgrade handshake to completion before handing
 # the established CONNECT_ONLY easy handle over.
 
