@@ -27,6 +27,17 @@ def _port(name)
   f = File.expand_path(name, File.dirname(__FILE__))
   File.exist?(f) ? File.read(f).strip.to_i : nil
 end
+
+# Run `name` unless `scheme` is unsupported by the embedded libcurl or `port`
+# (the readiness token) is nil, in which case it is recorded as a Skip with a
+# reason in the test report — instead of silently vanishing.
+def proto_assert(name, scheme, port)
+  assert(name) do
+    skip("libcurl built without #{scheme}") unless URL.supports?(scheme)
+    skip("no #{scheme} test server")        if port.nil?
+    yield
+  end
+end
 $ftp_port    = _port('ftp_port')
 $dict_port   = _port('dict_port')
 $gopher_port = _port('gopher_port')
@@ -358,227 +369,183 @@ end
 # Gated on a ws-capable libcurl (some distro builds omit the protocol) and the
 # local echo fixture. Drives the same paths as examples/websocket.rb.
 
-if URL.supports?('ws') && $ws_port
-  ws_base = "ws://127.0.0.1:#{$ws_port}/"
+proto_assert('URL.websocket text echo round-trip', 'ws', $ws_port) do
+  ws = URL.websocket("ws://127.0.0.1:#{$ws_port}/")
+  assert_true ws.open?
+  assert_nil  ws.error
+  ws.send_text('hello ws')
+  msg = ws.receive(timeout: 5)
+  assert_false msg.nil?
+  assert_true  msg.text?
+  assert_equal 'hello ws', msg.data
+  ws.close
+  assert_true ws.closed?
+end
 
-  assert('URL.websocket text echo round-trip') do
-    ws = URL.websocket(ws_base)
-    assert_true ws.open?
-    assert_nil  ws.error
-    ws.send_text('hello ws')
-    msg = ws.receive(timeout: 5)
-    assert_false msg.nil?
-    assert_true  msg.text?
-    assert_equal 'hello ws', msg.data
-    ws.close
-    assert_true ws.closed?
-  end
+proto_assert('URL.websocket binary echo round-trip', 'ws', $ws_port) do
+  ws = URL.websocket("ws://127.0.0.1:#{$ws_port}/")
+  payload = "\x00\x01\x02\x03\xfe\xff"
+  ws.send_binary(payload)
+  msg = ws.receive(timeout: 5)
+  assert_true  msg.binary?
+  assert_equal payload, msg.data
+  ws.close
+end
 
-  assert('URL.websocket binary echo round-trip') do
-    ws = URL.websocket(ws_base)
-    payload = "\x00\x01\x02\x03\xfe\xff"
-    ws.send_binary(payload)
-    msg = ws.receive(timeout: 5)
-    assert_true  msg.binary?
-    assert_equal payload, msg.data
-    ws.close
+proto_assert('URL.websocket block form yields a live socket then closes it', 'ws', $ws_port) do
+  got = nil
+  ws = URL.websocket("ws://127.0.0.1:#{$ws_port}/") do |w|
+    assert_true w.open?
+    w.send_text('blocky')
+    got = w.receive(timeout: 5)
   end
+  assert_equal 'blocky', got.data
+  assert_true ws.closed?
+end
 
-  assert('URL.websocket block form yields a live socket then closes it') do
-    got = nil
-    ws = URL.websocket(ws_base) do |w|
-      assert_true w.open?
-      w.send_text('blocky')
-      got = w.receive(timeout: 5)
-    end
-    assert_equal 'blocky', got.data
-    assert_true ws.closed?
-  end
-
-  assert('URL.websocket failed upgrade is a value, not a raise') do
-    # Point ws:// at the plain HTTP server: it answers with a normal response,
-    # never a 101, so the handshake fails. That is a value on #error.
-    ws = URL.websocket("ws://127.0.0.1:#{$server_port}/echo")
-    assert_false ws.open?
-    assert_true  ws.error.is_a?(URL::TransferError)
-    assert_nil   ws.send_text('x')        # no-op on a closed socket, never raises
-    assert_nil   ws.receive(timeout: 0)
-  end
+proto_assert('URL.websocket failed upgrade is a value, not a raise', 'ws', $ws_port) do
+  # Point ws:// at the plain HTTP server: it answers with a normal response,
+  # never a 101, so the handshake fails. That is a value on #error.
+  ws = URL.websocket("ws://127.0.0.1:#{$server_port}/echo")
+  assert_false ws.open?
+  assert_true  ws.error.is_a?(URL::TransferError)
+  assert_nil   ws.send_text('x')        # no-op on a closed socket, never raises
+  assert_nil   ws.receive(timeout: 0)
 end
 
 # ---- non-HTTP protocols ---------------------------------------------------
-# Each is gated on the embedded libcurl supporting the scheme AND the fixture
-# having brought its server up (port file present), so a build/platform missing
-# either skips cleanly — the same approach curl's own suite takes.
+# Each test announces itself as Skipped (with the reason) in the report when the
+# embedded libcurl lacks the scheme or the fixture's server for it didn't come
+# up — instead of silently vanishing. Same idea as curl's own suite.
 
 file_url_f = File.expand_path('file_url', File.dirname(__FILE__))
 $file_url  = File.exist?(file_url_f) ? File.read(file_url_f).strip : nil
 
-if URL.supports?('file') && $file_url
-  assert('URL.download file://') do
-    assert_equal "file-protocol-body\n", URL.download($file_url).body
-  end
-  assert('URL.download file:// missing is a value') do
-    r = URL.download("#{$file_url}.nope")
-    assert_false r.error.nil?
-  end
+proto_assert('URL.download file://', 'file', $file_url) do
+  assert_equal "file-protocol-body\n", URL.download($file_url).body
+end
+proto_assert('URL.download file:// missing is a value', 'file', $file_url) do
+  assert_false URL.download("#{$file_url}.nope").error.nil?
 end
 
-if URL.supports?('ftp') && $ftp_port
+proto_assert('URL.download ftp', 'ftp', $ftp_port) do
+  assert_equal "ftp-hello\nline2\n", URL.download("ftp://user:pass@127.0.0.1:#{$ftp_port}/hello.txt").body
+end
+proto_assert('URL.list ftp directory', 'ftp', $ftp_port) do
+  assert_equal %w[hello.txt second.txt], URL.list("ftp://user:pass@127.0.0.1:#{$ftp_port}/").lines.sort
+end
+proto_assert('URL.upload ftp round-trip', 'ftp', $ftp_port) do
   base = "ftp://user:pass@127.0.0.1:#{$ftp_port}"
-  assert('URL.download ftp') do
-    assert_equal "ftp-hello\nline2\n", URL.download("#{base}/hello.txt").body
-  end
-  assert('URL.list ftp directory') do
-    assert_equal %w[hello.txt second.txt], URL.list("#{base}/").lines.sort
-  end
-  assert('URL.upload ftp round-trip') do
-    URL.upload("#{base}/uploaded.txt", "payload-123\n")
-    assert_equal "payload-123\n", URL.download("#{base}/uploaded.txt").body
-  end
-  assert('URL.download ftp missing file is a value') do
-    r = URL.download("#{base}/nope.txt")
-    assert_false r.error.nil?
-    assert_true  r.error.is_a?(URL::TransferError)
-  end
+  URL.upload("#{base}/uploaded.txt", "payload-123\n")
+  assert_equal "payload-123\n", URL.download("#{base}/uploaded.txt").body
+end
+proto_assert('URL.download ftp missing file is a value', 'ftp', $ftp_port) do
+  r = URL.download("ftp://user:pass@127.0.0.1:#{$ftp_port}/nope.txt")
+  assert_false r.error.nil?
+  assert_true  r.error.is_a?(URL::TransferError)
 end
 
-if URL.supports?('dict') && $dict_port
-  assert('URL.lookup dict') do
-    r = URL.lookup("dict://127.0.0.1:#{$dict_port}", 'mruby')
-    assert_true r.error.nil?
-    assert_include r.body, 'mruby: a test definition.'
-  end
+proto_assert('URL.lookup dict', 'dict', $dict_port) do
+  r = URL.lookup("dict://127.0.0.1:#{$dict_port}", 'mruby')
+  assert_true r.error.nil?
+  assert_include r.body, 'mruby: a test definition.'
 end
 
-if URL.supports?('gopher') && $gopher_port
-  assert('URL.download gopher') do
-    r = URL.download("gopher://127.0.0.1:#{$gopher_port}/1/welcome")
-    assert_include r.body, 'selector=/welcome'
-  end
+proto_assert('URL.download gopher', 'gopher', $gopher_port) do
+  assert_include URL.download("gopher://127.0.0.1:#{$gopher_port}/1/welcome").body, 'selector=/welcome'
 end
 
-if URL.supports?('pop3') && $pop3_port
-  base = "pop3://u:p@127.0.0.1:#{$pop3_port}"
-  assert('URL.list pop3 messages') do
-    assert_equal ['1 26', '2 26'], URL.list("#{base}/").lines
-  end
-  assert('URL.download pop3 message') do
-    assert_equal "Subject: one\r\n\r\nbody one\r\n", URL.download("#{base}/1").body
-  end
+proto_assert('URL.list pop3 messages', 'pop3', $pop3_port) do
+  assert_equal ['1 26', '2 26'], URL.list("pop3://u:p@127.0.0.1:#{$pop3_port}/").lines
+end
+proto_assert('URL.download pop3 message', 'pop3', $pop3_port) do
+  assert_equal "Subject: one\r\n\r\nbody one\r\n", URL.download("pop3://u:p@127.0.0.1:#{$pop3_port}/1").body
 end
 
-if URL.supports?('telnet') && $telnet_port
-  assert('URL.download telnet banner') do
-    r = URL.download("telnet://127.0.0.1:#{$telnet_port}", timeout_ms: 3000)
-    assert_include r.body, 'telnet-banner-hello'
-  end
+proto_assert('URL.download telnet banner', 'telnet', $telnet_port) do
+  r = URL.download("telnet://127.0.0.1:#{$telnet_port}", timeout_ms: 3000)
+  assert_include r.body, 'telnet-banner-hello'
 end
 
-if URL.supports?('rtsp') && $rtsp_port
-  base = "rtsp://127.0.0.1:#{$rtsp_port}/stream"
-  assert('URL.rtsp OPTIONS') do
-    r = URL.rtsp(base, request: :options)
-    assert_equal 200, r.code
-    assert_include r.headers['public'], 'DESCRIBE'
-  end
-  assert('URL.rtsp DESCRIBE returns SDP') do
-    r = URL.rtsp(base, request: :describe)
-    assert_include r.body, 's=test-stream'
-  end
+proto_assert('URL.rtsp OPTIONS', 'rtsp', $rtsp_port) do
+  r = URL.rtsp("rtsp://127.0.0.1:#{$rtsp_port}/stream", request: :options)
+  assert_equal 200, r.code
+  assert_include r.headers['public'], 'DESCRIBE'
+end
+proto_assert('URL.rtsp DESCRIBE returns SDP', 'rtsp', $rtsp_port) do
+  r = URL.rtsp("rtsp://127.0.0.1:#{$rtsp_port}/stream", request: :describe)
+  assert_include r.body, 's=test-stream'
 end
 
-if URL.supports?('tftp') && $tftp_port
+proto_assert('URL.download tftp', 'tftp', $tftp_port) do
+  assert_equal "tftp-hello-content\n", URL.download("tftp://127.0.0.1:#{$tftp_port}/hello.txt").body
+end
+proto_assert('URL.upload tftp round-trip', 'tftp', $tftp_port) do
   base = "tftp://127.0.0.1:#{$tftp_port}"
-  assert('URL.download tftp') do
-    assert_equal "tftp-hello-content\n", URL.download("#{base}/hello.txt").body
-  end
-  assert('URL.upload tftp round-trip') do
-    URL.upload("#{base}/up.txt", "tftp-up-data\n")
-    assert_equal "tftp-up-data\n", URL.download("#{base}/up.txt").body
-  end
+  URL.upload("#{base}/up.txt", "tftp-up-data\n")
+  assert_equal "tftp-up-data\n", URL.download("#{base}/up.txt").body
 end
 
-if URL.supports?('sftp') && $sftp_port && $sftp_meta
-  user, key, kh, _remote = $sftp_meta
-  sd = File.dirname(key)
+$sftp_ready = ($sftp_port && $sftp_meta) ? $sftp_port : nil
+proto_assert('URL.download sftp', 'sftp', $sftp_ready) do
+  user, key, kh, = $sftp_meta
   sopts = { ssh_private_keyfile: key, ssh_knownhosts: kh, userpwd: "#{user}:" }
-  base = "sftp://127.0.0.1:#{$sftp_port}#{sd}"
-  assert('URL.download sftp') do
-    assert_equal "sftp-hello\nrow2\n", URL.download("#{base}/test.txt", **sopts).body
-  end
-  assert('URL.upload sftp round-trip') do
-    URL.upload("#{base}/up.txt", "sftp-up\n", **sopts)
-    assert_equal "sftp-up\n", URL.download("#{base}/up.txt", **sopts).body
-  end
-  if URL.supports?('scp')
-    assert('URL.download scp') do
-      assert_equal "sftp-hello\nrow2\n", URL.download("scp://127.0.0.1:#{$sftp_port}#{sd}/test.txt", **sopts).body
-    end
-  end
+  assert_equal "sftp-hello\nrow2\n",
+    URL.download("sftp://127.0.0.1:#{$sftp_port}#{File.dirname(key)}/test.txt", **sopts).body
+end
+proto_assert('URL.upload sftp round-trip', 'sftp', $sftp_ready) do
+  user, key, kh, = $sftp_meta
+  sopts = { ssh_private_keyfile: key, ssh_knownhosts: kh, userpwd: "#{user}:" }
+  base = "sftp://127.0.0.1:#{$sftp_port}#{File.dirname(key)}"
+  URL.upload("#{base}/up.txt", "sftp-up\n", **sopts)
+  assert_equal "sftp-up\n", URL.download("#{base}/up.txt", **sopts).body
+end
+proto_assert('URL.download scp', 'scp', $sftp_ready) do
+  user, key, kh, = $sftp_meta
+  sopts = { ssh_private_keyfile: key, ssh_knownhosts: kh, userpwd: "#{user}:" }
+  assert_equal "sftp-hello\nrow2\n",
+    URL.download("scp://127.0.0.1:#{$sftp_port}#{File.dirname(key)}/test.txt", **sopts).body
 end
 
-if URL.supports?('ldap') && $ldap_port
-  assert('URL.search ldap') do
-    u = "ldap://127.0.0.1:#{$ldap_port}/dc=example,dc=com?cn,mail?sub?(objectClass=inetOrgPerson)"
-    r = URL.search(u)
-    assert_true r.error.nil?
-    assert_include r.body, 'alice@example.com'
-  end
+proto_assert('URL.search ldap', 'ldap', $ldap_port) do
+  r = URL.search("ldap://127.0.0.1:#{$ldap_port}/dc=example,dc=com?cn,mail?sub?(objectClass=inetOrgPerson)")
+  assert_true r.error.nil?
+  assert_include r.body, 'alice@example.com'
 end
 
-if URL.supports?('mqtt') && $mqtt_port
-  assert('URL.publish + URL.subscribe mqtt') do
-    # The fixture retained "mqtt-retained" on test/topic; a one-shot subscribe
-    # receives it (payload extracted, keep-alive timeout normalized).
-    r = URL.subscribe("mqtt://127.0.0.1:#{$mqtt_port}/test/topic", timeout_ms: 2500)
-    assert_equal 'mqtt-retained', r.body
-    # Publishing should not error.
-    p = URL.publish("mqtt://127.0.0.1:#{$mqtt_port}/test/pub", 'hello')
-    assert_true p.error.nil?
-  end
+proto_assert('URL.publish + URL.subscribe mqtt', 'mqtt', $mqtt_port) do
+  r = URL.subscribe("mqtt://127.0.0.1:#{$mqtt_port}/test/topic", timeout_ms: 2500)
+  assert_equal 'mqtt-retained', r.body
+  assert_true URL.publish("mqtt://127.0.0.1:#{$mqtt_port}/test/pub", 'hello').error.nil?
 end
 
 # ---- TLS variants (self-signed cert; verification disabled) ----------------
-# Same protocols over implicit TLS — proving the ssl_verify_* + scheme paths.
-
 NOVERIFY = { ssl_verify_peer: false, ssl_verify_host: false }.freeze
 
-if URL.supports?('ftps') && $ftps_port
-  base = "ftps://user:pass@127.0.0.1:#{$ftps_port}"
-  assert('URL.download ftps (TLS control + data)') do
-    assert_equal "ftp-hello\nline2\n", URL.download("#{base}/hello.txt", **NOVERIFY).body
-  end
-  assert('URL.list ftps') do
-    assert_include URL.list("#{base}/", **NOVERIFY).lines, 'hello.txt'
-  end
+proto_assert('URL.download ftps (TLS control + data)', 'ftps', $ftps_port) do
+  assert_equal "ftp-hello\nline2\n",
+    URL.download("ftps://user:pass@127.0.0.1:#{$ftps_port}/hello.txt", **NOVERIFY).body
+end
+proto_assert('URL.list ftps', 'ftps', $ftps_port) do
+  assert_include URL.list("ftps://user:pass@127.0.0.1:#{$ftps_port}/", **NOVERIFY).lines, 'hello.txt'
 end
 
-if URL.supports?('pop3s') && $pop3s_port
-  assert('URL.download pop3s message') do
-    r = URL.download("pop3s://u:p@127.0.0.1:#{$pop3s_port}/1", **NOVERIFY)
-    assert_equal "Subject: one\r\n\r\nbody one\r\n", r.body
-  end
+proto_assert('URL.download pop3s message', 'pop3s', $pop3s_port) do
+  r = URL.download("pop3s://u:p@127.0.0.1:#{$pop3s_port}/1", **NOVERIFY)
+  assert_equal "Subject: one\r\n\r\nbody one\r\n", r.body
 end
 
-if URL.supports?('gopher') && $gophers_port
-  assert('URL.download gophers') do
-    r = URL.download("gophers://127.0.0.1:#{$gophers_port}/1/sec", **NOVERIFY)
-    assert_include r.body, 'selector=/sec'
-  end
+proto_assert('URL.download gophers', 'gophers', $gophers_port) do
+  r = URL.download("gophers://127.0.0.1:#{$gophers_port}/1/sec", **NOVERIFY)
+  assert_include r.body, 'selector=/sec'
 end
 
-if URL.supports?('ldaps') && $ldaps_port
-  assert('URL.search ldaps') do
-    u = "ldaps://127.0.0.1:#{$ldaps_port}/dc=example,dc=com?mail?sub?(cn=Alice)"
-    r = URL.search(u, **NOVERIFY)
-    assert_include r.body, 'alice@example.com'
-  end
+proto_assert('URL.search ldaps', 'ldaps', $ldaps_port) do
+  r = URL.search("ldaps://127.0.0.1:#{$ldaps_port}/dc=example,dc=com?mail?sub?(cn=Alice)", **NOVERIFY)
+  assert_include r.body, 'alice@example.com'
 end
 
-if URL.supports?('mqtts') && $mqtts_port
-  assert('URL.subscribe mqtts') do
-    r = URL.subscribe("mqtts://127.0.0.1:#{$mqtts_port}/test/topic", timeout_ms: 2500, **NOVERIFY)
-    assert_equal 'mqtt-retained', r.body
-  end
+proto_assert('URL.subscribe mqtts', 'mqtts', $mqtts_port) do
+  r = URL.subscribe("mqtts://127.0.0.1:#{$mqtts_port}/test/topic", timeout_ms: 2500, **NOVERIFY)
+  assert_equal 'mqtt-retained', r.body
 end

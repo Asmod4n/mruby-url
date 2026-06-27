@@ -41,13 +41,9 @@ task :test => :mruby do
   # makes the fixture a process-group leader, so its spawned daemons (sshd /
   # slapd / mosquitto) join that group and we can tear the whole group down
   # below — the daemons can never outlive the tests, even on SIGKILL.
-  group_kill =
-    begin
-      Process.kill(0, 0)  # probe; on Windows process-group signals don't apply
-      true
-    rescue
-      false
-    end
+  # Process-group signals are a POSIX thing; on Windows we fall back to killing
+  # the single fixture pid (where no daemons get spawned anyway).
+  group_kill = (RbConfig::CONFIG['host_os'] !~ /mswin|mingw|cygwin/)
   server_pid =
     if group_kill
       spawn(RbConfig.ruby, server_script, pgroup: true)
