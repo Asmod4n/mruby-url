@@ -331,9 +331,44 @@ the vendored `deps/curl` with CMake and links it statically against Schannel
 - Redirect chains: parsed `Response#headers` keeps only the final response;
   the full sequence stays in `#raw_headers`.
 
+## WebSocket
+
+`URL.websocket` opens a `ws://` / `wss://` connection and returns a
+`URL::WebSocket` once the upgrade handshake completes. Messages are sent and
+received whole — fragmentation and oversized frames are reassembled for you,
+and inbound PINGs are answered automatically.
+
+```ruby
+URL.websocket("wss://echo.websocket.org") do |ws|
+  ws.send_text("hello")
+  msg = ws.receive            # => URL::WebSocket::Message (text? / binary? / close?)
+  puts msg.data
+  ws.each { |m| handle(m) }   # iterate until the peer closes
+end
+```
+
+A failed handshake is a **value, not a raise** — same two-tier model as the HTTP
+verbs. `URL.websocket` always returns a `URL::WebSocket`; check `ws.open?` and
+read `ws.error` (a `URL::TransferError`, e.g. `URL::WebSocketError` naming the
+HTTP status when the server answered with a page instead of a 101 upgrade). The
+block is only entered for a live socket:
+
+```ruby
+ws = URL.websocket("wss://example.com/socket")
+ws.open?   # => false
+ws.error   # => #<URL::WebSocketError: websocket upgrade refused: server
+           #    replied HTTP 200 (expected 101 Switching Protocols) ...>
+```
+
+Without a block, `URL.websocket` returns the socket and you close it yourself
+(`ws.close(status: 1000)`). `#receive(timeout: 5)` returns `nil` if no message
+arrives in time; `#send_*` / `#receive` on a closed socket are no-ops returning
+`nil`. The C layer only adds two framing primitives (`curl_ws_send` /
+`curl_ws_recv`); all message-level logic lives in `mrblib/url/websocket.rb`.
+Only genuine usage errors raise: a non-ws scheme, or a libcurl built without
+WebSocket support (needs 7.86+).
+
 ## Roadmap
 
-Everything libcurl can do is in scope. Not yet implemented: parallel
-fan-out (running many transfers on one session and collecting results by
-key), and more protocol verbs (FTP, POP3, MQTT, WebSocket, …) as they're
-needed.
+Everything libcurl can do is in scope. More protocol verbs (FTP, POP3, MQTT,
+…) land as they're needed.

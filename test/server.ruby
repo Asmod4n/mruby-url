@@ -18,6 +18,8 @@ require 'zlib'
 require 'stringio'
 require 'socket'
 require 'openssl'
+require 'digest'
+require 'base64'
 
 server = WEBrick::HTTPServer.new(
   BindAddress: '127.0.0.1',
@@ -305,6 +307,97 @@ Thread.new do
   end
 end
 
+# ---- WebSocket echo server (ws://) ----------------------------------------
+#
+# Minimal RFC 6455 endpoint for the URL.websocket tests: do the upgrade
+# handshake (compute Sec-WebSocket-Accept), then echo every data frame back
+# with the same opcode, answer PING with PONG, and mirror CLOSE. Client->server
+# frames are masked (per spec); server->client frames are not. Just enough to
+# exercise send_text / send_binary / receive / close end to end — no TLS, plain
+# ws:// is enough for the framing path.
+
+WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'.freeze
+
+def ws_handshake(io)
+  req = +''
+  while (line = io.gets)
+    req << line
+    break if line == "\r\n" || line == "\n"
+  end
+  key = req[/Sec-WebSocket-Key:\s*(.+?)\r?\n/i, 1]
+  return false unless key
+  accept = Base64.strict_encode64(Digest::SHA1.digest(key.strip + WS_GUID))
+  io.write("HTTP/1.1 101 Switching Protocols\r\n" \
+           "Upgrade: websocket\r\n" \
+           "Connection: Upgrade\r\n" \
+           "Sec-WebSocket-Accept: #{accept}\r\n\r\n")
+  true
+end
+
+def ws_read_frame(io)
+  hdr = io.read(2)
+  return nil if hdr.nil? || hdr.bytesize < 2
+  b0, b1 = hdr.bytes
+  opcode = b0 & 0x0f
+  masked = (b1 & 0x80) != 0
+  len    = b1 & 0x7f
+  len = io.read(2).unpack1('n')  if len == 126
+  len = io.read(8).unpack1('Q>') if len == 127
+  mask = masked ? io.read(4).bytes : nil
+  payload = len > 0 ? io.read(len) : ''
+  return nil if payload.nil? || payload.bytesize < len
+  if mask
+    pb = payload.bytes
+    pb.each_index { |i| pb[i] ^= mask[i % 4] }
+    payload = pb.pack('C*')
+  end
+  [opcode, payload]
+end
+
+def ws_write_frame(io, opcode, payload)
+  n   = payload.bytesize
+  out = [0x80 | opcode]
+  if    n < 126   then out << n
+  elsif n < 65536 then out << 126; out.concat([n].pack('n').bytes)
+  else                 out << 127; out.concat([n].pack('Q>').bytes)
+  end
+  io.write(out.pack('C*'))
+  io.write(payload) if n > 0
+end
+
+def handle_ws_session(io)
+  return unless ws_handshake(io)
+  loop do
+    frame = ws_read_frame(io)
+    break if frame.nil?
+    opcode, payload = frame
+    case opcode
+    when 0x1, 0x2 then ws_write_frame(io, opcode, payload)  # text/binary -> echo
+    when 0x8      then ws_write_frame(io, 0x8, payload); break  # close -> mirror
+    when 0x9      then ws_write_frame(io, 0xA, payload)     # ping -> pong
+    when 0xA      then nil                                  # pong -> ignore
+    end
+  end
+end
+
+ws_tcp        = TCPServer.new('127.0.0.1', 0)
+ws_port_value = ws_tcp.addr[1]
+
+Thread.new do
+  loop do
+    begin
+      conn = ws_tcp.accept
+      begin
+        handle_ws_session(conn)
+      ensure
+        conn.close rescue nil
+      end
+    rescue => e
+      $stderr.puts("ws session error: #{e.class}: #{e.message}")
+    end
+  end
+end
+
 # ---- announce + serve -----------------------------------------------------
 
 # Write the SMTP port first; server_port is written LAST so its existence means
@@ -318,6 +411,7 @@ end
 
 write_port_atomic(File.join(__dir__, 'smtp_port'), smtp_port_value)
 write_port_atomic(File.join(__dir__, 'imap_port'), imap_port_value)
+write_port_atomic(File.join(__dir__, 'ws_port'),   ws_port_value)
 
 port      = server.config[:Port]
 port_file = File.join(__dir__, 'server_port')

@@ -20,6 +20,9 @@ imap_port_file = File.expand_path('imap_port', File.dirname(__FILE__))
 $imap_port     = File.exist?(imap_port_file) ? File.read(imap_port_file).strip.to_i : nil
 $imap_received = File.expand_path('imap_received', File.dirname(__FILE__))
 
+ws_port_file = File.expand_path('ws_port', File.dirname(__FILE__))
+$ws_port     = File.exist?(ws_port_file) ? File.read(ws_port_file).strip.to_i : nil
+
 # ---- assertions -----------------------------------------------------------
 
 assert('URL.get echo') do
@@ -327,4 +330,56 @@ assert('netrc options pass through; optional + missing file falls back') do
   r = URL.get("#{$base}/echo", netrc: true, netrc_file: "/nonexistent-netrc-xyz")
   assert_true r.success?
   assert_equal 'GET', r.json['method']
+end
+
+# ---- WebSocket ------------------------------------------------------------
+# Gated on a ws-capable libcurl (some distro builds omit the protocol) and the
+# local echo fixture. Drives the same paths as examples/websocket.rb.
+
+if URL.supports?('ws') && $ws_port
+  ws_base = "ws://127.0.0.1:#{$ws_port}/"
+
+  assert('URL.websocket text echo round-trip') do
+    ws = URL.websocket(ws_base)
+    assert_true ws.open?
+    assert_nil  ws.error
+    ws.send_text('hello ws')
+    msg = ws.receive(timeout: 5)
+    assert_false msg.nil?
+    assert_true  msg.text?
+    assert_equal 'hello ws', msg.data
+    ws.close
+    assert_true ws.closed?
+  end
+
+  assert('URL.websocket binary echo round-trip') do
+    ws = URL.websocket(ws_base)
+    payload = "\x00\x01\x02\x03\xfe\xff"
+    ws.send_binary(payload)
+    msg = ws.receive(timeout: 5)
+    assert_true  msg.binary?
+    assert_equal payload, msg.data
+    ws.close
+  end
+
+  assert('URL.websocket block form yields a live socket then closes it') do
+    got = nil
+    ws = URL.websocket(ws_base) do |w|
+      assert_true w.open?
+      w.send_text('blocky')
+      got = w.receive(timeout: 5)
+    end
+    assert_equal 'blocky', got.data
+    assert_true ws.closed?
+  end
+
+  assert('URL.websocket failed upgrade is a value, not a raise') do
+    # Point ws:// at the plain HTTP server: it answers with a normal response,
+    # never a 101, so the handshake fails. That is a value on #error.
+    ws = URL.websocket("ws://127.0.0.1:#{$server_port}/echo")
+    assert_false ws.open?
+    assert_true  ws.error.is_a?(URL::TransferError)
+    assert_nil   ws.send_text('x')        # no-op on a closed socket, never raises
+    assert_nil   ws.receive(timeout: 0)
+  end
 end

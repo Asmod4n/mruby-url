@@ -62,6 +62,24 @@ class URL::Request
   def total_time;    URL::Libcurl.easy_getinfo(@handle, :total_time);    end
   def content_type;  URL::Libcurl.easy_getinfo(@handle, :content_type);  end
 
+  # The live socket fd of an established connection (CURLINFO_ACTIVESOCKET), or
+  # nil if there isn't one. Used by URL::WebSocket to IO.select between the
+  # ws_send / ws_recv framing primitives.
+  def activesocket; URL::Libcurl.easy_getinfo(@handle, :activesocket); end
+
+  # WebSocket framing primitives — thin pass-throughs to the C glue. ws_recv
+  # returns [bytes, flags, bytesleft] or nil on CURLE_AGAIN; ws_send returns the
+  # byte count sent or nil on CURLE_AGAIN. All message-level logic (reassembly,
+  # frame dispatch, the send loop) lives in URL::WebSocket.
+  def ws_recv(buflen);                    URL::Libcurl.easy_ws_recv(@handle, buflen);                 end
+  def ws_send(data, flags, fragsize = 0); URL::Libcurl.easy_ws_send(@handle, data, flags, fragsize); end
+
+  # Blocking single-transfer drive (curl_easy_perform). Returns the CURLcode as
+  # a value (0 == success). Used by the WebSocket connect path: with
+  # :connect_only => 2 it runs the upgrade handshake and leaves the live socket
+  # on the handle for ws_recv / ws_send.
+  def perform; URL::Libcurl.easy_perform(@handle); end
+
   # Callback setters. The block is stashed as an ivar on the Easy handle so the
   # C trampoline can pick it up; the write/header callbacks yield a String of
   # received bytes, the read callback yields the max byte count and expects a

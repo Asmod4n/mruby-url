@@ -25,14 +25,16 @@ task :test => :mruby do
   port_file     = File.expand_path("test/server_port", __dir__)
   smtp_port_file = File.expand_path("test/smtp_port",   __dir__)
   imap_port_file = File.expand_path("test/imap_port",   __dir__)
+  ws_port_file   = File.expand_path("test/ws_port",     __dir__)
   server_script = File.expand_path("test/server.ruby",  __dir__)
 
   # Stale state from a previous run. server_port is written last by the fixture,
   # so clearing it here means the wait below only proceeds once the fresh run
-  # has all servers up; clear smtp_port/imap_port too so we never read a dead port.
+  # has all servers up; clear the other port files too so we never read a dead port.
   File.unlink(port_file) if File.exist?(port_file)
   File.unlink(smtp_port_file) if File.exist?(smtp_port_file)
   File.unlink(imap_port_file) if File.exist?(imap_port_file)
+  File.unlink(ws_port_file) if File.exist?(ws_port_file)
 
   # MRI->MRI spawn. No cmd.exe wrapper, no Winsock init weirdness.
   server_pid = spawn(RbConfig.ruby, server_script)

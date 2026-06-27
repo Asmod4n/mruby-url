@@ -412,6 +412,56 @@ class URL
     end
 
     # ----------------------------------------------------------------------
+    #  WebSocket
+    # ----------------------------------------------------------------------
+
+    # Open a WebSocket to a ws:// or wss:// URL and return a URL::WebSocket once
+    # the upgrade handshake has completed. The handshake is driven on the shared
+    # session (a throwaway one when called re-entrantly); afterwards the
+    # established connection is detached and lives on the returned object until
+    # it is closed or GC'd.
+    #
+    #   ws = URL.websocket("wss://echo.websocket.org")
+    #   if ws.open?
+    #     ws.send_text("hello")
+    #     msg = ws.receive        # => URL::WebSocket::Message (or nil on timeout)
+    #     ws.close
+    #   else
+    #     warn ws.error           # handshake failed — a value, not a raise
+    #   end
+    #
+    # With a block, a live socket is yielded and closed for you; a socket that
+    # failed to connect is not yielded — inspect the returned object's #error:
+    #
+    #   ws = URL.websocket("wss://echo.websocket.org") do |w|
+    #     w.send_text("hi")
+    #     w.each { |m| handle(m) }
+    #   end
+    #   warn ws.error if ws.error   # nil unless the handshake failed
+    #
+    # Extra **opts (headers:, timeout_ms:, ssl_verify_peer:, …) flow through to
+    # setopt, exactly like the HTTP verbs. A failed handshake is a value
+    # (ws.error), never a raise; only genuine usage errors — a non-ws scheme or a
+    # libcurl built without ws/wss — raise URL::Error.
+    def websocket(url, **opts)
+      case _scheme_of(url)
+      when "ws", "wss"
+        _require_protocol!(url)
+        ws = _open_websocket(url, opts)
+        if block_given? && ws.open?
+          begin
+            yield ws
+          ensure
+            ws.close
+          end
+        end
+        ws
+      else
+        raise URL::Error, "websocket not available for #{_scheme_of(url)}"
+      end
+    end
+
+    # ----------------------------------------------------------------------
     #  Parallel fan-out
     # ----------------------------------------------------------------------
 

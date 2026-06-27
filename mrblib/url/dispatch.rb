@@ -245,6 +245,28 @@ class URL
       _drive_sync(session, mailbox_url, req, state)
     end
 
+    # Open a WebSocket: build a CONNECT_ONLY=2 request and run the upgrade
+    # handshake with a blocking curl_easy_perform, which leaves the live socket
+    # on the easy handle for the framing primitives — libcurl's documented ws
+    # flow. The handle is standalone (never added to a multi), so nothing has to
+    # detach it afterwards. A failed handshake is a value on the returned socket
+    # (ws.error / ws.open?), never a raise — the HTTP verbs' two-tier model.
+    def _open_websocket(url, opts)
+      opts = opts.dup
+      opts[:timeout_ms] = DEFAULT_TIMEOUT_MS unless opts.key?(:timeout_ms)
+      user_hdrs = opts.delete(:headers)
+      params    = opts.delete(:params)
+
+      url_str = _stringify_url(url, params)
+      req     = URL::Request._open(shared, url_str)
+      req.setopt(:connect_only, 2)   # 2 = WebSocket: curl runs the upgrade, then hands back
+      _apply_opts(req, opts)
+      req.headers = user_hdrs if user_hdrs && !user_hdrs.empty?
+
+      code = req.perform
+      URL::WebSocket.new(req, code)
+    end
+
     def _response_from(url, req, state)
       URL::Response.new(
         url:           url,
