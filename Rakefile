@@ -19,23 +19,20 @@ end
 
 desc "test"
 task :test => :mruby do
+  require 'tmpdir'
+
   unless system(RbConfig.ruby, "-rwebrick", "-e", "", out: File::NULL, err: File::NULL)
     abort "test server needs webrick — run: gem install webrick"
   end
-  port_file     = File.expand_path("test/server_port", __dir__)
-  server_script = File.expand_path("test/server.ruby",  __dir__)
+  server_script = File.expand_path("test/server.ruby", __dir__)
 
-  # Stale state from a previous run. server_port is written last by the fixture,
-  # so clearing it here means the wait below only proceeds once the fresh run
-  # has all servers up; clear the other port files too so we never read a dead
-  # port (a protocol whose server didn't come up this run leaves no port file,
-  # and its tests skip).
-  %w[server_port smtp_port imap_port ws_port ftp_port dict_port gopher_port
-     pop3_port telnet_port rtsp_port tftp_port sftp_port sftp_meta ldap_port
-     mqtt_port ftps_port pop3s_port gophers_port ldaps_port mqtts_port file_url].each do |n|
-    f = File.expand_path("test/#{n}", __dir__)
-    File.unlink(f) if File.exist?(f)
-  end
+  # All run-state (port files, captured payloads, daemon scratch dirs) goes
+  # into a throwaway directory. Keeps the checked-in test/ tree clean and
+  # avoids stale-file races between runs. mktmpdir picks the platform-correct
+  # temp root (TMPDIR/TEMP/TMP) — no hardcoded paths, works on Windows.
+  state_dir  = Dir.mktmpdir("mruby-url-test-")
+  port_file  = File.join(state_dir, "server_port")
+  ENV["MURL_TEST_STATE_DIR"] = state_dir
 
   # MRI->MRI spawn. No cmd.exe wrapper, no Winsock init weirdness. pgroup: true
   # makes the fixture a process-group leader, so its spawned daemons (sshd /
@@ -77,13 +74,7 @@ task :test => :mruby do
     rescue
       # already gone
     end
-    %w[server_port smtp_port imap_port ws_port ftp_port dict_port gopher_port
-       pop3_port telnet_port rtsp_port tftp_port sftp_port sftp_meta ldap_port
-       mqtt_port ftps_port pop3s_port gophers_port ldaps_port mqtts_port
-       file_url].each do |n|
-      f = File.expand_path("test/#{n}", __dir__)
-      File.unlink(f) if File.exist?(f)
-    end
+    FileUtils.rm_rf(state_dir)
   end
 end
 
