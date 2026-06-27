@@ -83,6 +83,13 @@ class URL::Response
     @headers ||= _parse_headers
   end
 
+  # The body split into non-empty lines — handy for directory/message listings
+  # from URL.list (FTP/SFTP/POP3) and other line-oriented protocol responses.
+  # Regex-free so it never depends on the regexp mrbgem being built in.
+  def lines
+    (@body || "").split("\n").map { |l| l.chomp("\r") }.reject(&:empty?)
+  end
+
   def [](name)
     headers[name.to_s.downcase]
   end
@@ -408,6 +415,138 @@ class URL
         _imap(url, nil, opts, ";UID=#{uid}", block)
       else
         raise URL::Error, "fetch not available for #{_scheme_of(url)}"
+      end
+    end
+
+    # ----------------------------------------------------------------------
+    #  Generic transfers for the non-HTTP protocols
+    #
+    #  download / upload are scheme-agnostic: they work for every protocol the
+    #  embedded libcurl was built with (see URL::PROTOS) — file, ftp(s), sftp,
+    #  scp, dict, gopher(s), ldap(s), pop3(s), tftp, mqtt(s), http(s). The
+    #  protocol-named helpers below (list / search / lookup / publish /
+    #  subscribe) are thin wrappers that set the right option for a scheme.
+    #  Failures are values (resp.error), exactly like the HTTP verbs.
+    # ----------------------------------------------------------------------
+
+    # Fetch a URL of any supported scheme; returns a URL::Response whose #body is
+    # the received bytes, or streams each chunk to the block. Raises only for an
+    # unbuilt/unknown scheme (a usage error); transport failures are resp.error.
+    #
+    #   URL.download("ftp://host/pub/file.txt").body
+    #   URL.download("file:///etc/hostname").body
+    #   URL.download("sftp://user:pw@host/path") { |chunk| sink << chunk }
+    def download(url, **opts, &on_chunk)
+      _require_protocol!(url)
+      _run_transfer(url, opts, on_chunk, nil)
+    end
+
+    # Upload `data` (a String) to a URL of any upload-capable scheme (ftp(s),
+    # sftp, scp, tftp). The body is streamed through libcurl's read callback,
+    # chunked in Ruby. Returns a URL::Response.
+    #
+    #   URL.upload("ftp://host/incoming/x.txt", File.read("x.txt"))
+    def upload(url, data, **opts)
+      _require_protocol!(url)
+      _run_transfer(url, opts, nil, data.to_s)
+    end
+
+    # Directory listing (FTP/SFTP) or message-id listing (POP3): a transfer with
+    # CURLOPT_DIRLISTONLY. Returns a URL::Response; use #lines for the entries.
+    #
+    #   URL.list("ftp://host/pub/").lines   # => ["file1", "file2", ...]
+    def list(url, **opts)
+      _require_protocol!(url)
+      _run_transfer(url, opts.merge(dirlistonly: true), nil, nil)
+    end
+
+    # LDAP(S) search: the query lives in the URL (ldap://host/base?attrs?scope?
+    # filter). Returns a URL::Response whose #body is the LDIF-ish result text.
+    def search(url, **opts)
+      case _scheme_of(url)
+      when "ldap", "ldaps"
+        _require_protocol!(url)
+        _run_transfer(url, opts, nil, nil)
+      else
+        raise URL::Error, "search not available for #{_scheme_of(url)}"
+      end
+    end
+
+    # DICT lookup: define `word` in `database` (default "!", first DB with a
+    # match) on a dict:// server. Builds the dict define URL; returns a Response.
+    def lookup(url, word, database: "!", **opts)
+      case _scheme_of(url)
+      when "dict"
+        _require_protocol!(url)
+        base = url.to_s
+        base = base[0..-2] while base.end_with?("/")   # strip trailing slashes (regex-free)
+        _run_transfer("#{base}/d:#{word}:#{database}", opts, nil, nil)
+      else
+        raise URL::Error, "lookup not available for #{_scheme_of(url)}"
+      end
+    end
+
+    # MQTT publish: send `payload` to the topic in the URL path. curl publishes
+    # when POSTFIELDS is set on an mqtt URL. Returns a Response.
+    def publish(url, payload, **opts)
+      case _scheme_of(url)
+      when "mqtt", "mqtts"
+        _require_protocol!(url)
+        _run_transfer(url, opts.merge(post_fields: payload.to_s), nil, nil)
+      else
+        raise URL::Error, "publish not available for #{_scheme_of(url)}"
+      end
+    end
+
+    # MQTT subscribe: receive a message from the topic in the URL path. libcurl
+    # keeps the subscription open, so this blocks until `timeout_ms` elapses and
+    # returns the message(s) received meanwhile. curl frames each message as
+    # [2-byte topic length][topic][payload]; the payload is extracted and the
+    # expected keep-alive timeout is normalised away, so #error is nil on a
+    # clean receive. #body holds the payload.
+    def subscribe(url, timeout_ms: 5_000, **opts)
+      case _scheme_of(url)
+      when "mqtt", "mqtts"
+        _require_protocol!(url)
+        resp    = _run_transfer(url, opts.merge(timeout_ms: timeout_ms), nil, nil)
+        payload = _mqtt_payload(resp.body)
+        # CURLE_OPERATION_TIMEDOUT (28) is how a one-shot subscribe ends once the
+        # message arrived; clear it when we actually got a payload.
+        ecode = (resp.error_code == 28 && payload && !payload.empty?) ? 0 : resp.error_code
+        URL::Response.new(
+          url: url.to_s, effective_url: resp.effective_url, code: resp.code,
+          body: payload || "", raw_headers: resp.raw_headers,
+          total_time: resp.total_time, content_type: resp.content_type,
+          error_code: ecode
+        )
+      else
+        raise URL::Error, "subscribe not available for #{_scheme_of(url)}"
+      end
+    end
+
+    # RTSP request. `request:` is the method as a symbol (:options, :describe,
+    # :setup, :play, :pause, :teardown, :get_parameter, :set_parameter,
+    # :announce, :record). `transport:` sets the Transport header for SETUP;
+    # `stream_uri:` overrides the control URI. Returns a URL::Response whose
+    # #body is the response payload (e.g. the SDP from DESCRIBE) and whose
+    # #headers carry the RTSP reply headers (Public, Session, …).
+    RTSP_REQUESTS = {
+      options: 1, describe: 2, announce: 3, setup: 4, play: 5, pause: 6,
+      teardown: 7, get_parameter: 8, set_parameter: 9, record: 10, receive: 11,
+    }.freeze
+
+    def rtsp(url, request: :options, transport: nil, stream_uri: nil, **opts)
+      case _scheme_of(url)
+      when "rtsp"
+        _require_protocol!(url)
+        req_enum = RTSP_REQUESTS[request] or
+          raise URL::Error, "unknown RTSP request: #{request.inspect}"
+        opts = opts.merge(rtsp_request: req_enum)
+        opts[:rtsp_stream_uri] = stream_uri if stream_uri
+        opts[:rtsp_transport]  = transport  if transport
+        _run_transfer(url, opts, nil, nil)
+      else
+        raise URL::Error, "rtsp not available for #{_scheme_of(url)}"
       end
     end
 

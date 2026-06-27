@@ -299,6 +299,35 @@ On Linux/macOS the gem finds libcurl via `pkg-config`. On Windows it builds
 the vendored `deps/curl` with CMake and links it statically against Schannel
 (no OpenSSL); `mrbgem.rake` handles this.
 
+## Other protocols
+
+Every scheme the embedded libcurl was built with (see `URL::PROTOS`) is reachable
+through a small, scheme-agnostic surface. Failures are values (`resp.error`),
+exactly like the HTTP verbs; only an unbuilt/unknown scheme raises.
+
+```ruby
+URL.download("ftp://host/pub/file.txt").body          # ftp, ftps, sftp, scp,
+URL.download("file:///etc/hostname").body             #   file, dict, gopher,
+URL.download("sftp://user@host/path",                 #   pop3, tftp, ldap, http…
+            ssh_private_keyfile: "id_ed25519",
+            ssh_knownhosts: "known_hosts").body
+URL.upload("ftp://host/incoming/x.txt", data)         # ftp(s), sftp, scp, tftp
+URL.list("ftp://host/pub/").lines                     # directory / message list
+URL.lookup("dict://dict.org", "ruby").body            # DICT define
+URL.search("ldap://host/dc=ex,dc=com?cn?sub?(cn=*)")  # LDAP search → LDIF body
+URL.publish("mqtt://host/topic", "payload")           # MQTT publish
+URL.subscribe("mqtt://host/topic", timeout_ms: 5000)  # MQTT subscribe → #body
+URL.rtsp("rtsp://host/stream", request: :describe)    # RTSP (OPTIONS/DESCRIBE/…)
+```
+
+`download`/`upload` take the same `**opts` as the HTTP verbs plus protocol
+options as needed: `:quote` (FTP/SFTP commands), `:dirlistonly`, `:range`,
+`:use_ssl`, the `:ssh_*` keys, and `:rtsp_*`. The `s` schemes (ftps, pop3s,
+gophers, ldaps, mqtts, …) are the same calls over TLS — pass
+`ssl_verify_peer:`/`ssl_verify_host:` as usual. As with everything here, the
+dispatch, option mapping and parsing live in Ruby; the C layer only gained a
+handful of flat `setopt` pass-throughs and a blocking `easy_perform`.
+
 ## Design notes
 
 - **C is an FFI-thin binding only.** `src/mrb_url.c` does only what a generic
@@ -370,5 +399,7 @@ WebSocket support (needs 7.86+).
 
 ## Roadmap
 
-Everything libcurl can do is in scope. More protocol verbs (FTP, POP3, MQTT,
-…) land as they're needed.
+Everything libcurl can do is in scope. Every scheme libcurl is built with —
+http(s), ftp(s), sftp, scp, file, dict, gopher(s), pop3(s), imap(s), smtp(s),
+ldap(s), mqtt(s), rtsp, telnet, tftp, ws(s) — is now reachable; further work is
+filling in protocol-specific conveniences as they're needed.

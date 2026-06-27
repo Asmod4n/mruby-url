@@ -20,6 +20,15 @@ require 'socket'
 require 'openssl'
 require 'digest'
 require 'base64'
+require 'fileutils'
+require 'tmpdir'
+
+# Defined early so the protocol/daemon fixtures below can announce their ports.
+def write_port_atomic(path, value)
+  tmp = "#{path}.tmp"
+  File.write(tmp, value.to_s)
+  File.rename(tmp, path)
+end
 
 server = WEBrick::HTTPServer.new(
   BindAddress: '127.0.0.1',
@@ -121,6 +130,42 @@ cert.sign(key, OpenSSL::Digest::SHA256.new)
 ssl_ctx      = OpenSSL::SSL::SSLContext.new
 ssl_ctx.cert = cert
 ssl_ctx.key  = key
+
+# Persist the cert/key as PEM files so the daemon-backed TLS variants (ldaps via
+# slapd, mqtts via mosquitto) can load them, and keep the dir for fixture state.
+tls_dir = File.join(Dir.tmpdir, "mruby-url-tls-#{$$}")
+FileUtils.mkdir_p(tls_dir)
+CERT_PEM = File.join(tls_dir, 'cert.pem')
+KEY_PEM  = File.join(tls_dir, 'key.pem')
+File.write(CERT_PEM, cert.to_pem)
+File.write(KEY_PEM, key.to_pem)
+
+# Accept loop that wraps each connection in implicit TLS before handing it to a
+# protocol handler — the pure-Ruby basis for ftps:// / pop3s:// / gophers://.
+def proto_accept_loop_tls(srv, ssl_ctx)
+  Thread.new do
+    loop do
+      begin
+        raw = srv.accept
+        Thread.new(raw) do |r|
+          ssl = nil
+          begin
+            ssl = OpenSSL::SSL::SSLSocket.new(r, ssl_ctx)
+            ssl.sync_close = true
+            ssl.accept
+            yield ssl
+          rescue => e
+            $stderr.puts("tls proto error: #{e.class}: #{e.message}")
+          ensure
+            ssl.close rescue nil
+          end
+        end
+      rescue => e
+        $stderr.puts("tls accept error: #{e.class}: #{e.message}")
+      end
+    end
+  end
+end
 
 # Ephemeral port; bind now so the port is known before we announce.
 smtp_tcp        = TCPServer.new('127.0.0.1', 0)
@@ -398,20 +443,415 @@ Thread.new do
   end
 end
 
-# ---- announce + serve -----------------------------------------------------
+# ---- non-HTTP protocol fixtures (pure Ruby) -------------------------------
+#
+# Small servers for the protocols URL.download/upload/list/lookup/search/rtsp
+# drive: FTP, DICT, GOPHER, POP3, TELNET, RTSP (all TCP) and TFTP (UDP). Each
+# binds an ephemeral port and its number is written to a test/<proto>_port file
+# the mruby tests read; a test is skipped when its port file is absent or the
+# embedded libcurl lacks the scheme. Mirrors the SMTP/IMAP fixtures above.
 
-# Write the SMTP port first; server_port is written LAST so its existence means
-# both servers are up. The server is rake's child; rake kills it in an ensure
-# block when tests finish (or crash).
-def write_port_atomic(path, value)
-  tmp = "#{path}.tmp"
-  File.write(tmp, value.to_s)
-  File.rename(tmp, path)
+require 'timeout'
+
+def proto_accept_loop(srv)
+  Thread.new do
+    loop do
+      begin
+        conn = srv.accept
+        Thread.new(conn) { |s| yield s; s.close rescue nil }
+      rescue => e
+        $stderr.puts("proto session error: #{e.class}: #{e.message}")
+      end
+    end
+  end
 end
 
+# --- FTP ---
+ftp_root = File.join(Dir.tmpdir, "mruby-url-ftp-#{$$}")
+FileUtils.mkdir_p(ftp_root)
+File.write(File.join(ftp_root, 'hello.txt'), "ftp-hello\nline2\n")
+File.write(File.join(ftp_root, 'second.txt'), "second\n")
+
+# A plain file for file:// (outside ftp_root so it doesn't show up in FTP
+# listings) — record the platform-correct URL for the test to read (curl wants
+# file:///abs/path, file:///C:/... on Windows).
+file_fixture = File.join(Dir.tmpdir, "mruby-url-file-#{$$}.txt")
+File.write(file_fixture, "file-protocol-body\n")
+abs = file_fixture.tr('\\', '/')
+abs = "/#{abs}" unless abs.start_with?('/')
+File.write(File.join(__dir__, 'file_url'), "file://#{abs}")
+
+# `data_ssl`, when given, wraps each passive data connection in TLS (PROT P) —
+# the only extra needed to serve implicit ftps:// alongside plain ftp://.
+def handle_ftp(sock, root, data_ssl = nil)
+  sock.write("220 test-ftp ready\r\n")
+  dsrv = nil
+  data_accept = lambda do
+    ds = dsrv.accept
+    if data_ssl
+      ds = OpenSSL::SSL::SSLSocket.new(ds, data_ssl); ds.sync_close = true; ds.accept
+    end
+    ds
+  end
+  loop do
+    line = sock.gets or break
+    cmd, arg = line.strip.split(' ', 2)
+    case (cmd || '').upcase
+    when 'USER' then sock.write("331 need pass\r\n")
+    when 'PASS' then sock.write("230 ok\r\n")
+    when 'SYST' then sock.write("215 UNIX Type: L8\r\n")
+    when 'FEAT' then sock.write("211-Features\r\n EPSV\r\n PBSZ\r\n PROT\r\n211 End\r\n")
+    when 'AUTH' then sock.write("234 proceed\r\n")    # explicit-TLS path (unused by implicit)
+    when 'PBSZ' then sock.write("200 ok\r\n")
+    when 'PROT' then sock.write("200 ok\r\n")
+    when 'PWD'  then sock.write("257 \"/\"\r\n")
+    when 'TYPE' then sock.write("200 ok\r\n")
+    when 'CWD'  then sock.write("250 ok\r\n")
+    when 'SIZE'
+      p = File.join(root, File.basename(arg.to_s))
+      sock.write(File.file?(p) ? "213 #{File.size(p)}\r\n" : "550 no\r\n")
+    when 'EPSV'
+      dsrv = TCPServer.new('127.0.0.1', 0)
+      sock.write("229 Entering Extended Passive Mode (|||#{dsrv.addr[1]}|)\r\n")
+    when 'PASV'
+      dsrv = TCPServer.new('127.0.0.1', 0); dp = dsrv.addr[1]
+      sock.write("227 Entering Passive Mode (127,0,0,1,#{dp / 256},#{dp % 256})\r\n")
+    when 'NLST', 'LIST'
+      sock.write("150 listing\r\n"); ds = data_accept.call
+      names = Dir.children(root).sort
+      body = (cmd.upcase == 'NLST') ? names.map { |e| "#{e}\r\n" }.join :
+        names.map { |e| "-rw-r--r-- 1 u u #{File.size(File.join(root, e))} Jan 01 00:00 #{e}\r\n" }.join
+      ds.write(body); ds.close; dsrv.close; dsrv = nil
+      sock.write("226 done\r\n")
+    when 'RETR'
+      p = File.join(root, File.basename(arg.to_s))
+      if File.file?(p)
+        sock.write("150 opening\r\n"); ds = data_accept.call
+        ds.write(File.binread(p)); ds.close; dsrv.close; dsrv = nil
+        sock.write("226 complete\r\n")
+      else
+        sock.write("550 not found\r\n")
+      end
+    when 'STOR'
+      sock.write("150 ready\r\n"); ds = data_accept.call
+      File.binwrite(File.join(root, File.basename(arg.to_s)), ds.read)
+      ds.close; dsrv.close; dsrv = nil
+      sock.write("226 stored\r\n")
+    when 'QUIT' then sock.write("221 bye\r\n"); break
+    else sock.write("200 ok\r\n")
+    end
+  end
+end
+
+# --- DICT ---
+def handle_dict(sock)
+  sock.write("220 test-dict <mime> <1@test>\r\n")
+  loop do
+    line = sock.gets or break
+    s = line.strip; up = s.upcase
+    if up.start_with?('CLIENT') then sock.write("250 ok\r\n")
+    elsif up.start_with?('DEFINE')
+      word = s.split(' ', 3)[2].to_s
+      sock.write("150 1 definitions retrieved\r\n")
+      sock.write("151 \"#{word}\" testdb \"Test\"\r\n#{word}: a test definition.\r\n.\r\n250 ok\r\n")
+    elsif up.start_with?('QUIT') then sock.write("221 bye\r\n"); break
+    else sock.write("500 unknown\r\n")
+    end
+  end
+end
+
+# --- GOPHER ---
+def handle_gopher(sock)
+  sel = (sock.gets || '').strip
+  sock.write("gopher-doc for selector=#{sel}\r\n.\r\n")
+end
+
+# --- POP3 ---
+POP3_MSGS = { '1' => "Subject: one\r\n\r\nbody one\r\n", '2' => "Subject: two\r\n\r\nbody two\r\n" }.freeze
+def handle_pop3(sock)
+  sock.write("+OK test-pop3 ready\r\n")
+  loop do
+    line = sock.gets or break
+    s = line.strip; up = s.upcase
+    if up == 'CAPA' then sock.write("+OK\r\nUSER\r\nUIDL\r\nTOP\r\n.\r\n")
+    elsif up.start_with?('USER', 'PASS') then sock.write("+OK\r\n")
+    elsif up.start_with?('STAT') then sock.write("+OK 2 100\r\n")
+    elsif up.start_with?('LIST')
+      sock.write("+OK 2 messages\r\n1 #{POP3_MSGS['1'].bytesize}\r\n2 #{POP3_MSGS['2'].bytesize}\r\n.\r\n")
+    elsif up.start_with?('UIDL') then sock.write("+OK\r\n1 uid1\r\n2 uid2\r\n.\r\n")
+    elsif up.start_with?('RETR')
+      m = POP3_MSGS[s.split(' ')[1]].to_s
+      sock.write("+OK #{m.bytesize} octets\r\n#{m}.\r\n")
+    elsif up.start_with?('QUIT') then sock.write("+OK bye\r\n"); break
+    else sock.write("+OK\r\n")
+    end
+  end
+end
+
+# --- TELNET ---
+def handle_telnet(sock)
+  begin
+    Timeout.timeout(0.3) { sock.recv(64) }
+  rescue Exception
+  end
+  sock.write("telnet-banner-hello\r\n")
+end
+
+# --- RTSP ---
+def handle_rtsp(sock)
+  loop do
+    req = +''
+    until req.include?("\r\n\r\n")
+      line = sock.gets or return
+      req << line
+    end
+    method = req.split(' ', 2)[0]
+    cseq = (req[/CSeq:\s*(\d+)/i, 1] || '0')
+    if method == 'DESCRIBE'
+      sdp = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=test-stream\r\n"
+      sock.write("RTSP/1.0 200 OK\r\nCSeq: #{cseq}\r\nContent-Type: application/sdp\r\nContent-Length: #{sdp.bytesize}\r\n\r\n#{sdp}")
+    else
+      sock.write("RTSP/1.0 200 OK\r\nCSeq: #{cseq}\r\nPublic: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN\r\n\r\n")
+    end
+  end
+end
+
+# --- TFTP (UDP) ---
+TFTP_FILES = { 'hello.txt' => "tftp-hello-content\n" }
+def handle_tftp(data, addr, usock)
+  op = data[0, 2].unpack1('n')
+  fname = data[2..].split("\x00")[0]
+  ds = UDPSocket.new; ds.bind('127.0.0.1', 0)
+  cip = addr[3]; cport = addr[1]
+  if op == 1 # RRQ
+    content = (TFTP_FILES[fname] || '').b; blk = 1; i = 0
+    loop do
+      chunk = content[i, 512] || ''.b
+      ds.send([3, blk].pack('nn') + chunk, 0, cip, cport)
+      begin
+        Timeout.timeout(2) { _, a = ds.recvfrom(64); cip = a[3]; cport = a[1] }
+      rescue Exception then break end
+      i += 512; blk += 1
+      break if chunk.bytesize < 512
+    end
+  elsif op == 2 # WRQ
+    ds.send([4, 0].pack('nn'), 0, cip, cport); buf = ''.b
+    loop do
+      begin
+        d = a = nil
+        Timeout.timeout(2) { d, a = ds.recvfrom(2048) }
+      rescue Exception then break end
+      b = d[2, 2].unpack1('n'); payload = d[4..] || ''.b; buf << payload
+      ds.send([4, b].pack('nn'), 0, a[3], a[1])
+      break if payload.bytesize < 512
+    end
+    TFTP_FILES[fname] = buf
+  end
+  ds.close
+end
+
+# Bind ephemeral TCP ports and start each handler.
+ftp_srv    = TCPServer.new('127.0.0.1', 0)
+dict_srv   = TCPServer.new('127.0.0.1', 0)
+gopher_srv = TCPServer.new('127.0.0.1', 0)
+pop3_srv   = TCPServer.new('127.0.0.1', 0)
+telnet_srv = TCPServer.new('127.0.0.1', 0)
+rtsp_srv   = TCPServer.new('127.0.0.1', 0)
+proto_accept_loop(ftp_srv)    { |s| handle_ftp(s, ftp_root) }
+proto_accept_loop(dict_srv)   { |s| handle_dict(s) }
+proto_accept_loop(gopher_srv) { |s| handle_gopher(s) }
+proto_accept_loop(pop3_srv)   { |s| handle_pop3(s) }
+proto_accept_loop(telnet_srv) { |s| handle_telnet(s) }
+proto_accept_loop(rtsp_srv)   { |s| handle_rtsp(s) }
+
+# Implicit-TLS variants (ftps / pop3s / gophers): same handlers behind a TLS
+# accept. ftps also wraps its data channel (PROT P) with the same context.
+ftps_srv   = TCPServer.new('127.0.0.1', 0)
+pop3s_srv  = TCPServer.new('127.0.0.1', 0)
+gophers_srv = TCPServer.new('127.0.0.1', 0)
+proto_accept_loop_tls(ftps_srv, ssl_ctx)    { |s| handle_ftp(s, ftp_root, ssl_ctx) }
+proto_accept_loop_tls(pop3s_srv, ssl_ctx)   { |s| handle_pop3(s) }
+proto_accept_loop_tls(gophers_srv, ssl_ctx) { |s| handle_gopher(s) }
+
+# TFTP over UDP.
+tftp_usock = UDPSocket.new; tftp_usock.bind('127.0.0.1', 0)
+tftp_port_value = tftp_usock.addr[1]
+Thread.new do
+  loop do
+    begin
+      data, addr = tftp_usock.recvfrom(2048)
+      Thread.new { handle_tftp(data, addr, tftp_usock) }
+    rescue => e
+      $stderr.puts("tftp error: #{e.class}: #{e.message}")
+    end
+  end
+end
+
+# ---- daemon-backed protocols (sftp/scp, ldap, mqtt) -----------------------
+#
+# These need real servers (OpenSSH, OpenLDAP, mosquitto). When the binaries are
+# present we spin each up in a temp dir on an ephemeral port and write its port
+# file (plus, for SSH, the client key + known_hosts the tests pass to curl). On
+# any platform/host without the binary — e.g. the Windows Schannel build, which
+# also lacks sftp/scp/ldap in libcurl — the port file is simply absent and the
+# matching tests skip. Best-effort: a setup failure is logged and skipped, never
+# fatal to the rest of the suite.
+
+def which(bin)
+  ENV['PATH'].to_s.split(File::PATH_SEPARATOR).each do |d|
+    %W[#{d}/#{bin} /usr/sbin/#{bin} /usr/lib/openssh/#{bin}].each do |p|
+      return p if File.executable?(p)
+    end
+  end
+  ['/usr/sbin/' + bin, '/usr/lib/openssh/' + bin].find { |p| File.executable?(p) }
+end
+
+proto_dir = File.join(Dir.tmpdir, "mruby-url-proto-#{$$}")
+FileUtils.mkdir_p(proto_dir)
+child_pids = []
+
+# --- SSH (sftp/scp) ---
+begin
+  sshd = which('sshd')
+  if sshd && which('ssh-keygen')
+    sd = File.join(proto_dir, 'ssh'); FileUtils.mkdir_p(sd)
+    system('ssh-keygen', '-q', '-t', 'ed25519', '-f', "#{sd}/host", '-N', '', out: File::NULL, err: File::NULL)
+    system('ssh-keygen', '-q', '-t', 'ed25519', '-f', "#{sd}/client", '-N', '', out: File::NULL, err: File::NULL)
+    File.write("#{sd}/test.txt", "sftp-hello\nrow2\n")
+    File.write("#{sd}/authorized_keys", File.read("#{sd}/client.pub"))
+    File.chmod(0600, "#{sd}/authorized_keys")
+    ssh_user = ENV['USER'] || 'root'
+    ssh_port = TCPServer.open('127.0.0.1', 0) { |s| s.addr[1] }
+    File.write("#{sd}/sshd_config", <<~CFG)
+      Port #{ssh_port}
+      ListenAddress 127.0.0.1
+      HostKey #{sd}/host
+      PidFile #{sd}/sshd.pid
+      AuthorizedKeysFile #{sd}/authorized_keys
+      UsePAM no
+      PasswordAuthentication no
+      PubkeyAuthentication yes
+      Subsystem sftp internal-sftp
+      StrictModes no
+    CFG
+    FileUtils.mkdir_p('/run/sshd') rescue nil
+    if system(sshd, '-f', "#{sd}/sshd_config", '-E', "#{sd}/sshd.log")
+      sleep 0.5
+      kh = `ssh-keyscan -p #{ssh_port} -t ed25519 127.0.0.1 2>/dev/null`
+      if !kh.strip.empty?
+        File.write("#{sd}/known_hosts", kh)
+        write_port_atomic(File.join(__dir__, 'sftp_port'), ssh_port)
+        File.write(File.join(__dir__, 'sftp_meta'), "#{ssh_user}\n#{sd}/client\n#{sd}/known_hosts\n#{sd}/test.txt\n")
+      end
+    end
+  end
+rescue => e
+  $stderr.puts("sshd setup skipped: #{e.class}: #{e.message}")
+end
+
+# --- LDAP (slapd) ---
+begin
+  slapd = which('slapd')
+  schema = '/etc/ldap/schema'
+  if slapd && File.directory?(schema) && File.exist?("#{schema}/core.schema")
+    ld = File.join(proto_dir, 'ldap'); FileUtils.mkdir_p("#{ld}/data")
+    modpath = ['/usr/lib/ldap', '/usr/lib/openldap'].find { |p| File.exist?("#{p}/back_mdb.so") || !Dir.glob("#{p}/back_mdb*").empty? }
+    File.write("#{ld}/slapd.conf", <<~CFG)
+      include #{schema}/core.schema
+      include #{schema}/cosine.schema
+      include #{schema}/inetorgperson.schema
+      #{modpath ? "modulepath #{modpath}\nmoduleload back_mdb" : ''}
+      pidfile #{ld}/slapd.pid
+      TLSCertificateFile #{CERT_PEM}
+      TLSCertificateKeyFile #{KEY_PEM}
+      database mdb
+      suffix "dc=example,dc=com"
+      rootdn "cn=admin,dc=example,dc=com"
+      rootpw secret
+      directory #{ld}/data
+    CFG
+    File.write("#{ld}/data.ldif", <<~LDIF)
+      dn: dc=example,dc=com
+      objectClass: dcObject
+      objectClass: organization
+      o: Example Org
+      dc: example
+
+      dn: cn=Alice,dc=example,dc=com
+      objectClass: inetOrgPerson
+      cn: Alice
+      sn: Smith
+      mail: alice@example.com
+    LDIF
+    slapadd = which('slapadd') || '/usr/sbin/slapadd'
+    if system(slapadd, '-f', "#{ld}/slapd.conf", '-l', "#{ld}/data.ldif", out: File::NULL, err: File::NULL)
+      ldap_port  = TCPServer.open('127.0.0.1', 0) { |s| s.addr[1] }
+      ldaps_port = TCPServer.open('127.0.0.1', 0) { |s| s.addr[1] }
+      pid = spawn(slapd, '-f', "#{ld}/slapd.conf",
+                  '-h', "ldap://127.0.0.1:#{ldap_port}/ ldaps://127.0.0.1:#{ldaps_port}/",
+                  '-d', '0', out: "#{ld}/slapd.log", err: "#{ld}/slapd.log")
+      child_pids << pid
+      sleep 0.7
+      write_port_atomic(File.join(__dir__, 'ldap_port'), ldap_port)
+      write_port_atomic(File.join(__dir__, 'ldaps_port'), ldaps_port)
+    end
+  end
+rescue => e
+  $stderr.puts("slapd setup skipped: #{e.class}: #{e.message}")
+end
+
+# --- MQTT (mosquitto) ---
+begin
+  mosq = which('mosquitto')
+  if mosq
+    md = File.join(proto_dir, 'mqtt'); FileUtils.mkdir_p(md)
+    mqtt_port  = TCPServer.open('127.0.0.1', 0) { |s| s.addr[1] }
+    mqtts_port = TCPServer.open('127.0.0.1', 0) { |s| s.addr[1] }
+    File.write("#{md}/mosq.conf", <<~CFG)
+      listener #{mqtt_port} 127.0.0.1
+      allow_anonymous true
+      persistence false
+      listener #{mqtts_port} 127.0.0.1
+      certfile #{CERT_PEM}
+      keyfile #{KEY_PEM}
+      require_certificate false
+    CFG
+    pid = spawn(mosq, '-c', "#{md}/mosq.conf", out: "#{md}/mosq.log", err: "#{md}/mosq.log")
+    child_pids << pid
+    sleep 0.5
+    # Publish a retained message (over the plaintext listener) so a one-shot
+    # subscribe on either listener is deterministic.
+    if (mp = which('mosquitto_pub'))
+      system(mp, '-h', '127.0.0.1', '-p', mqtt_port.to_s, '-t', 'test/topic', '-m', 'mqtt-retained', '-r',
+             out: File::NULL, err: File::NULL)
+    end
+    write_port_atomic(File.join(__dir__, 'mqtt_port'), mqtt_port)
+    write_port_atomic(File.join(__dir__, 'mqtts_port'), mqtts_port)
+  end
+rescue => e
+  $stderr.puts("mosquitto setup skipped: #{e.class}: #{e.message}")
+end
+
+# Reap the spawned daemons when this fixture is killed by rake.
+at_exit { child_pids.each { |pid| Process.kill('KILL', pid) rescue nil } }
+
+# ---- announce + serve -----------------------------------------------------
+
+# server_port is written LAST so its existence means every server is up. The
+# fixture is rake's child; rake kills it in an ensure block when tests finish.
 write_port_atomic(File.join(__dir__, 'smtp_port'), smtp_port_value)
 write_port_atomic(File.join(__dir__, 'imap_port'), imap_port_value)
 write_port_atomic(File.join(__dir__, 'ws_port'),   ws_port_value)
+write_port_atomic(File.join(__dir__, 'ftp_port'),    ftp_srv.addr[1])
+write_port_atomic(File.join(__dir__, 'dict_port'),   dict_srv.addr[1])
+write_port_atomic(File.join(__dir__, 'gopher_port'), gopher_srv.addr[1])
+write_port_atomic(File.join(__dir__, 'pop3_port'),   pop3_srv.addr[1])
+write_port_atomic(File.join(__dir__, 'telnet_port'), telnet_srv.addr[1])
+write_port_atomic(File.join(__dir__, 'rtsp_port'),   rtsp_srv.addr[1])
+write_port_atomic(File.join(__dir__, 'tftp_port'),   tftp_port_value)
+write_port_atomic(File.join(__dir__, 'ftps_port'),    ftps_srv.addr[1])
+write_port_atomic(File.join(__dir__, 'pop3s_port'),   pop3s_srv.addr[1])
+write_port_atomic(File.join(__dir__, 'gophers_port'), gophers_srv.addr[1])
 
 port      = server.config[:Port]
 port_file = File.join(__dir__, 'server_port')

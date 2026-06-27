@@ -23,18 +23,19 @@ task :test => :mruby do
     abort "test server needs webrick — run: gem install webrick"
   end
   port_file     = File.expand_path("test/server_port", __dir__)
-  smtp_port_file = File.expand_path("test/smtp_port",   __dir__)
-  imap_port_file = File.expand_path("test/imap_port",   __dir__)
-  ws_port_file   = File.expand_path("test/ws_port",     __dir__)
   server_script = File.expand_path("test/server.ruby",  __dir__)
 
   # Stale state from a previous run. server_port is written last by the fixture,
   # so clearing it here means the wait below only proceeds once the fresh run
-  # has all servers up; clear the other port files too so we never read a dead port.
-  File.unlink(port_file) if File.exist?(port_file)
-  File.unlink(smtp_port_file) if File.exist?(smtp_port_file)
-  File.unlink(imap_port_file) if File.exist?(imap_port_file)
-  File.unlink(ws_port_file) if File.exist?(ws_port_file)
+  # has all servers up; clear the other port files too so we never read a dead
+  # port (a protocol whose server didn't come up this run leaves no port file,
+  # and its tests skip).
+  %w[server_port smtp_port imap_port ws_port ftp_port dict_port gopher_port
+     pop3_port telnet_port rtsp_port tftp_port sftp_port sftp_meta ldap_port
+     mqtt_port ftps_port pop3s_port gophers_port ldaps_port mqtts_port file_url].each do |n|
+    f = File.expand_path("test/#{n}", __dir__)
+    File.unlink(f) if File.exist?(f)
+  end
 
   # MRI->MRI spawn. No cmd.exe wrapper, no Winsock init weirdness.
   server_pid = spawn(RbConfig.ruby, server_script)
@@ -57,9 +58,13 @@ task :test => :mruby do
     rescue
       # already gone
     end
-    File.unlink(port_file) if File.exist?(port_file)
-    File.unlink(smtp_port_file) if File.exist?(smtp_port_file)
-    File.unlink(imap_port_file) if File.exist?(imap_port_file)
+    %w[server_port smtp_port imap_port ws_port ftp_port dict_port gopher_port
+       pop3_port telnet_port rtsp_port tftp_port sftp_port sftp_meta ldap_port
+       mqtt_port ftps_port pop3s_port gophers_port ldaps_port mqtts_port
+       file_url].each do |n|
+      f = File.expand_path("test/#{n}", __dir__)
+      File.unlink(f) if File.exist?(f)
+    end
   end
 end
 

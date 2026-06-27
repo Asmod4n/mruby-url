@@ -267,6 +267,73 @@ class URL
       URL::WebSocket.new(req, code)
     end
 
+    # ----------------------------------------------------------------------
+    #  Generic transfer core (the non-HTTP protocols ride this)
+    # ----------------------------------------------------------------------
+
+    # Run a plain transfer for any supported scheme and return a URL::Response.
+    # `on_chunk` streams the body instead of buffering; `upload_data`, when set,
+    # turns it into an upload driven by the read callback. Reuses the same
+    # shared/throwaway session + IO.select drive as the HTTP verbs, so all
+    # protocols share one code path.
+    def _run_transfer(url, opts, on_chunk, upload_data)
+      session = shared
+      session = open if session._busy?
+      req, state = _build_transfer(session, url, opts, on_chunk, upload_data)
+      _drive_sync(session, url, req, state)
+    end
+
+    def _build_transfer(session, url, opts, on_chunk, upload_data)
+      opts = opts.dup
+      opts[:timeout_ms] = DEFAULT_TIMEOUT_MS unless opts.key?(:timeout_ms)
+      user_hdrs = opts.delete(:headers)
+      params    = opts.delete(:params)
+
+      url_str = params ? _stringify_url(url, params) : url.to_s
+      req     = URL::Request._open(session, url_str)
+
+      if upload_data
+        req.setopt(:upload, true)
+        req.setopt(:infilesize, upload_data.bytesize)
+      end
+      _apply_opts(req, opts)
+      req.headers = user_hdrs if user_hdrs && !user_hdrs.empty?
+
+      state = URL::TransferState.new
+
+      if upload_data
+        offset = 0
+        req.on_read do |max|
+          if offset >= upload_data.bytesize
+            ""
+          else
+            chunk   = upload_data.byteslice(offset, max)
+            offset += chunk.bytesize
+            chunk
+          end
+        end
+      end
+
+      if on_chunk
+        req.on_data { |c| on_chunk.call(c) }
+      else
+        req.on_data { |c| state.append_body(c) }
+      end
+      req.on_header { |l| state.append_header(l) }
+
+      [req, state]
+    end
+
+    # Extract the application payload from a libcurl MQTT message body, which is
+    # framed as [2-byte big-endian topic length][topic][payload]. Returns the
+    # payload bytes (or the body unchanged if it is too short to be framed).
+    def _mqtt_payload(body)
+      return body if body.nil? || body.bytesize < 2
+      tlen = (body.getbyte(0) << 8) | body.getbyte(1)
+      return body if body.bytesize < 2 + tlen
+      body.byteslice(2 + tlen, body.bytesize - 2 - tlen)
+    end
+
     def _response_from(url, req, state)
       URL::Response.new(
         url:           url,
