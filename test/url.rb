@@ -58,6 +58,46 @@ $sftp_meta   = File.exist?(sftp_meta_f) ? File.read(sftp_meta_f).split("\n") : n
 
 # ---- assertions -----------------------------------------------------------
 
+assert('URL("uri") returns the scheme-typed wrapper for every supported scheme') do
+  expected = {
+    "http"    => URL::HTTP,     "https"   => URL::HTTP,
+    "ftp"     => URL::Transfer, "ftps"    => URL::Transfer,
+    "sftp"    => URL::Transfer, "scp"     => URL::Transfer,
+    "file"    => URL::Transfer, "tftp"    => URL::Transfer, "telnet" => URL::Transfer,
+    "gopher"  => URL::Gopher,   "gophers" => URL::Gopher,
+    "dict"    => URL::Dict,
+    "imap"    => URL::IMAP,     "imaps"   => URL::IMAP,
+    "pop3"    => URL::POP3,     "pop3s"   => URL::POP3,
+    "smtp"    => URL::SMTP,     "smtps"   => URL::SMTP,
+    "ldap"    => URL::LDAP,     "ldaps"   => URL::LDAP,
+    "mqtt"    => URL::MQTT,     "mqtts"   => URL::MQTT,
+    "rtsp"    => URL::RTSP,
+    "ws"      => URL::WS,       "wss"     => URL::WS,
+  }
+  expected.each do |scheme, klass|
+    sample = case scheme
+             when "file" then "file:///etc/hostname"
+             else             "#{scheme}://h"
+             end
+    assert_equal klass, URL(sample).class, "URL(#{sample.inspect}) should be #{klass}"
+  end
+end
+
+assert('URL("uri").get and URL::HTTP.get("uri") both work') do
+  url = "#{$base}/echo"
+  a = URL(url).get
+  b = URL::HTTP.get(url)
+  assert_true a.success?
+  assert_true b.success?
+  assert_equal 'GET', a.json['method']
+  assert_equal 'GET', b.json['method']
+end
+
+assert('URL("uri") raises URL::Error for an unknown scheme') do
+  err = assert_raise(URL::Error) { URL("zzz://x") }
+  assert_include err.message, 'unsupported scheme'
+end
+
 assert('URL::Libcurl::SHARE is the per-VM share') do
   # The Share constant exists and stays stable across the lifetime of the VM —
   # every easy_init attaches to it so every session (the shared one and any
