@@ -100,5 +100,12 @@ MRuby::Gem::Specification.new('mruby-url') do |spec|
     # pulls it in there and is a harmless no-op on modern glibc and macOS.
     spec.cc.flags     << '-pthread'
     spec.linker.flags << '-pthread'
+
+    # Apple clang ships no C11 <threads.h>. Put our pthreads-backed shim
+    # (src/compat/threads.h, a 1:1 subset of the C11 interface) on the include
+    # path so <threads.h> resolves on macOS; Linux keeps using the real header.
+    if RUBY_PLATFORM =~ /darwin/
+      spec.cc.include_paths << "#{spec.dir}/src/compat"
+    end
   end
 end
