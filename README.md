@@ -33,9 +33,11 @@ URL("wss://echo.websocket.org").connect { |ws| ws.send_text("hi"); puts ws.recei
 `URL(uri)` dispatches on the scheme and returns the right wrapper:
 `URL::HTTP`, `URL::Transfer`, `URL::Gopher`, `URL::Dict`, `URL::IMAP`,
 `URL::POP3`, `URL::SMTP`, `URL::LDAP`, `URL::MQTT`, `URL::RTSP`, `URL::WS`.
-Each class carries only the verbs that fit the protocol; an unknown or
-unbuilt scheme raises `URL::Error` from `URL(uri)` itself, before any
-connection attempt.
+Each class carries only the verbs that fit the protocol. An *unknown* scheme
+— one `URL::PROTOS` doesn't list — raises `URL::Error` from `URL(uri)` itself.
+A scheme libcurl recognizes but wasn't compiled with still constructs its
+wrapper fine and raises only when you call a verb, so the failure stays where
+the work happens.
 
 ```ruby
 # Build once, call repeatedly:
@@ -57,8 +59,10 @@ Every HTTP call gets these unless you override them:
 - `timeout: 30.s` — prevents indefinite hangs (any chrono duration: `500.ms`, `2.min`, …)
 - `follow_location: true` — HTTP redirects followed
 - `user_agent: "mruby-url"`
-- libcurl advertises `Accept-Encoding` for gzip/deflate/br/zstd and
-  transparently decompresses (pass `accept_encoding:` to narrow it)
+
+Compression is **opt-in**, not a default: pass `accept_encoding: ""` to
+advertise gzip/deflate/br/zstd and have libcurl transparently decompress the
+response, or a specific token list (e.g. `"gzip"`) to narrow it.
 
 ## Convenience kwargs
 
@@ -87,7 +91,7 @@ r["Content-Type"]   # => "application/json"
 r.content_length    # => 1234
 r.success? / .client_error? / .server_error? / .redirect? / .error?
 r.error_message     # decorated when there was a transport failure
-r.raise_for_status! # raise URL::HTTPError if 4xx/5xx or transport-failed
+r.raise_for_status! # raises resp.error (e.g. URL::HttpReturnedError) on 4xx/5xx or transport failure
 
 r.json              # JSON.parse(body), cached
 r.json_lazy         # JSON.parse_lazy(body) -> JSON::Document, cached
@@ -179,9 +183,9 @@ blocking verbs do.
 ## Other protocols
 
 Every scheme `URL::PROTOS` lists is reachable. Failures are values
-(`resp.error`), exactly like the HTTP verbs; only an unknown/unbuilt
-scheme raises `URL::Error` — and that comes from `URL(uri)` itself, before
-any connection attempt.
+(`resp.error`), exactly like the HTTP verbs. Only an *unknown* scheme raises
+`URL::Error`, from `URL(uri)` itself; a recognized scheme that libcurl wasn't
+built with raises only when you call a verb.
 
 ```ruby
 URL("ftp://host/pub/file.txt").download.body          # ftp(s), sftp, scp,
@@ -427,6 +431,47 @@ any single request.
 | `:mail_from` | MAIL_FROM |
 | `:mail_rcpt` | MAIL_RCPT (Array) |
 | `:post_fields` | COPYPOSTFIELDS (size from POSTFIELDSIZE_LARGE) |
+| `:range` | RANGE |
+| `:infilesize` | INFILESIZE_LARGE |
+| `:dirlistonly` | DIRLISTONLY |
+| `:ftp_create_dirs` | FTP_CREATE_MISSING_DIRS |
+| `:use_ssl` | USE_SSL (`0`–`3`) |
+| `:ssh_knownhosts` / `:ssh_private_keyfile` / `:ssh_public_keyfile` | SSH_KNOWNHOSTS / SSH_PRIVATE_KEYFILE / SSH_PUBLIC_KEYFILE |
+| `:rtsp_request` / `:rtsp_stream_uri` / `:rtsp_transport` | RTSP_REQUEST / RTSP_STREAM_URI / RTSP_TRANSPORT |
+
+Client TLS:
+
+| Symbol | `CURLOPT_` |
+| --- | --- |
+| `:sslcert` / `:sslkey` / `:keypasswd` | SSLCERT / SSLKEY / KEYPASSWD |
+| `:capath` | CAPATH |
+| `:pinnedpublickey` | PINNEDPUBLICKEY |
+| `:ssl_cipher_list` | SSL_CIPHER_LIST |
+| `:sslversion` | SSLVERSION (curl integer enum) |
+
+HTTP / proxy / network:
+
+| Symbol | `CURLOPT_` |
+| --- | --- |
+| `:http_version` | HTTP_VERSION (curl integer enum: `2`=1.1, `3`=2, `30`=3) |
+| `:cookie` | COOKIE (inline `"a=1; b=2"`) |
+| `:unrestricted_auth` | UNRESTRICTED_AUTH |
+| `:postredir` | POSTREDIR |
+| `:proxyuserpwd` | PROXYUSERPWD |
+| `:proxytype` | PROXYTYPE (curl integer enum) |
+| `:httpproxytunnel` | HTTPPROXYTUNNEL |
+| `:noproxy` | NOPROXY |
+| `:interface` | INTERFACE |
+| `:dns_servers` | DNS_SERVERS |
+| `:doh_url` | DOH_URL |
+| `:max_send_speed` / `:max_recv_speed` | MAX_SEND_SPEED_LARGE / MAX_RECV_SPEED_LARGE (bytes/s) |
+| `:tcp_keepalive` / `:tcp_keepidle` / `:tcp_keepintvl` | TCP_KEEPALIVE / TCP_KEEPIDLE / TCP_KEEPINTVL |
+| `:unix_socket_path` | UNIX_SOCKET_PATH |
+
+Auth note: `auth:`/`bearer:`/`userpwd:` (Basic, Bearer) and `netrc:` are the
+supported auth paths. NTLM and Digest are intentionally **not** exposed —
+curl is removing NTLM (Sep 2026) and the local-crypto Digest fallback (Oct
+2026); Basic + Bearer + TLS client certs are the durable options.
 
 Headers: pass `headers: { ... }` to a one-shot, or `Request#headers=`.
 

@@ -204,6 +204,32 @@ assert('timeout accepts any chrono duration unit') do
   assert_true URL("#{$base}/slow/2000").get(timeout: 100.ms).error?
 end
 
+assert('newly wired curl options are accepted (not an unsupported option)') do
+  # A representative spread across the new flat setopt pass-throughs (client
+  # TLS, HTTP version, inline cookie, proxy, name resolution, rate limiting,
+  # keepalive, unix socket). The values are inert for a plain localhost GET;
+  # the point is that setopt wires each one instead of raising ArgumentError
+  # "unsupported option".
+  r = URL("#{$base}/echo").get(
+    accept_encoding: "",          # opt-in transparent compression
+    cookie:          "a=1; b=2",
+    http_version:    2,           # CURL_HTTP_VERSION_1_1
+    sslversion:      0,           # CURL_SSLVERSION_DEFAULT
+    capath:          ".",
+    pinnedpublickey: "",
+    proxytype:       0,           # CURLPROXY_HTTP
+    noproxy:         "*",
+    max_recv_speed:  10_000_000,
+    max_send_speed:  10_000_000,
+    tcp_keepalive:   true,
+    tcp_keepidle:    30,
+    tcp_keepintvl:   15,
+  )
+  assert_true r.success?
+  # The inline cookie really went out (echoed back by the server).
+  assert_include r.json["headers"]["cookie"].to_s, "a=1"
+end
+
 assert('resp.error is set on failure (transport or HTTP) as a value, nil on success') do
   ok = URL("#{$base}/echo").get
   assert_nil ok.error                                  # success -> no error value

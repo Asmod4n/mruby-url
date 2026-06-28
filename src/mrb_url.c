@@ -515,6 +515,37 @@ murl_lc_easy_setopt(mrb_state* mrb, mrb_value mod)
   else if (opt == MRB_SYM(rtsp_request))       rc = curl_easy_setopt(h, CURLOPT_RTSP_REQUEST, (long)mrb_as_int(mrb, val));
   else if (opt == MRB_SYM(rtsp_stream_uri))    rc = curl_easy_setopt(h, CURLOPT_RTSP_STREAM_URI, mrb_string_cstr(mrb, val));
   else if (opt == MRB_SYM(rtsp_transport))     rc = curl_easy_setopt(h, CURLOPT_RTSP_TRANSPORT, mrb_string_cstr(mrb, val));
+  /* --- client TLS ------------------------------------------------------- */
+  else if (opt == MRB_SYM(sslcert))            rc = curl_easy_setopt(h, CURLOPT_SSLCERT, mrb_string_cstr(mrb, val));
+  else if (opt == MRB_SYM(sslkey))             rc = curl_easy_setopt(h, CURLOPT_SSLKEY, mrb_string_cstr(mrb, val));
+  else if (opt == MRB_SYM(keypasswd))          rc = curl_easy_setopt(h, CURLOPT_KEYPASSWD, mrb_string_cstr(mrb, val));
+  else if (opt == MRB_SYM(capath))             rc = curl_easy_setopt(h, CURLOPT_CAPATH, mrb_string_cstr(mrb, val));
+  else if (opt == MRB_SYM(pinnedpublickey))    rc = curl_easy_setopt(h, CURLOPT_PINNEDPUBLICKEY, mrb_string_cstr(mrb, val));
+  else if (opt == MRB_SYM(ssl_cipher_list))    rc = curl_easy_setopt(h, CURLOPT_SSL_CIPHER_LIST, mrb_string_cstr(mrb, val));
+  else if (opt == MRB_SYM(sslversion))         rc = curl_easy_setopt(h, CURLOPT_SSLVERSION, (long)mrb_as_int(mrb, val));
+  /* --- HTTP version / cookies / redirect auth --------------------------- */
+  else if (opt == MRB_SYM(http_version))       rc = curl_easy_setopt(h, CURLOPT_HTTP_VERSION, (long)mrb_as_int(mrb, val));
+  else if (opt == MRB_SYM(cookie))             rc = curl_easy_setopt(h, CURLOPT_COOKIE, mrb_string_cstr(mrb, val));
+  else if (opt == MRB_SYM(unrestricted_auth))  rc = curl_easy_setopt(h, CURLOPT_UNRESTRICTED_AUTH, (long)mrb_bool(val));
+  else if (opt == MRB_SYM(postredir))          rc = curl_easy_setopt(h, CURLOPT_POSTREDIR, (long)mrb_as_int(mrb, val));
+  /* --- proxy ------------------------------------------------------------ */
+  else if (opt == MRB_SYM(proxyuserpwd))       rc = curl_easy_setopt(h, CURLOPT_PROXYUSERPWD, mrb_string_cstr(mrb, val));
+  else if (opt == MRB_SYM(proxytype))          rc = curl_easy_setopt(h, CURLOPT_PROXYTYPE, (long)mrb_as_int(mrb, val));
+  else if (opt == MRB_SYM(httpproxytunnel))    rc = curl_easy_setopt(h, CURLOPT_HTTPPROXYTUNNEL, (long)mrb_bool(val));
+  else if (opt == MRB_SYM(noproxy))            rc = curl_easy_setopt(h, CURLOPT_NOPROXY, mrb_string_cstr(mrb, val));
+  /* --- name resolution -------------------------------------------------- */
+  else if (opt == MRB_SYM(interface))          rc = curl_easy_setopt(h, CURLOPT_INTERFACE, mrb_string_cstr(mrb, val));
+  else if (opt == MRB_SYM(dns_servers))        rc = curl_easy_setopt(h, CURLOPT_DNS_SERVERS, mrb_string_cstr(mrb, val));
+  else if (opt == MRB_SYM(doh_url))            rc = curl_easy_setopt(h, CURLOPT_DOH_URL, mrb_string_cstr(mrb, val));
+  /* --- transfer rate limiting ------------------------------------------- */
+  else if (opt == MRB_SYM(max_send_speed))     rc = curl_easy_setopt(h, CURLOPT_MAX_SEND_SPEED_LARGE, (curl_off_t)mrb_as_int(mrb, val));
+  else if (opt == MRB_SYM(max_recv_speed))     rc = curl_easy_setopt(h, CURLOPT_MAX_RECV_SPEED_LARGE, (curl_off_t)mrb_as_int(mrb, val));
+  /* --- TCP keepalive ---------------------------------------------------- */
+  else if (opt == MRB_SYM(tcp_keepalive))      rc = curl_easy_setopt(h, CURLOPT_TCP_KEEPALIVE, (long)mrb_bool(val));
+  else if (opt == MRB_SYM(tcp_keepidle))       rc = curl_easy_setopt(h, CURLOPT_TCP_KEEPIDLE, (long)mrb_as_int(mrb, val));
+  else if (opt == MRB_SYM(tcp_keepintvl))      rc = curl_easy_setopt(h, CURLOPT_TCP_KEEPINTVL, (long)mrb_as_int(mrb, val));
+  /* --- unix domain socket (Docker / HTTP-over-unix) --------------------- */
+  else if (opt == MRB_SYM(unix_socket_path))   rc = curl_easy_setopt(h, CURLOPT_UNIX_SOCKET_PATH, mrb_string_cstr(mrb, val));
   else if (opt == MRB_SYM(post_fields)) {
     mrb_value s = mrb_str_to_str(mrb, val);
     curl_easy_setopt(h, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)RSTRING_LEN(s));
