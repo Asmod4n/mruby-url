@@ -177,11 +177,11 @@ streams persist across calls. That session can only drive one transfer at
 a time, so a call made from *inside* a streaming/callback (where the
 shared session is mid-flight) would be re-entrant. mruby-url detects that
 and transparently runs the nested call on a throwaway session — and a
-process-wide `CURLSH` (`URL::Libcurl::SHARE`) means the throwaway shares
-the **same connection cache and TLS-session-ticket cache** as the shared
-session, so a nested call to a host you already opened resumes TLS (and
-often reuses the live TCP/HTTP-2 connection) instead of doing a full
-handshake. Transparent in both directions:
+per-OS-thread `CURLSH` (held in thread-local storage in C, not exposed to
+Ruby) means the throwaway shares the **same connection cache and
+TLS-session-ticket cache** as the shared session, so a nested call to a host
+you already opened resumes TLS (and often reuses the live TCP/HTTP-2
+connection) instead of doing a full handshake. Transparent in both directions:
 
 ```ruby
 URL("https://a.example/stream").get do |chunk|
@@ -542,26 +542,30 @@ the vendored `deps/curl` with CMake and links it statically against Schannel
   it afterwards). The C side never `longjmp`s through libcurl — the first
   exception is stashed on `mrb->exc`, the callback returns libcurl's abort
   code, and it's re-raised on the way back to Ruby.
-- `curl_global_init` runs exactly once per process via C11 `call_once`, and
-  `curl_global_cleanup` is deferred to `atexit` — not tied to `mrb_state`
-  lifecycle, so spinning VMs up and down never races or tears down the
-  TLS/Winsock layer under a live transfer.
-- **Connection / TLS session reuse across sessions** is wired through
-  libcurl's `CURLSH`. One `URL::Libcurl::SHARE` is created per VM in
-  `gem_init` and every `easy_init` attaches via `CURLOPT_SHARE`, so the
-  shared session **and** any throwaway session (created when the shared
-  one is busy mid-callback — see below) use one TCP-connection cache and
-  one TLS-session-ticket cache. A request fired from inside a callback
-  therefore resumes TLS (and often the live TCP/HTTP/2 connection) of
-  the original session instead of doing a full handshake. We share
-  `CONNECT` + `SSL_SESSION` only — `DNS`/`PSL` are auto-shared at the
-  multi level, `COOKIE`/`HSTS` are documented thread-unsafe and we set
-  them per-easy. Lock callbacks are deliberately unset; libcurl guards
-  every cache use with `if(share->lockfunc)`, so unset is the cheap
-  no-op for single-threaded mruby. Cleanup is a three-pass walk in
-  `gem_final` — disarm callbacks, clean every easy/multi (each detaches
-  itself from the share), then `curl_share_cleanup` — so the share is
-  the last thing to go.
+- `curl_global_init`/`curl_global_cleanup` are refcounted, not tied to any one
+  `mrb_state`. A C11 `call_once` builds the mutex and a thread-local key; under
+  the mutex the global layer comes up on the first **holder** and is torn down
+  after the last, where holders are both live VMs *and* live per-thread shares
+  (below). So spinning VMs up and down — even across threads — never races or
+  tears down the TLS/Winsock layer under a live transfer.
+- **Connection / TLS session reuse** is wired through libcurl's `CURLSH`, held
+  in **OS-thread-local storage** (`tss_t`), not per VM and not exposed to Ruby.
+  It's created lazily on the first `easy_init` on a thread, and every `easy_init`
+  on that thread attaches via `CURLOPT_SHARE` — so the shared session, any
+  throwaway session, **and any other `mrb_state` running on the same OS thread**
+  reuse one TCP-connection cache and one TLS-session-ticket cache (users can
+  spawn several VMs per thread; binding the share to the thread lets them share a
+  warm pool). A request fired from inside a callback therefore resumes TLS (and
+  often the live TCP/HTTP/2 connection) instead of doing a full handshake. We
+  share `CONNECT` + `SSL_SESSION` only — `DNS`/`PSL` are auto-shared at the multi
+  level, `COOKIE`/`HSTS` are documented thread-unsafe and set per-easy. Lock
+  callbacks are deliberately unset: a thread-local `CURLSH` is only ever touched
+  by its owning OS thread (which runs one VM at a time), so access is serialised
+  by construction and libcurl's `if(share->lockfunc)` guard makes unset the cheap
+  no-op. The share is freed by its thread-local destructor at **thread exit**
+  (`curl_share_cleanup`; well-behaved code has closed its VMs first so every easy
+  has detached). Trade-off: no connection/TLS reuse *across* OS threads — each
+  thread warms its own pool — which is the price of staying lock-free.
 - `URL::Request` is private (`#initialize` undef'd; `_open` factory). The
   verbs use it internally. If you get one back from `info_read` you can call
   `#response_code`, `#effective_url`, `#total_time`, `#content_type`,

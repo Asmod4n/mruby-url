@@ -292,62 +292,113 @@ murl_multi_get(mrb_state* mrb, mrb_value self)
 }
 
 /* =========================================================================
- * URL::Libcurl::Share (CDATA = murl_share_t, wraps CURLSH*)
+ * Per-OS-thread connection/TLS share (CURLSH in thread-local storage)
  *
- * One per VM, created in gem_init and published as URL::Libcurl::SHARE. Every
- * Easy from murl_lc_easy_init attaches via CURLOPT_SHARE, so every session in
- * this VM uses the same connection cache and TLS session-ticket cache. A
- * request fired from inside a callback (which runs on a throwaway session
- * because the shared multi is busy) reuses the live TCP connection / TLS
- * session-ticket from the shared session instead of doing a full handshake.
+ * One CURLSH per OS thread, created lazily on the first easy_init that runs on
+ * the thread and held in C11 thread-specific storage (tss_t). Every easy made
+ * on the thread attaches via CURLOPT_SHARE, so every session — and every
+ * mrb_state that runs on this OS thread — reuses the one connection cache and
+ * TLS session-ticket cache. Users can spawn several mrb_state on a single OS
+ * thread; binding the share to the thread instead of the VM lets those VMs
+ * share one warm pool, while a request fired from inside a callback (running on
+ * a throwaway session because the shared multi is busy) still reuses the live
+ * connection / TLS ticket.
  *
- * Single-threaded mruby: no lock callbacks are set. curl_share.c uses
- * `if(share->lockfunc)` and skips the call when unset — unset is the cheap
- * documented no-op. No-op stubs would add an indirect call per cache hit.
+ * Still no lock callbacks: a thread-local CURLSH is only ever touched by its
+ * owning OS thread, which runs one VM at a time, so access is serialised by
+ * construction. curl_share.c uses `if(share->lockfunc)` and skips locking when
+ * unset — the cheap documented no-op.
  *
- * LOCK_DATA enabled:
- *   CONNECT     — TCP keep-alive + HTTP/2/3 connection cache reuse
- *   SSL_SESSION — TLS session-ticket cache (resumption)
- * Skipped: DNS/PSL (auto-shared at multi level), COOKIE/HSTS (libcurl docs say
- * "not supported to share across threads", and we set them per-easy anyway).
+ * Lifetime. curl_global_init must outlive every holder, of which there are now
+ * two kinds: live VMs (gem_init/gem_final) and live thread-shares (created
+ * here, destroyed by the tss destructor at thread exit). g_refs counts both;
+ * the global layer comes up on the first holder and is torn down after the
+ * last. The destructor runs curl_share_cleanup on the owning thread at thread
+ * exit — well-behaved code has closed its VMs first (each curl_easy_cleanup
+ * detached its easy), so cleanup succeeds; a thread torn down with a VM still
+ * live gets CURLSHE_IN_USE (non-fatal — the share is left, the same tolerance
+ * as a leaked easy).
+ *
+ * LOCK_DATA enabled: CONNECT (keep-alive + HTTP/2/3 pool) and SSL_SESSION (TLS
+ * resumption). Skipped: DNS/PSL (auto-shared at multi level), COOKIE/HSTS (set
+ * per-easy; libcurl docs say not shareable across threads).
+ *
+ * No <threads.h> on some toolchains (Apple's, C99-only): src/compat/threads.h
+ * shims the tss, mtx and call_once subset onto POSIX; how it is included is
+ * unchanged.
  * ========================================================================= */
 
-typedef struct murl_share_t {
-  mrb_state* mrb;
-  CURLSH*    share;
-} murl_share_t;
+static once_flag g_once = ONCE_FLAG_INIT;
+static mtx_t     g_lock;              /* mtx_t has NO static initializer in C11 */
+static unsigned  g_refs = 0;          /* live holders: VMs + thread-shares */
+static tss_t     g_share_key;         /* thread-local CURLSH* */
+static int       g_share_key_ok = 0;  /* tss_create succeeded */
 
+static void murl_share_dtor(void* p); /* fwd: tss destructor, defined below */
+
+/* call_once target: build the mutex (mtx_t has no static initializer) and the
+ * tss key. If tss_create fails the gem still works — easies just run shareless. */
 static void
-murl_share_free(mrb_state* mrb, void* p)
+murl_globals_init(void)
 {
-  if (unlikely(!p)) return;
-  murl_share_t* s = (murl_share_t*)p;
-  /* When this GC sweep runs, gem_final's three-pass cleanup
-   * (disarm -> cleanup_curl -> cleanup_share) has already nulled s->share, so
-   * the guard below makes this a no-op. The guard also covers the unusual
-   * order — direct GC sweep without gem_final — and the path where the share
-   * was never opened (curl_share_init returned NULL in gem_init): in both
-   * cases curl_share_cleanup would otherwise be called on NULL. If somehow an
-   * easy still references the share, curl_share_cleanup returns
-   * CURLSHE_IN_USE (does not crash) and the share is left intact. */
-  if (s->share) curl_share_cleanup(s->share);
-  mrb_free(mrb, s);
+  mtx_init(&g_lock, mtx_plain);
+  g_share_key_ok = (tss_create(&g_share_key, murl_share_dtor) == thrd_success);
 }
 
-static const struct mrb_data_type murl_share_type = {
-  "URL::Libcurl::Share", murl_share_free
-};
-
-/* Per-VM share lookup. Returns NULL if missing/torn-down so easy_init proceeds
- * without CURLOPT_SHARE rather than failing. */
-static CURLSH*
-murl_share_lookup(mrb_state* mrb, struct RClass* lc)
+/* Bring curl_global_init up on the first holder and tear it down after the
+ * last. Both VM init/final and thread-share create/destroy go through here,
+ * serialised by the one mutex. */
+static void
+murl_global_ref(void)
 {
-  mrb_sym sym = MRB_SYM(SHARE);
-  if (!mrb_const_defined_at(mrb, mrb_obj_value(lc), sym)) return NULL;
-  mrb_value v = mrb_const_get(mrb, mrb_obj_value(lc), sym);
-  murl_share_t* s = (murl_share_t*)mrb_data_check_get_ptr(mrb, v, &murl_share_type);
-  return (s && s->share) ? s->share : NULL;
+  mtx_lock(&g_lock);
+  if (g_refs++ == 0) curl_global_init(CURL_GLOBAL_DEFAULT);
+  mtx_unlock(&g_lock);
+}
+
+static void
+murl_global_unref(void)
+{
+  mtx_lock(&g_lock);
+  if (--g_refs == 0) curl_global_cleanup();
+  mtx_unlock(&g_lock);
+}
+
+/* tss destructor: runs at thread exit for any thread that created a share. */
+static void
+murl_share_dtor(void* p)
+{
+  CURLSH* sh = (CURLSH*)p;
+  if (unlikely(!sh)) return;
+  curl_share_cleanup(sh);   /* CURLSHE_IN_USE if an easy still attached: leaves it */
+  murl_global_unref();      /* release the global ref this share held */
+}
+
+/* The calling OS thread's CURLSH, created on first use. Returns NULL (so
+ * easy_init proceeds shareless) when TLS is unavailable or curl_share_init
+ * fails. Always called with the global layer already up: an easy is only
+ * created from within a live VM that holds a gem_init ref. */
+static CURLSH*
+murl_thread_share(void)
+{
+  if (unlikely(!g_share_key_ok)) return NULL;
+  CURLSH* sh = (CURLSH*)tss_get(g_share_key);
+  if (sh) return sh;
+
+  sh = curl_share_init();
+  if (unlikely(!sh)) return NULL;
+  /* CONNECT + SSL_SESSION are the safe, useful single-thread caches; lock
+   * callbacks intentionally unset. A setopt failure degrades to an unconfigured
+   * share (attaches but reuses nothing) — acceptable, not fatal. */
+  curl_share_setopt(sh, CURLSHOPT_SHARE, CURL_LOCK_DATA_CONNECT);
+  curl_share_setopt(sh, CURLSHOPT_SHARE, CURL_LOCK_DATA_SSL_SESSION);
+
+  if (unlikely(tss_set(g_share_key, sh) != thrd_success)) {
+    curl_share_cleanup(sh);
+    return NULL;
+  }
+  murl_global_ref();   /* keep the global layer up until this share's dtor runs */
+  return sh;
 }
 
 /* =========================================================================
@@ -602,9 +653,9 @@ murl_lc_easy_init(mrb_state* mrb, mrb_value mod)
   curl_easy_setopt(h, CURLOPT_READDATA,       e);
   curl_easy_setopt(h, CURLOPT_NOSIGNAL,       1L);
 
-  /* Attach to the per-VM share so this easy uses the shared connection cache
-   * and TLS session-ticket cache. Detach is automatic on curl_easy_cleanup. */
-  CURLSH* sh = murl_share_lookup(mrb, lc);
+  /* Attach to this OS thread's share so this easy uses the per-thread connection
+   * cache and TLS session-ticket cache. Detach is automatic on curl_easy_cleanup. */
+  CURLSH* sh = murl_thread_share();
   if (sh) curl_easy_setopt(h, CURLOPT_SHARE, sh);
 
   return self;
@@ -1142,33 +1193,18 @@ murl_lc_multi_strerror(mrb_state* mrb, mrb_value mod)
  * ========================================================================= */
 
 /* libcurl's global init/cleanup are process-global, not per-mrb_state, and are
- * not safe to churn. curl_global_init brings up the TLS backend and (on
- * Windows) Winsock, which must come up once before any other thread runs and be
- * torn down once after every handle is gone. Tying them naively to gem_init /
- * gem_final would re-run them for every VM: a race when VMs are created on
- * multiple threads, and worse, one VM's gem_final could pull the TLS/Winsock
- * layer out from under a transfer still live in another VM.
- *
- * So we refcount. A C11 call_once builds the mutex exactly once (mtx_t has no
- * static initializer), and under that mutex gem_init runs curl_global_init only
- * on the 0->1 transition and gem_final runs curl_global_cleanup only on the
- * 1->0 transition. The mutex serialises those two calls across concurrently
- * created mrb_states; the count keeps the global layer up for as long as any VM
- * is using it, then tears it down once the last one is gone. Per-mrb_state
- * handle teardown still happens in gem_final below. */
-static once_flag g_once = ONCE_FLAG_INIT;
-static mtx_t     g_lock;              /* mtx_t has NO static initializer in C11 */
-static unsigned  g_refs = 0;
-
-static void init_lock(void) { mtx_init(&g_lock, mtx_plain); }
-
+ * not safe to churn (curl_global_init brings up the TLS backend and, on Windows,
+ * Winsock; a VM's gem_final must not pull them out from under a transfer still
+ * live in another VM). So the global layer is refcounted: call_once builds the
+ * mutex and the tss key, then murl_global_ref/unref (above) bring curl_global_
+ * init up on the first holder and tear it down after the last — holders being
+ * both live VMs (here) and live per-thread shares. Per-mrb_state handle teardown
+ * still happens in gem_final below. */
 void
 mrb_mruby_url_gem_init(mrb_state* mrb)
 {
-  call_once(&g_once, init_lock);
-  mtx_lock(&g_lock);
-  if (g_refs++ == 0) curl_global_init(CURL_GLOBAL_DEFAULT);
-  mtx_unlock(&g_lock);
+  call_once(&g_once, murl_globals_init);
+  murl_global_ref();
 
   struct RClass* url_cls = mrb_define_class_id(mrb, MRB_SYM(URL), mrb->object_class);
 
@@ -1239,11 +1275,6 @@ mrb_mruby_url_gem_init(mrb_state* mrb)
   MRB_SET_INSTANCE_TT(multi_cls, MRB_TT_CDATA);
   mrb_undef_method_id(mrb, multi_cls, MRB_SYM(initialize));
 
-  struct RClass* share_cls =
-    mrb_define_class_under_id(mrb, lc, MRB_SYM(Share), mrb->object_class);
-  MRB_SET_INSTANCE_TT(share_cls, MRB_TT_CDATA);
-  mrb_undef_method_id(mrb, share_cls, MRB_SYM(initialize));
-
   /* multipart/form-data handles: curl_mime (the tree) and curl_mimepart. */
   struct RClass* mime_cls =
     mrb_define_class_under_id(mrb, lc, MRB_SYM(Mime), mrb->object_class);
@@ -1263,28 +1294,9 @@ mrb_mruby_url_gem_init(mrb_state* mrb)
   mrb_define_module_function_id(mrb, lc, MRB_SYM(mime_type),     murl_lc_mime_type,     MRB_ARGS_REQ(2));
   mrb_define_module_function_id(mrb, lc, MRB_SYM(mime_filename), murl_lc_mime_filename, MRB_ARGS_REQ(2));
 
-  /* One Share per VM, published as URL::Libcurl::SHARE so easy_init can attach
-   * to it. CONNECT + SSL_SESSION are the safe-and-useful caches to share
-   * single-threaded; lock callbacks intentionally unset (curl guards with
-   * `if(share->lockfunc)`). The two setopt return codes are checked because a
-   * CURLSHE_NOMEM there would otherwise silently degrade the share to
-   * unconfigured — every easy would attach and never reuse anything. */
-  {
-    murl_share_t* s;
-    struct RData* sd;
-    Data_Make_Struct(mrb, share_cls, murl_share_t, &murl_share_type, s, sd);
-    s->mrb   = mrb;
-    s->share = curl_share_init();
-    if (unlikely(!s->share)) mrb_raise(mrb, E_RUNTIME_ERROR, "curl_share_init failed");
-    CURLSHcode src;
-    src = curl_share_setopt(s->share, CURLSHOPT_SHARE, CURL_LOCK_DATA_CONNECT);
-    if (unlikely(src != CURLSHE_OK))
-      mrb_raisef(mrb, E_RUNTIME_ERROR, "curl_share_setopt(CONNECT): %s", curl_share_strerror(src));
-    src = curl_share_setopt(s->share, CURLSHOPT_SHARE, CURL_LOCK_DATA_SSL_SESSION);
-    if (unlikely(src != CURLSHE_OK))
-      mrb_raisef(mrb, E_RUNTIME_ERROR, "curl_share_setopt(SSL_SESSION): %s", curl_share_strerror(src));
-    mrb_define_const_id(mrb, lc, MRB_SYM(SHARE), mrb_obj_value(sd));
-  }
+  /* The connection/TLS share is per-OS-thread now (see murl_thread_share), not
+   * per-VM, so nothing is created or published here — it springs up lazily on
+   * the first easy made on each thread. */
 }
 
 /* =========================================================================
@@ -1348,33 +1360,16 @@ murl_cleanup_curl(mrb_state* mrb, struct RBasic* obj, void* data)
   return MRB_EACH_OBJ_OK;
 }
 
-/* Third pass: clean every Share now that every easy/multi is gone. Each
- * curl_easy_cleanup above has detached its easy from the share
- * (Curl_share_easy_unlink, ref_count--), so curl_share_cleanup here succeeds
- * instead of returning CURLSHE_IN_USE. */
-static int
-murl_cleanup_share(mrb_state* mrb, struct RBasic* obj, void* data)
-{
-  (void)data;
-  if (mrb_object_dead_p(mrb, obj)) return MRB_EACH_OBJ_OK;
-  switch (obj->tt) { case MRB_TT_ENV: case MRB_TT_ICLASS: return MRB_EACH_OBJ_OK; default: break; }
-  if (!obj->c || obj->tt != MRB_TT_CDATA) return MRB_EACH_OBJ_OK;
-  struct RData* d = (struct RData*)obj;
-  if (!d->data) return MRB_EACH_OBJ_OK;
-  if (d->type != &murl_share_type) return MRB_EACH_OBJ_OK;
-  murl_share_t* s = (murl_share_t*)d->data;
-  if (s->share) { curl_share_cleanup(s->share); s->share = NULL; }
-  return MRB_EACH_OBJ_OK;
-}
-
+/* This VM's easies/multis are gone after the two passes above. The connection
+ * share is no longer per-VM — it belongs to the OS thread and is cleaned by its
+ * tss destructor at thread exit — so there is no third (share) pass here. Each
+ * curl_easy_cleanup above already detached its easy from the thread share
+ * (ref_count--), so the share is left in a cleanly releasable state. */
 void
 mrb_mruby_url_gem_final(mrb_state* mrb)
 {
   mrb_objspace_each_objects(mrb, murl_disarm_callbacks, NULL);
   mrb_objspace_each_objects(mrb, murl_cleanup_curl,     NULL);
-  mrb_objspace_each_objects(mrb, murl_cleanup_share,    NULL);
 
-  mtx_lock(&g_lock);
-  if (--g_refs == 0) curl_global_cleanup();
-  mtx_unlock(&g_lock);
+  murl_global_unref();   /* drop this VM's hold on the global layer */
 }

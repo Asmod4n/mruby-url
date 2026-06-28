@@ -126,20 +126,21 @@ assert('URL("uri") raises URL::UnsupportedScheme for an unknown scheme') do
   assert_equal URL::PROTOS, err.supported
 end
 
-assert('URL::Libcurl::SHARE is the per-VM share') do
-  # The Share constant exists and stays stable across the lifetime of the VM —
-  # every easy_init attaches to it so every session (the shared one and any
-  # throwaway URL.open) uses one connection cache + one TLS-session cache.
-  assert_equal URL::Libcurl::Share, URL::Libcurl::SHARE.class
-  same = URL::Libcurl::SHARE
-  assert_equal URL::Libcurl::SHARE.object_id, same.object_id
+assert('the connection share is per-thread, not exposed to Ruby') do
+  # The CURLSH now lives in OS-thread-local storage in C, created lazily on the
+  # first easy on each thread and freed by its tss destructor at thread exit.
+  # It is deliberately invisible to Ruby — no URL::Libcurl::SHARE constant, no
+  # URL::Libcurl::Share class — so it can't be tampered with or GC'd out from
+  # under libcurl.
+  assert_false URL::Libcurl.const_defined?(:SHARE)
+  assert_false URL::Libcurl.const_defined?(:Share)
 end
 
 assert('Throwaway session against the same host still succeeds (share-attached)') do
-  # First request warms the shared session's connection / TLS cache. A second
-  # request on a fresh URL.open against the same origin succeeds — and (not
-  # asserted because timing is CI-flaky) reuses the kept-alive connection
-  # through the share, which is the whole point of the SHARE constant.
+  # First request warms this thread's connection / TLS cache. A second request
+  # on a fresh URL.open against the same origin succeeds — and (not asserted
+  # because timing is CI-flaky) reuses the kept-alive connection through the
+  # per-thread share, which every easy on the thread attaches to.
   assert_true URL("#{$base}/echo").get.success?
   fresh = URL.open
   req, state = URL.__send__(:_build_request, fresh, :GET, "#{$base}/echo", nil, { timeout: 5.s }, nil)
