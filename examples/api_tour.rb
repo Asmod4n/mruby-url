@@ -41,11 +41,15 @@ puts "https built? #{URL.supports?('https')}"
 puts "protocols:   #{URL::PROTOS.join(' ')}"
 
 # An unbuilt protocol raises from URL(uri) itself (no wrapper is made); an
-# unknown scheme raises too. Both are URL::Error (a usage error).
+# unknown scheme raises too. These are specific URL::SchemeError subclasses —
+# URL::UnsupportedScheme (unknown) and URL::ProtocolNotAvailable (real protocol,
+# not compiled in) — each carrying the offending .scheme and the .supported list,
+# so you can branch on data, not scrape the message. Both are still URL::Error.
 begin
   URL("zzz://nowhere")
-rescue URL::Error => e
-  puts "unknown scheme -> #{e.message}"
+rescue URL::SchemeError => e
+  puts "#{e.class}: scheme=#{e.scheme.inspect}"
+  puts "  #{e.message}"
 end
 
 # ---------------------------------------------------------------------------

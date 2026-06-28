@@ -305,7 +305,7 @@ class URL
       private
 
       def _request(verb, transport, stream_uri, opts)
-        enum = REQUESTS[verb] or raise URL::Error, "unknown RTSP request: #{verb.inspect}"
+        enum = REQUESTS[verb] or raise URL::UnknownRTSPRequest.new(verb, REQUESTS.keys)
         opts = _ck(opts).merge(rtsp_request: enum)
         opts[:rtsp_stream_uri] = stream_uri if stream_uri
         opts[:rtsp_transport]  = transport  if transport
@@ -389,9 +389,9 @@ class URL
     klass  = SCHEME_CLIENTS[scheme]
     return klass.new(uri) if klass
     if KNOWN_SCHEMES.include?(scheme)
-      raise URL::Error, "protocol not available: #{scheme}"
+      raise URL::ProtocolNotAvailable.new(scheme, PROTOS)
     else
-      raise URL::Error, "unsupported scheme: #{scheme.inspect}"
+      raise URL::UnsupportedScheme.new(scheme, PROTOS)
     end
   end
 end
