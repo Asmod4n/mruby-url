@@ -39,11 +39,11 @@ URL("wss://echo.websocket.org").connect { |ws| ws.send_text("hi"); puts ws.recei
 `URL(uri)` dispatches on the scheme and returns the right wrapper:
 `URL::HTTP`, `URL::Transfer`, `URL::Gopher`, `URL::Dict`, `URL::IMAP`,
 `URL::POP3`, `URL::SMTP`, `URL::LDAP`, `URL::MQTT`, `URL::RTSP`, `URL::WS`.
-Each class carries only the verbs that fit the protocol. An *unknown* scheme
-— one `URL::PROTOS` doesn't list — raises `URL::Error` from `URL(uri)` itself.
-A scheme libcurl recognizes but wasn't compiled with still constructs its
-wrapper fine and raises only when you call a verb, so the failure stays where
-the work happens.
+Each class carries only the verbs that fit the protocol. A scheme this libcurl
+can't speak — whether unknown or simply not compiled in — raises `URL::Error`
+from `URL(uri)` itself: no wrapper is constructed for a protocol the build
+can't use, so the failure surfaces immediately, not later at a verb. Check
+ahead of time with `URL.supports?("scheme")` or against `URL::PROTOS`.
 
 ```ruby
 # Build once, call repeatedly:
@@ -198,10 +198,10 @@ blocking verbs do.
 
 ## Other protocols
 
-Every scheme `URL::PROTOS` lists is reachable. Failures are values
-(`resp.error`), exactly like the HTTP verbs. Only an *unknown* scheme raises
-`URL::Error`, from `URL(uri)` itself; a recognized scheme that libcurl wasn't
-built with raises only when you call a verb.
+Every scheme `URL::PROTOS` lists is reachable, and transfer failures are values
+(`resp.error`), exactly like the HTTP verbs. A scheme this libcurl wasn't built
+with — known or not — raises `URL::Error` straight from `URL(uri)`, before any
+wrapper exists; only failures *during* a transfer come back as values.
 
 ```ruby
 URL("ftp://host/pub/file.txt").download.body          # ftp(s), sftp, scp,

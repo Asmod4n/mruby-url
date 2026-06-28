@@ -54,7 +54,7 @@ class URL
     include URL::SchemeKwargs
     KWARGS = %i[params json form multipart auth bearer headers].freeze
 
-    def initialize(uri); @uri = uri.to_s; end
+    def initialize(uri); @uri = uri.to_s; URL._require_protocol!(@uri); end
 
     def get(**o, &b);                URL._fire(:GET,     @uri, nil,  _ck(o), &b); end
     def head(**o, &b);               URL._fire(:HEAD,    @uri, nil,  _ck(o), &b); end
@@ -78,18 +78,15 @@ class URL
     include URL::SchemeKwargs
     KWARGS = %i[params headers].freeze
 
-    def initialize(uri); @uri = uri.to_s; end
+    def initialize(uri); @uri = uri.to_s; URL._require_protocol!(@uri); end
 
     def download(**o, &b)
-      URL._require_protocol!(@uri)
       URL._run_transfer(@uri, _ck(o), b, nil)
     end
     def upload(data, **o)
-      URL._require_protocol!(@uri)
       URL._run_transfer(@uri, _ck(o), nil, data)
     end
     def list(**o)
-      URL._require_protocol!(@uri)
       URL._run_transfer(@uri, _ck(o).merge(dirlistonly: true), nil, nil)
     end
 
@@ -103,10 +100,9 @@ class URL
     include URL::SchemeKwargs
     KWARGS = %i[params headers].freeze
 
-    def initialize(uri); @uri = uri.to_s; end
+    def initialize(uri); @uri = uri.to_s; URL._require_protocol!(@uri); end
 
     def get(**o, &b)
-      URL._require_protocol!(@uri)
       URL._run_transfer(@uri, _ck(o), b, nil)
     end
     alias download get
@@ -120,10 +116,9 @@ class URL
     include URL::SchemeKwargs
     KWARGS = %i[params headers].freeze
 
-    def initialize(uri); @uri = uri.to_s; end
+    def initialize(uri); @uri = uri.to_s; URL._require_protocol!(@uri); end
 
     def define(word, database: "!", **o)
-      URL._require_protocol!(@uri)
       base = @uri
       base = base[0..-2] while base.end_with?("/")
       URL._run_transfer("#{base}/d:#{word}:#{database}", _ck(o), nil, nil)
@@ -137,22 +132,18 @@ class URL
     include URL::SchemeKwargs
     KWARGS = [].freeze   # mailbox/uid/flags are explicit verb args; no high-level kwargs
 
-    def initialize(uri); @uri = uri.to_s; end
+    def initialize(uri); @uri = uri.to_s; URL._require_protocol!(@uri); end
 
     def fetch(uid:, **o, &b)
-      URL._require_protocol!(@uri)
       URL._imap(@uri, nil, _ck(o), ";UID=#{uid}", b)
     end
     def move(uid:, to:, **o)
-      URL._require_protocol!(@uri)
       URL._imap(@uri, "UID MOVE #{uid} #{to}", _ck(o))
     end
     def store(uid:, flags:, op: "+", **o)
-      URL._require_protocol!(@uri)
       URL._imap(@uri, "UID STORE #{uid} #{op}FLAGS (#{flags})", _ck(o))
     end
     def expunge(**o)
-      URL._require_protocol!(@uri)
       URL._imap(@uri, "EXPUNGE", _ck(o))
     end
 
@@ -167,14 +158,12 @@ class URL
     include URL::SchemeKwargs
     KWARGS = %i[params headers].freeze
 
-    def initialize(uri); @uri = uri.to_s; end
+    def initialize(uri); @uri = uri.to_s; URL._require_protocol!(@uri); end
 
     def list(**o)
-      URL._require_protocol!(@uri)
       URL._run_transfer(@uri, _ck(o).merge(dirlistonly: true), nil, nil)
     end
     def fetch(n = nil, **o, &b)
-      URL._require_protocol!(@uri)
       target = @uri
       if n
         base = @uri
@@ -198,11 +187,10 @@ class URL
     include URL::SchemeKwargs
     KWARGS = [].freeze   # from:/to:/body are explicit; no high-level kwargs
 
-    def initialize(uri); @uri = uri.to_s; end
+    def initialize(uri); @uri = uri.to_s; URL._require_protocol!(@uri); end
 
     # Replaces the old URL.send — no Object#send clash.
     def deliver(body, from:, to:, **opts)
-      URL._require_protocol!(@uri)
       _ck(opts)
       session = URL.shared
       session = URL.open if session._busy?
@@ -219,10 +207,9 @@ class URL
     include URL::SchemeKwargs
     KWARGS = %i[params headers].freeze
 
-    def initialize(uri); @uri = uri.to_s; end
+    def initialize(uri); @uri = uri.to_s; URL._require_protocol!(@uri); end
 
     def search(**o)
-      URL._require_protocol!(@uri)
       URL._run_transfer(@uri, _ck(o), nil, nil)
     end
 
@@ -234,10 +221,9 @@ class URL
     include URL::SchemeKwargs
     KWARGS = %i[params headers].freeze
 
-    def initialize(uri); @uri = uri.to_s; end
+    def initialize(uri); @uri = uri.to_s; URL._require_protocol!(@uri); end
 
     def publish(payload, **o)
-      URL._require_protocol!(@uri)
       URL._run_transfer(@uri, _ck(o).merge(post_fields: payload.to_s), nil, nil)
     end
 
@@ -247,7 +233,6 @@ class URL
     # length][topic][payload]; the payload is extracted and the expected
     # keep-alive timeout is normalised away, so #error is nil on a clean receive.
     def subscribe(timeout: 5.0, **o)
-      URL._require_protocol!(@uri)
       resp    = URL._run_transfer(@uri, _ck(o).merge(timeout: timeout), nil, nil)
       payload = URL._mqtt_payload(resp.body)
       # CURLE_OPERATION_TIMEDOUT (28) is how a one-shot subscribe ends once the
@@ -276,7 +261,7 @@ class URL
       teardown: 7, get_parameter: 8, set_parameter: 9, record: 10, receive: 11,
     }.freeze
 
-    def initialize(uri); @uri = uri.to_s; end
+    def initialize(uri); @uri = uri.to_s; URL._require_protocol!(@uri); end
 
     def options(transport: nil, stream_uri: nil, **o);         _request(:options,         transport, stream_uri, o); end
     def describe(transport: nil, stream_uri: nil, **o);        _request(:describe,        transport, stream_uri, o); end
@@ -303,7 +288,6 @@ class URL
     private
 
     def _request(verb, transport, stream_uri, opts)
-      URL._require_protocol!(@uri)
       enum = REQUESTS[verb] or raise URL::Error, "unknown RTSP request: #{verb.inspect}"
       opts = _ck(opts).merge(rtsp_request: enum)
       opts[:rtsp_stream_uri] = stream_uri if stream_uri
@@ -317,12 +301,11 @@ class URL
     include URL::SchemeKwargs
     KWARGS = %i[params headers].freeze
 
-    def initialize(uri); @uri = uri.to_s; end
+    def initialize(uri); @uri = uri.to_s; URL._require_protocol!(@uri); end
 
     # With a block, the live socket is yielded and closed for you; a socket
     # that failed to connect is not yielded — inspect ws.error on the return.
     def connect(**opts, &block)
-      URL._require_protocol!(@uri)
       ws = URL._open_websocket(@uri, _ck(opts))
       if block && ws.open?
         begin

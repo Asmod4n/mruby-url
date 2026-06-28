@@ -89,8 +89,21 @@ assert('URL("uri") returns the scheme-typed wrapper for every supported scheme')
              when "file" then "file:///etc/hostname"
              else             "#{scheme}://h"
              end
-    assert_equal klass, URL(sample).class, "URL(#{sample.inspect}) should be #{klass}"
+    if URL.supports?(scheme)
+      assert_equal klass, URL(sample).class, "URL(#{sample.inspect}) should be #{klass}"
+    else
+      # A scheme libcurl wasn't built with raises immediately from URL(uri) —
+      # no wrapper is constructed for a protocol the build can't speak.
+      assert_raise(URL::Error) { URL(sample) }
+    end
   end
+end
+
+assert('URL(uri) raises immediately for a recognized-but-unbuilt scheme') do
+  unbuilt = %w[ws wss sftp scp mqtt mqtts rtsp gopher dict ldap].find { |s| !URL.supports?(s) }
+  skip("every candidate scheme is built in this libcurl") unless unbuilt
+  err = assert_raise(URL::Error) { URL("#{unbuilt}://h/x") }
+  assert_include err.message, "protocol not available"
 end
 
 assert('URL("uri").get and URL::HTTP.get("uri") both work') do
