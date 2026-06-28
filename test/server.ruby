@@ -77,7 +77,7 @@ server.mount_proc('/redirect') do |req, res|
   end
 end
 
-# /slow/2000 -> wait 2s then respond. Covers timeout_ms + error_message.
+# /slow/2000 -> wait 2s then respond. Covers timeout + error_message.
 server.mount_proc('/slow') do |req, res|
   ms = req.path.split('/').last.to_i
   sleep(ms / 1000.0)

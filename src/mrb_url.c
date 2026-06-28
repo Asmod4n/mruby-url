@@ -31,6 +31,7 @@
 #include <mruby/presym.h>
 #include <mruby/numeric.h>
 #include <mruby/num_helpers.h>
+#include <mruby/chrono.h>
 #include <mruby/branch_pred.h>
 
 #include <curl/curl.h>
@@ -476,8 +477,21 @@ murl_lc_easy_setopt(mrb_state* mrb, mrb_value mod)
   else if (opt == MRB_SYM(follow_location))    rc = curl_easy_setopt(h, CURLOPT_FOLLOWLOCATION, (long)mrb_bool(val));
   else if (opt == MRB_SYM(verbose))            rc = curl_easy_setopt(h, CURLOPT_VERBOSE, (long)mrb_bool(val));
   else if (opt == MRB_SYM(connect_only))       rc = curl_easy_setopt(h, CURLOPT_CONNECT_ONLY, (long)mrb_as_int(mrb, val));
-  else if (opt == MRB_SYM(timeout_ms))         rc = curl_easy_setopt(h, CURLOPT_TIMEOUT_MS, (long)mrb_as_int(mrb, val));
-  else if (opt == MRB_SYM(connect_timeout_ms)) rc = curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT_MS, (long)mrb_as_int(mrb, val));
+  else if (opt == MRB_SYM(timeout) || opt == MRB_SYM(connect_timeout)) {
+    /* The one timeout API: val is a duration (Float seconds, as produced by
+     * mruby-chrono's 30.s / 500.ms / 2.min). libcurl's finest timeout
+     * granularity is the millisecond, so convert to long ms and use the _MS
+     * options — no precision lost versus the whole-second CURLOPT_TIMEOUT.
+     * mruby-chrono does the unit math, the type check (TypeError if val isn't
+     * numeric) and the range check; NEAREST absorbs Float representation noise
+     * so 0.1s lands on exactly 100ms, not 101. Marshalling a primitive across
+     * the boundary with the dedicated converter — no policy in C. */
+    long ms;
+    mrb_chrono_convert(mrb, val, MRB_CHRONO_OUT_LONG, MRB_CHRONO_DUR_MILLISECONDS,
+                       MRB_CHRONO_NEAREST, &ms, sizeof ms);
+    rc = curl_easy_setopt(h, opt == MRB_SYM(timeout) ? CURLOPT_TIMEOUT_MS
+                                                     : CURLOPT_CONNECTTIMEOUT_MS, ms);
+  }
   else if (opt == MRB_SYM(ssl_verify_peer))    rc = curl_easy_setopt(h, CURLOPT_SSL_VERIFYPEER, (long)mrb_bool(val));
   else if (opt == MRB_SYM(ssl_verify_host))    rc = curl_easy_setopt(h, CURLOPT_SSL_VERIFYHOST, mrb_bool(val) ? 2L : 0L);
   else if (opt == MRB_SYM(max_redirs))         rc = curl_easy_setopt(h, CURLOPT_MAXREDIRS, (long)mrb_as_int(mrb, val));

@@ -132,7 +132,7 @@ class URL
 
       auto_hdrs["Authorization"] = "Bearer #{bearer}" if bearer
 
-      opts[:timeout_ms]      = DEFAULT_TIMEOUT_MS      unless opts.key?(:timeout_ms)
+      opts[:timeout]         = DEFAULT_TIMEOUT         unless opts.key?(:timeout)
       opts[:follow_location] = DEFAULT_FOLLOW_LOCATION unless opts.key?(:follow_location)
       opts[:user_agent]      = DEFAULT_USER_AGENT       unless opts.key?(:user_agent)
 
@@ -176,7 +176,7 @@ class URL
     # message body is streamed through the read callback, chunked entirely in
     # Ruby (String#byteslice + a tracked offset), never relying on C to slice.
     def _build_mail_request(session, server_url, from, recipients, body, opts)
-      opts[:timeout_ms] = DEFAULT_TIMEOUT_MS unless opts.key?(:timeout_ms)
+      opts[:timeout] = DEFAULT_TIMEOUT unless opts.key?(:timeout)
 
       url_str = _stringify_url(server_url, nil)
       req     = URL::Request._open(session, url_str)
@@ -203,7 +203,7 @@ class URL
     # (e.g. ";UID=<n>") so a plain transfer fetches a message via the write
     # callback. on_chunk, when supplied, streams the body instead of buffering.
     def _build_imap_request(session, mailbox_url, command, opts, url_suffix = nil, on_chunk = nil)
-      opts[:timeout_ms] = DEFAULT_TIMEOUT_MS unless opts.key?(:timeout_ms)
+      opts[:timeout] = DEFAULT_TIMEOUT unless opts.key?(:timeout)
 
       url_str = _stringify_url(mailbox_url, nil)
       url_str = "#{url_str}#{url_suffix}" if url_suffix
@@ -244,7 +244,7 @@ class URL
     # (ws.error / ws.open?), never a raise — the HTTP verbs' two-tier model.
     def _open_websocket(url, opts)
       opts = opts.dup
-      opts[:timeout_ms] = DEFAULT_TIMEOUT_MS unless opts.key?(:timeout_ms)
+      opts[:timeout] = DEFAULT_TIMEOUT unless opts.key?(:timeout)
       user_hdrs = opts.delete(:headers)
       params    = opts.delete(:params)
 
@@ -276,7 +276,7 @@ class URL
 
     def _build_transfer(session, url, opts, on_chunk, upload_data)
       opts = opts.dup
-      opts[:timeout_ms] = DEFAULT_TIMEOUT_MS unless opts.key?(:timeout_ms)
+      opts[:timeout] = DEFAULT_TIMEOUT unless opts.key?(:timeout)
       user_hdrs = opts.delete(:headers)
       params    = opts.delete(:params)
 

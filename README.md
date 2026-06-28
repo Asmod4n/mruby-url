@@ -54,7 +54,7 @@ URL::WS.connect("wss://h/sock") { |ws| ws.send_text("hi") }
 
 Every HTTP call gets these unless you override them:
 
-- `timeout_ms: 30_000` — prevents indefinite hangs
+- `timeout: 30.s` — prevents indefinite hangs (any chrono duration: `500.ms`, `2.min`, …)
 - `follow_location: true` — HTTP redirects followed
 - `user_agent: "mruby-url"`
 - libcurl advertises `Accept-Encoding` for gzip/deflate/br/zstd and
@@ -72,7 +72,8 @@ Every HTTP call gets these unless you override them:
 | `netrc: true / :optional / :required` | Read credentials from `~/.netrc`. `true`/`:optional` falls back to the request's own creds; `:required` uses `.netrc` only. |
 | `netrc_file: "<path>"` | Use a `.netrc` at a non-default path. |
 | `headers: { ... }` | Extra headers. Wins over anything we auto-set. |
-| any `curl_easy` opt | `timeout_ms`, `proxy`, `cookiefile`, `cookiejar`, `verbose`, `ssl_verify_peer`, `userpwd`, … (see [Options reference](#options-reference)). |
+| `timeout: 30.s` / `connect_timeout: 5.s` | Durations (mruby-chrono). Any unit — `500.ms`, `2.min` — handed to libcurl as milliseconds losslessly. |
+| any `curl_easy` opt | `proxy`, `cookiefile`, `cookiejar`, `verbose`, `ssl_verify_peer`, `userpwd`, … (see [Options reference](#options-reference)). |
 
 ## Response
 
@@ -195,7 +196,7 @@ URL("ftp://host/pub/").list.lines                     # directory / message list
 URL("dict://dict.org").define("ruby").body            # DICT define
 URL("ldap://host/dc=ex,dc=com?cn?sub?(cn=*)").search  # LDAP search → LDIF body
 URL("mqtt://host/topic").publish("payload")           # MQTT publish
-URL("mqtt://host/topic").subscribe(timeout_ms: 5000)  # MQTT subscribe → #body
+URL("mqtt://host/topic").subscribe(timeout: 5.s)      # MQTT subscribe → #body
 
 URL("rtsp://host/stream").describe                    # RTSP OPTIONS/DESCRIBE/PLAY/…
 URL("rtsp://host/stream").options
@@ -314,7 +315,7 @@ ws.error   # => #<URL::WebSocketError: websocket upgrade refused: server
 ```
 
 Without a block, `connect` returns the socket and you close it yourself
-(`ws.close(status: 1000)`). `#receive(timeout: 5)` returns `nil` if no
+(`ws.close(status: 1000)`). `#receive(timeout: 5.s)` returns `nil` if no
 message arrives in time; `#send_*` / `#receive` on a closed socket are
 no-ops returning `nil`. The C layer only adds two framing primitives
 (`curl_ws_send` / `curl_ws_recv`); all message-level logic lives in
@@ -416,8 +417,8 @@ any single request.
 | `:follow_location` | FOLLOWLOCATION |
 | `:max_redirs` | MAXREDIRS |
 | `:verbose` | VERBOSE |
-| `:timeout_ms` | TIMEOUT_MS |
-| `:connect_timeout_ms` | CONNECTTIMEOUT_MS |
+| `:timeout` | TIMEOUT_MS (chrono duration → ms) |
+| `:connect_timeout` | CONNECTTIMEOUT_MS (chrono duration → ms) |
 | `:ssl_verify_peer` | SSL_VERIFYPEER |
 | `:ssl_verify_host` | SSL_VERIFYHOST |
 | `:nobody` | NOBODY |

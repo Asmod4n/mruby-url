@@ -125,7 +125,7 @@ assert('Throwaway session against the same host still succeeds (share-attached)'
   # through the share, which is the whole point of the SHARE constant.
   assert_true URL("#{$base}/echo").get.success?
   fresh = URL.open
-  req, state = URL.__send__(:_build_request, fresh, :GET, "#{$base}/echo", nil, { timeout_ms: 5_000 }, nil)
+  req, state = URL.__send__(:_build_request, fresh, :GET, "#{$base}/echo", nil, { timeout: 5.s }, nil)
   resp = URL.__send__(:_drive_sync, fresh, "#{$base}/echo", req, state)
   assert_true resp.success?
 end
@@ -189,10 +189,20 @@ assert('raise_for_status!') do
 end
 
 assert('timeout produces decorated error') do
-  r = URL("#{$base}/slow/2000").get(timeout_ms: 100)
+  # Duration API: 100.ms (a chrono Float-seconds value) is handed to libcurl
+  # losslessly as 100 CURLOPT_TIMEOUT_MS by the C converter.
+  r = URL("#{$base}/slow/2000").get(timeout: 100.ms)
   assert_true r.error?
   assert_equal 28, r.error_code           # CURLE_OPERATION_TIMEDOUT
   assert_include r.error_message, 'timed out'
+end
+
+assert('timeout accepts any chrono duration unit') do
+  # Different units, same effect — all are Float seconds under the hood, handed
+  # to libcurl as milliseconds without precision loss.
+  assert_true URL("#{$base}/slow/2000").get(timeout: 0.1.s).error?
+  assert_true URL("#{$base}/slow/2000").get(timeout: 100_000.us).error?
+  assert_true URL("#{$base}/slow/2000").get(timeout: 100.ms).error?
 end
 
 assert('resp.error is set on failure (transport or HTTP) as a value, nil on success') do
@@ -209,7 +219,7 @@ assert('resp.error is set on failure (transport or HTTP) as a value, nil on succ
   assert_true  http.server_error?
 
   # A genuine below-the-response failure shows up as the matching URL:: value.
-  trans = URL("#{$base}/slow/2000").get(timeout_ms: 100)
+  trans = URL("#{$base}/slow/2000").get(timeout: 100.ms)
   assert_kind_of URL::OperationTimedout, trans.error   # CURLE_OPERATION_TIMEDOUT
   assert_kind_of URL::TransferError, trans.error       # ...and the family base
   assert_equal 28,    trans.error.curl_code
@@ -579,7 +589,7 @@ proto_assert('URL.download pop3 message', 'pop3', $pop3_port) do
 end
 
 proto_assert('URL.download telnet banner', 'telnet', $telnet_port) do
-  r = URL("telnet://127.0.0.1:#{$telnet_port}").download(timeout_ms: 3000)
+  r = URL("telnet://127.0.0.1:#{$telnet_port}").download(timeout: 3.s)
   assert_include r.body, 'telnet-banner-hello'
 end
 
@@ -630,7 +640,7 @@ proto_assert('URL.search ldap', 'ldap', $ldap_port) do
 end
 
 proto_assert('URL.publish + URL.subscribe mqtt', 'mqtt', $mqtt_port) do
-  r = URL("mqtt://127.0.0.1:#{$mqtt_port}/test/topic").subscribe(timeout_ms: 2500)
+  r = URL("mqtt://127.0.0.1:#{$mqtt_port}/test/topic").subscribe(timeout: 2500.ms)
   assert_equal 'mqtt-retained', r.body
   assert_true URL("mqtt://127.0.0.1:#{$mqtt_port}/test/pub").publish('hello').error.nil?
 end
@@ -662,6 +672,6 @@ proto_assert('URL.search ldaps', 'ldaps', $ldaps_port) do
 end
 
 proto_assert('URL.subscribe mqtts', 'mqtts', $mqtts_port) do
-  r = URL("mqtts://127.0.0.1:#{$mqtts_port}/test/topic").subscribe(timeout_ms: 2500, **NOVERIFY)
+  r = URL("mqtts://127.0.0.1:#{$mqtts_port}/test/topic").subscribe(timeout: 2500.ms, **NOVERIFY)
   assert_equal 'mqtt-retained', r.body
 end
