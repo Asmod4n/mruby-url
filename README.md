@@ -72,6 +72,15 @@ response, or a specific token list (e.g. `"gzip"`) to narrow it.
 
 ## Convenience kwargs
 
+These high-level kwargs are **owned per scheme** — each wrapper defines its own
+set, nothing is shared. The table below is the **HTTP** set. Other schemes own a
+subset: the `Transfer`/`Gopher`/`Dict`/`POP3`/`LDAP`/`MQTT`/`RTSP`/`WS` wrappers
+take `params`/`headers`; `IMAP` and `SMTP` take none (their inputs are explicit
+verb arguments). Passing a high-level kwarg a scheme doesn't own raises
+`ArgumentError` up front — no silent no-op, no cryptic libcurl error. Raw
+`curl_easy` options are *not* high-level kwargs: they always pass through to
+`setopt`, which validates them against libcurl regardless of scheme.
+
 | kwarg | what it does |
 | --- | --- |
 | `params: { ... }` | Appended to the URL as a query string (`URI.encode`, WHATWG-strict). Array values expand to repeated keys. |

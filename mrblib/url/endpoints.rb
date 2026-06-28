@@ -11,19 +11,58 @@
 # everything non-HTTP), _imap (IMAP shape), _build_mail_request + _drive_sync
 # (SMTP shape), _open_websocket (WS handshake). Nothing is delegated through
 # the (now removed) top-level URL.verb methods.
+#
+# Kwargs are owned per scheme — nothing is shared. Each wrapper lists in its
+# KWARGS constant the *high-level* convenience kwargs it handles (json, form,
+# headers, …). Those are NOT raw curl_easy options: any other key flows through
+# to URL::Request#setopt, which validates it against libcurl. A high-level kwarg
+# that belongs to a *different* scheme is rejected here — before any connection
+# — with a clear ArgumentError instead of a silent no-op or a cryptic libcurl
+# error. _ck does that check (and returns the opts so it composes inline).
 
 class URL
+  # The universe of high-level convenience kwargs the wrappers handle specially.
+  # A key outside this set is a raw curl option and is never rejected here — it
+  # passes through to setopt. A key inside it is owned by whichever scheme lists
+  # it in KWARGS; passing it to a scheme that doesn't is the usage error we name.
+  HIGH_LEVEL_KWARGS = %i[params json form multipart auth bearer headers].freeze
+
+  def self._reject_foreign_kwargs!(opts, allowed, where)
+    foreign = opts.keys & (HIGH_LEVEL_KWARGS - allowed)
+    return opts if foreign.empty?
+    raise ArgumentError,
+          "#{where} does not accept #{foreign.map(&:inspect).join(', ')} — " \
+          "that option belongs to another scheme"
+  end
+
+  # Mixed into every wrapper. _ck validates an opts hash against the wrapper's
+  # own KWARGS (self.class::KWARGS) and returns it, so verbs can write
+  # `dispatch(..., _ck(o), ...)` inline. The set is per-class; only the check is
+  # shared.
+  module SchemeKwargs
+    private
+
+    def _ck(opts)
+      # self.class stringifies to the wrapper name (URL::HTTP, …) — mruby has no
+      # Class#name, but #to_s gives it, and the helper interpolates `where`.
+      URL._reject_foreign_kwargs!(opts, self.class::KWARGS, self.class)
+    end
+  end
+
   # ---- HTTP(S) -----------------------------------------------------------
   class HTTP
+    include URL::SchemeKwargs
+    KWARGS = %i[params json form multipart auth bearer headers].freeze
+
     def initialize(uri); @uri = uri.to_s; end
 
-    def get(**o, &b);                URL._fire(:GET,     @uri, nil,  o, &b); end
-    def head(**o, &b);               URL._fire(:HEAD,    @uri, nil,  o, &b); end
-    def options(**o, &b);            URL._fire(:OPTIONS, @uri, nil,  o, &b); end
-    def delete(body = nil, **o, &b); URL._fire(:DELETE,  @uri, body, o, &b); end
-    def post(body = nil, **o, &b);   URL._fire(:POST,    @uri, body, o, &b); end
-    def put(body = nil, **o, &b);    URL._fire(:PUT,     @uri, body, o, &b); end
-    def patch(body = nil, **o, &b);  URL._fire(:PATCH,   @uri, body, o, &b); end
+    def get(**o, &b);                URL._fire(:GET,     @uri, nil,  _ck(o), &b); end
+    def head(**o, &b);               URL._fire(:HEAD,    @uri, nil,  _ck(o), &b); end
+    def options(**o, &b);            URL._fire(:OPTIONS, @uri, nil,  _ck(o), &b); end
+    def delete(body = nil, **o, &b); URL._fire(:DELETE,  @uri, body, _ck(o), &b); end
+    def post(body = nil, **o, &b);   URL._fire(:POST,    @uri, body, _ck(o), &b); end
+    def put(body = nil, **o, &b);    URL._fire(:PUT,     @uri, body, _ck(o), &b); end
+    def patch(body = nil, **o, &b);  URL._fire(:PATCH,   @uri, body, _ck(o), &b); end
 
     def self.get(uri, **o, &b);                 new(uri).get(**o, &b); end
     def self.head(uri, **o, &b);                new(uri).head(**o, &b); end
@@ -36,19 +75,22 @@ class URL
 
   # ---- file / ftp(s) / sftp / scp / tftp / telnet -----------------------
   class Transfer
+    include URL::SchemeKwargs
+    KWARGS = %i[params headers].freeze
+
     def initialize(uri); @uri = uri.to_s; end
 
     def download(**o, &b)
       URL._require_protocol!(@uri)
-      URL._run_transfer(@uri, o, b, nil)
+      URL._run_transfer(@uri, _ck(o), b, nil)
     end
     def upload(data, **o)
       URL._require_protocol!(@uri)
-      URL._run_transfer(@uri, o, nil, data)
+      URL._run_transfer(@uri, _ck(o), nil, data)
     end
     def list(**o)
       URL._require_protocol!(@uri)
-      URL._run_transfer(@uri, o.merge(dirlistonly: true), nil, nil)
+      URL._run_transfer(@uri, _ck(o).merge(dirlistonly: true), nil, nil)
     end
 
     def self.download(uri, **o, &b); new(uri).download(**o, &b); end
@@ -58,11 +100,14 @@ class URL
 
   # ---- gopher(s) --------------------------------------------------------
   class Gopher
+    include URL::SchemeKwargs
+    KWARGS = %i[params headers].freeze
+
     def initialize(uri); @uri = uri.to_s; end
 
     def get(**o, &b)
       URL._require_protocol!(@uri)
-      URL._run_transfer(@uri, o, b, nil)
+      URL._run_transfer(@uri, _ck(o), b, nil)
     end
     alias download get
 
@@ -72,13 +117,16 @@ class URL
 
   # ---- dict -------------------------------------------------------------
   class Dict
+    include URL::SchemeKwargs
+    KWARGS = %i[params headers].freeze
+
     def initialize(uri); @uri = uri.to_s; end
 
     def define(word, database: "!", **o)
       URL._require_protocol!(@uri)
       base = @uri
       base = base[0..-2] while base.end_with?("/")
-      URL._run_transfer("#{base}/d:#{word}:#{database}", o, nil, nil)
+      URL._run_transfer("#{base}/d:#{word}:#{database}", _ck(o), nil, nil)
     end
 
     def self.define(uri, word, database: "!", **o); new(uri).define(word, database: database, **o); end
@@ -86,23 +134,26 @@ class URL
 
   # ---- imap(s) ----------------------------------------------------------
   class IMAP
+    include URL::SchemeKwargs
+    KWARGS = [].freeze   # mailbox/uid/flags are explicit verb args; no high-level kwargs
+
     def initialize(uri); @uri = uri.to_s; end
 
     def fetch(uid:, **o, &b)
       URL._require_protocol!(@uri)
-      URL._imap(@uri, nil, o, ";UID=#{uid}", b)
+      URL._imap(@uri, nil, _ck(o), ";UID=#{uid}", b)
     end
     def move(uid:, to:, **o)
       URL._require_protocol!(@uri)
-      URL._imap(@uri, "UID MOVE #{uid} #{to}", o)
+      URL._imap(@uri, "UID MOVE #{uid} #{to}", _ck(o))
     end
     def store(uid:, flags:, op: "+", **o)
       URL._require_protocol!(@uri)
-      URL._imap(@uri, "UID STORE #{uid} #{op}FLAGS (#{flags})", o)
+      URL._imap(@uri, "UID STORE #{uid} #{op}FLAGS (#{flags})", _ck(o))
     end
     def expunge(**o)
       URL._require_protocol!(@uri)
-      URL._imap(@uri, "EXPUNGE", o)
+      URL._imap(@uri, "EXPUNGE", _ck(o))
     end
 
     def self.fetch(uri, uid:, **o, &b);                    new(uri).fetch(uid: uid, **o, &b); end
@@ -113,11 +164,14 @@ class URL
 
   # ---- pop3(s) ----------------------------------------------------------
   class POP3
+    include URL::SchemeKwargs
+    KWARGS = %i[params headers].freeze
+
     def initialize(uri); @uri = uri.to_s; end
 
     def list(**o)
       URL._require_protocol!(@uri)
-      URL._run_transfer(@uri, o.merge(dirlistonly: true), nil, nil)
+      URL._run_transfer(@uri, _ck(o).merge(dirlistonly: true), nil, nil)
     end
     def fetch(n = nil, **o, &b)
       URL._require_protocol!(@uri)
@@ -127,7 +181,7 @@ class URL
         base = base[0..-2] while base.end_with?("/")
         target = "#{base}/#{n}"
       end
-      URL._run_transfer(target, o, b, nil)
+      URL._run_transfer(target, _ck(o), b, nil)
     end
     # download is the same idea — POP3 calls it retrieving a message, so we
     # delegate to fetch (with optional message-id n) for symmetry with the
@@ -141,11 +195,15 @@ class URL
 
   # ---- smtp(s) ----------------------------------------------------------
   class SMTP
+    include URL::SchemeKwargs
+    KWARGS = [].freeze   # from:/to:/body are explicit; no high-level kwargs
+
     def initialize(uri); @uri = uri.to_s; end
 
     # Replaces the old URL.send — no Object#send clash.
     def deliver(body, from:, to:, **opts)
       URL._require_protocol!(@uri)
+      _ck(opts)
       session = URL.shared
       session = URL.open if session._busy?
       recipients = to.is_a?(Array) ? to : [to]
@@ -158,11 +216,14 @@ class URL
 
   # ---- ldap(s) ----------------------------------------------------------
   class LDAP
+    include URL::SchemeKwargs
+    KWARGS = %i[params headers].freeze
+
     def initialize(uri); @uri = uri.to_s; end
 
     def search(**o)
       URL._require_protocol!(@uri)
-      URL._run_transfer(@uri, o, nil, nil)
+      URL._run_transfer(@uri, _ck(o), nil, nil)
     end
 
     def self.search(uri, **o); new(uri).search(**o); end
@@ -170,11 +231,14 @@ class URL
 
   # ---- mqtt(s) ----------------------------------------------------------
   class MQTT
+    include URL::SchemeKwargs
+    KWARGS = %i[params headers].freeze
+
     def initialize(uri); @uri = uri.to_s; end
 
     def publish(payload, **o)
       URL._require_protocol!(@uri)
-      URL._run_transfer(@uri, o.merge(post_fields: payload.to_s), nil, nil)
+      URL._run_transfer(@uri, _ck(o).merge(post_fields: payload.to_s), nil, nil)
     end
 
     # Receive one message. libcurl keeps the subscription open, so this blocks
@@ -184,7 +248,7 @@ class URL
     # keep-alive timeout is normalised away, so #error is nil on a clean receive.
     def subscribe(timeout: 5.0, **o)
       URL._require_protocol!(@uri)
-      resp    = URL._run_transfer(@uri, o.merge(timeout: timeout), nil, nil)
+      resp    = URL._run_transfer(@uri, _ck(o).merge(timeout: timeout), nil, nil)
       payload = URL._mqtt_payload(resp.body)
       # CURLE_OPERATION_TIMEDOUT (28) is how a one-shot subscribe ends once the
       # message arrived; clear it when we actually got a payload.
@@ -203,6 +267,9 @@ class URL
 
   # ---- rtsp -------------------------------------------------------------
   class RTSP
+    include URL::SchemeKwargs
+    KWARGS = %i[params headers].freeze
+
     # CURL_RTSP_REQ_* enum, kept on the class so the verbs map cleanly.
     REQUESTS = {
       options: 1, describe: 2, announce: 3, setup: 4, play: 5, pause: 6,
@@ -238,7 +305,7 @@ class URL
     def _request(verb, transport, stream_uri, opts)
       URL._require_protocol!(@uri)
       enum = REQUESTS[verb] or raise URL::Error, "unknown RTSP request: #{verb.inspect}"
-      opts = opts.merge(rtsp_request: enum)
+      opts = _ck(opts).merge(rtsp_request: enum)
       opts[:rtsp_stream_uri] = stream_uri if stream_uri
       opts[:rtsp_transport]  = transport  if transport
       URL._run_transfer(@uri, opts, nil, nil)
@@ -247,13 +314,16 @@ class URL
 
   # ---- ws(s) ------------------------------------------------------------
   class WS
+    include URL::SchemeKwargs
+    KWARGS = %i[params headers].freeze
+
     def initialize(uri); @uri = uri.to_s; end
 
     # With a block, the live socket is yielded and closed for you; a socket
     # that failed to connect is not yielded — inspect ws.error on the return.
     def connect(**opts, &block)
       URL._require_protocol!(@uri)
-      ws = URL._open_websocket(@uri, opts)
+      ws = URL._open_websocket(@uri, _ck(opts))
       if block && ws.open?
         begin
           block.call(ws)
