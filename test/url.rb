@@ -205,18 +205,18 @@ assert('timeout accepts any chrono duration unit') do
 end
 
 assert('newly wired curl options are accepted (not an unsupported option)') do
-  # A representative spread across the new flat setopt pass-throughs (client
-  # TLS, HTTP version, inline cookie, proxy, name resolution, rate limiting,
-  # keepalive, unix socket). The values are inert for a plain localhost GET;
-  # the point is that setopt wires each one instead of raising ArgumentError
-  # "unsupported option".
+  # A representative spread across the new flat setopt pass-throughs (HTTP
+  # version, inline cookie, proxy, rate limiting, keepalive). The values are
+  # inert for a plain localhost GET; the point is that setopt wires each one
+  # instead of raising ArgumentError "unsupported option". Backend-specific TLS
+  # options (capath, pinnedpublickey, …) are deliberately left out — they
+  # legitimately raise CURLE_NOT_BUILT_IN on TLS backends that lack them (e.g.
+  # Schannel on Windows), which is correct behaviour, not a wiring failure.
   r = URL("#{$base}/echo").get(
     accept_encoding: "",          # opt-in transparent compression
     cookie:          "a=1; b=2",
-    http_version:    2,           # CURL_HTTP_VERSION_1_1
+    http_version:    2,           # CURL_HTTP_VERSION_1_1 (always built)
     sslversion:      0,           # CURL_SSLVERSION_DEFAULT
-    capath:          ".",
-    pinnedpublickey: "",
     proxytype:       0,           # CURLPROXY_HTTP
     noproxy:         "*",
     max_recv_speed:  10_000_000,
