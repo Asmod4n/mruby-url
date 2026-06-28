@@ -31,10 +31,14 @@
 #include <mruby/presym.h>
 #include <mruby/numeric.h>
 #include <mruby/num_helpers.h>
-#include <mruby/chrono.h>
 #include <mruby/branch_pred.h>
 
 #include <curl/curl.h>
+/* After curl: on Windows curl pulls in winsock2.h, which defines struct timeval
+ * and _WINSOCK2API_. mruby/chrono.h only defines its own fallback timeval when
+ * winsock hasn't been included yet, so including it here avoids a C2011
+ * 'timeval' redefinition under MSVC. */
+#include <mruby/chrono.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
