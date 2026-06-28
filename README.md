@@ -13,6 +13,12 @@ URL("https://example.com").get.body
 URL("https://api.example.com/users").get(params: { limit: 10 }).json
 URL("https://api.example.com/users").post(json: { name: "Alice" }).raise_for_status!.json
 
+# multipart/form-data (curl_mime): String = field, Hash = file part (streamed from disk)
+URL("https://api.example.com/upload").post(multipart: {
+  "title"  => "vacation",
+  "avatar" => { file: "pic.png", type: "image/png" },
+})
+
 # Streaming a big response
 URL("https://huge.example.com/file").get { |chunk| sink << chunk }
 
@@ -71,6 +77,7 @@ response, or a specific token list (e.g. `"gzip"`) to narrow it.
 | `params: { ... }` | Appended to the URL as a query string (`URI.encode`, WHATWG-strict). Array values expand to repeated keys. |
 | `json: <obj>` | Body is `JSON.dump(obj)`; auto `Content-Type` and `Accept` of `application/json`. |
 | `form: { ... }` | Body is `application/x-www-form-urlencoded`; `Content-Type` set accordingly. |
+| `multipart: { ... }` | `multipart/form-data` via `curl_mime`. A String value is a plain field; a Hash is a file/blob part — `file:` streams from disk (never buffered in Ruby), `data:` is an in-memory blob, `filename:`/`type:` set the part headers. |
 | `auth: "user:pass"` or `["user", "pass"]` | Basic auth via `CURLOPT_USERPWD` (libcurl builds the header). |
 | `bearer: "<token>"` | Adds `Authorization: Bearer <token>` (user headers override). |
 | `netrc: true / :optional / :required` | Read credentials from `~/.netrc`. `true`/`:optional` falls back to the request's own creds; `:required` uses `.netrc` only. |

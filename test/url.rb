@@ -230,6 +230,35 @@ assert('newly wired curl options are accepted (not an unsupported option)') do
   assert_include r.json["headers"]["cookie"].to_s, "a=1"
 end
 
+assert('multipart/form-data upload (curl_mime) with a plain field and a file part') do
+  r = URL("#{$base}/multipart").post(multipart: {
+    "field"  => "value-123",
+    "upload" => { filename: "a.txt", type: "text/plain", data: "file-body-xyz\n" },
+  })
+  assert_true r.success?
+  j = r.json
+  assert_include j["content_type"], "multipart/form-data"
+  assert_include j["content_type"], "boundary="
+  body = j["body"]
+  assert_include body, 'name="field"'
+  assert_include body, "value-123"
+  assert_include body, 'name="upload"'
+  assert_include body, 'filename="a.txt"'
+  assert_include body, "Content-Type: text/plain"
+  assert_include body, "file-body-xyz"
+end
+
+assert('multipart streams a file part from disk via file:') do
+  path = File.join($state_dir, "mime-part.txt")
+  File.open(path, "wb") { |f| f.write("from-disk-streamed\n") }
+  r = URL("#{$base}/multipart").post(multipart: {
+    "doc" => { file: path, filename: "doc.txt" },
+  })
+  assert_true r.success?
+  assert_include r.json["body"], "from-disk-streamed"
+  assert_include r.json["body"], 'filename="doc.txt"'
+end
+
 assert('resp.error is set on failure (transport or HTTP) as a value, nil on success') do
   ok = URL("#{$base}/echo").get
   assert_nil ok.error                                  # success -> no error value

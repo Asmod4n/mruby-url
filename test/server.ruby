@@ -59,6 +59,17 @@ server.mount_proc('/echo') do |req, res|
   )
 end
 
+# Multipart upload sink: echoes the Content-Type and the raw multipart body so
+# the mruby test can assert the boundary, part names, filenames and payloads
+# that curl_mime produced. Covers the `multipart:` (curl_mime) path.
+server.mount_proc('/multipart') do |req, res|
+  res['Content-Type'] = 'application/json'
+  res.body = JSON.dump(
+    content_type: req['content-type'],
+    body:         req.body.to_s,
+  )
+end
+
 # /status/418 -> 418, etc. Covers success?/client_error?/server_error?.
 server.mount_proc('/status') do |req, res|
   res.status = req.path.split('/').last.to_i
