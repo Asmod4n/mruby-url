@@ -24,24 +24,19 @@ task :test => :mruby do
   end
   server_script = File.expand_path("test/server.ruby", __dir__)
 
-  # Build first. Loading the gem's mrbgem.rake creates the throwaway run-state
-  # directory under the gem's build tree (swept by `rake clean`) and writes its
-  # path to this pointer file. We read the pointer rather than recompute the
-  # build layout, so the path stays owned by one place — the gem spec.
-  pointer = File.join(__dir__, "mruby", ".url-test-state")
-  Dir.chdir("mruby") do
-    ENV["MRUBY_CONFIG"] = MRUBY_CONFIG_PATH
-    sh "rake all"
-  end
-  raise "gem build did not create #{pointer}" unless File.exist?(pointer)
-  state_dir = File.read(pointer).strip
+  # Throwaway run-state dir: port files, captured payloads, logs. It lives under
+  # the build's own scratch area (mruby/build/), so it never touches the
+  # checked-in test/ tree and `rake (deep_)clean` sweeps it with the build. We
+  # hand the path to the two consumers without any pointer/marker file: the MRI
+  # fixture is our own child, so it gets the path as an ARGV; the mruby test
+  # (test/url.rb) runs inside mrbtest (whose environ reads empty), so we export
+  # the path here in ENV and the gem's mrbgem.rake — which runs under MRI, where
+  # ENV works — forwards it into spec.test_args / the mrbtest TEST_ARGS constant.
+  state_dir = File.join(__dir__, "mruby", "build", "url-test-run")
   port_file = File.join(state_dir, "server_port")
-
-  # Start from a clean slate so we never read a stale port from a previous run
-  # (a protocol whose server doesn't come up leaves no port file, and its tests
-  # skip). The dir itself stays put — `rake clean` removes it with the build.
-  FileUtils.rm_rf(state_dir)
+  FileUtils.rm_rf(state_dir)        # clean slate — never read a stale port
   FileUtils.mkdir_p(state_dir)
+  ENV["MURL_TEST_STATE_DIR"] = state_dir
 
   # MRI->MRI spawn. No cmd.exe wrapper, no Winsock init weirdness. pgroup: true
   # makes the fixture a process-group leader, so its spawned daemons (sshd /
@@ -49,7 +44,7 @@ task :test => :mruby do
   # below — the daemons can never outlive the tests, even on SIGKILL.
   # Process-group signals are a POSIX thing; on Windows we fall back to killing
   # the single fixture pid (where no daemons get spawned anyway). The fixture
-  # learns where to write via ARGV — it's our own child, no ENV needed.
+  # learns where to write via ARGV — it's our own child.
   group_kill = (RbConfig::CONFIG['host_os'] !~ /mswin|mingw|cygwin/)
   server_pid =
     if group_kill
@@ -84,8 +79,9 @@ task :test => :mruby do
     rescue
       # already gone
     end
-    # Run-state lives under the gem build dir; `rake clean` sweeps it. Nothing
-    # to remove here — leaving the logs around aids post-mortem on a failure.
+    # Run-state lives under mruby/build/; `rake (deep_)clean` sweeps it. Leaving
+    # it in place between runs aids post-mortem on a failure — the next run
+    # wipes it clean before starting.
   end
 end
 
