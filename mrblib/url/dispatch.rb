@@ -41,8 +41,8 @@ class URL
       _drive_sync(session, url, req, state)
     end
 
-    # Verb-agnostic blocking drive shared by the HTTP verbs, URL.data and the
-    # IMAP verbs.
+    # Verb-agnostic blocking drive shared by the HTTP verbs, SMTP delivery and
+    # the IMAP verbs.
     # Attaches `req` to `session`'s reused IO.select loop, pumps it until the
     # request completes, and wraps the outcome in a URL::Response. The caller
     # supplies a fully configured Request and its TransferState; this only owns
