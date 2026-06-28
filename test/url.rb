@@ -516,7 +516,9 @@ end
 
 proto_assert('URL.upload accepts an IO (File)', 'ftp', $ftp_port) do
   base = "ftp://user:pass@127.0.0.1:#{$ftp_port}"
-  path = "/tmp/mruby-url-upload-#{Process.pid rescue 0}.txt"
+  # Write the fixture into the run-state dir, not a hardcoded /tmp (absent on
+  # Windows). $state_dir is the platform-correct throwaway dir resolved up top.
+  path = File.join($state_dir, "upload-fixture.txt")
   body = "from-file-io\nline2\n"
   File.open(path, "wb") { |f| f.write(body) }
   File.open(path, "rb") { |f| URL("#{base}/io.txt").upload(f) }
