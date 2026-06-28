@@ -70,4 +70,32 @@ mtx_destroy(mtx_t *mtx)
   pthread_mutex_destroy(mtx);
 }
 
+/* --- thread-specific storage: tss_t / tss_create / tss_get / tss_set ---
+ * Maps C11 thread-local storage onto a POSIX thread-specific key. The key's
+ * destructor (tss_dtor_t) runs at thread exit for every thread that set a
+ * non-NULL value — which is exactly how curl_url's per-thread CURLSH is torn
+ * down. pthread runs the destructor up to PTHREAD_DESTRUCTOR_ITERATIONS times
+ * while the slot keeps being re-set; we only ever set it once per thread, so a
+ * single pass suffices. tss_delete is unused by mrb_url.c and omitted. */
+typedef pthread_key_t tss_t;
+typedef void (*tss_dtor_t)(void *);
+
+static inline int
+tss_create(tss_t *key, tss_dtor_t dtor)
+{
+  return pthread_key_create(key, dtor) == 0 ? thrd_success : thrd_error;
+}
+
+static inline void *
+tss_get(tss_t key)
+{
+  return pthread_getspecific(key);
+}
+
+static inline int
+tss_set(tss_t key, void *val)
+{
+  return pthread_setspecific(key, val) == 0 ? thrd_success : thrd_error;
+}
+
 #endif /* MRB_URL_COMPAT_THREADS_H */
