@@ -309,15 +309,28 @@ murl_multi_get(mrb_state* mrb, mrb_value self)
  * construction. curl_share.c uses `if(share->lockfunc)` and skips locking when
  * unset — the cheap documented no-op.
  *
- * Lifetime. curl_global_init must outlive every holder, of which there are now
- * two kinds: live VMs (gem_init/gem_final) and live thread-shares (created
- * here, destroyed by the tss destructor at thread exit). g_refs counts both;
- * the global layer comes up on the first holder and is torn down after the
- * last. The destructor runs curl_share_cleanup on the owning thread at thread
- * exit — well-behaved code has closed its VMs first (each curl_easy_cleanup
- * detached its easy), so cleanup succeeds; a thread torn down with a VM still
- * live gets CURLSHE_IN_USE (non-fatal — the share is left, the same tolerance
- * as a leaked easy).
+ * REQUIRED of the caller: a VM and the easy/multi handles created on it must
+ * stay on the OS thread that created them. An mrb_state may not be driven from
+ * a different OS thread than the one its share was created on — that would touch
+ * an unsynchronised CURLSH from two threads (there are no lock callbacks) and is
+ * undefined. (This is the same single-owning-thread rule mruby itself imposes on
+ * an mrb_state.) Likewise libcurl is not fork-safe: do not fork() after a
+ * transfer has run and then use libcurl in the child; the inherited share/easies
+ * reference the parent's sockets. Neither is enforced in C.
+ *
+ * Lifetime. curl_global_init must outlive every holder, of which there are two
+ * kinds: live VMs (gem_init/gem_final) and live thread-shares. g_refs counts
+ * both; the global layer comes up on the first holder and tears down after the
+ * last. A thread's share is drained in gem_final when its LAST VM closes (by
+ * then every easy on the thread is curl_easy_cleanup'd and detached, so
+ * curl_share_cleanup succeeds and g_refs reaches its 1->0 transition
+ * deterministically — no atexit, which is unsafe from a dlclose'able module, and
+ * no reliance on the main thread's tss destructor, which POSIX/C11 do not run at
+ * exit()/return-from-main). The tss destructor is the fallback for a thread that
+ * exits WITHOUT finalizing its VM: it gets CURLSHE_IN_USE (an easy still
+ * attached), so the share is left and its global ref is NOT released — keeping
+ * the global layer up rather than tearing it down under a live handle (the share
+ * leaks, the same tolerance as a leaked easy).
  *
  * LOCK_DATA enabled: CONNECT (keep-alive + HTTP/2/3 pool) and SSL_SESSION (TLS
  * resumption). Skipped: DNS/PSL (auto-shared at multi level), COOKIE/HSTS (set
@@ -334,7 +347,16 @@ static unsigned  g_refs = 0;          /* live holders: VMs + thread-shares */
 static tss_t     g_share_key;         /* thread-local CURLSH* */
 static int       g_share_key_ok = 0;  /* tss_create succeeded */
 
-static void murl_share_dtor(void* p); /* fwd: tss destructor, defined below */
+/* VMs currently alive on THIS OS thread. gem_init bumps it, gem_final drops it,
+ * and the thread's share is drained when it falls to zero — so the share lives
+ * exactly as long as some VM on the thread can use it, and its teardown is
+ * deterministic (no atexit, which is unsafe from a dlclose'able module, and no
+ * dependence on the main thread's tss destructor, which POSIX/C11 do not run at
+ * exit()/return-from-main). _Thread_local is a C11 keyword, available without
+ * <threads.h>. */
+static _Thread_local unsigned t_vm_count = 0;
+
+static void murl_share_dtor(void* p);  /* fwd: tss destructor, defined below */
 
 /* call_once target: build the mutex (mtx_t has no static initializer) and the
  * tss key. If tss_create fails the gem still works — easies just run shareless. */
@@ -347,13 +369,21 @@ murl_globals_init(void)
 
 /* Bring curl_global_init up on the first holder and tear it down after the
  * last. Both VM init/final and thread-share create/destroy go through here,
- * serialised by the one mutex. */
-static void
+ * serialised by the one mutex. Returns 0 if curl_global_init failed (the layer
+ * is left DOWN and the count is NOT bumped, so no later cleanup is armed against
+ * an unsuccessful init and no curl call is issued atop a dead library); 1
+ * otherwise. */
+static int
 murl_global_ref(void)
 {
+  int ok = 1;
   mtx_lock(&g_lock);
-  if (g_refs++ == 0) curl_global_init(CURL_GLOBAL_DEFAULT);
+  if (g_refs == 0) {
+    if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) ok = 0;
+  }
+  if (ok) g_refs++;
   mtx_unlock(&g_lock);
+  return ok;
 }
 
 static void
@@ -364,14 +394,34 @@ murl_global_unref(void)
   mtx_unlock(&g_lock);
 }
 
-/* tss destructor: runs at thread exit for any thread that created a share. */
+/* Destroy a thread's CURLSH and release the global ref it held. Runs from
+ * murl_thread_share_drain (gem_final, the thread's last VM) and as the tss
+ * destructor at thread exit (the fallback). The global ref is released ONLY when
+ * curl_share_cleanup actually freed the share:
+ * on CURLSHE_IN_USE (an easy still attached — reachable only if a VM was driven
+ * from a different OS thread than the one that created its share, which is
+ * unsupported) the CURLSH is left allocated, so keeping its global ref ensures
+ * curl_global_cleanup can never run while a live share exists. The share is then
+ * leaked, exactly as a leaked easy would be. */
 static void
 murl_share_dtor(void* p)
 {
   CURLSH* sh = (CURLSH*)p;
   if (unlikely(!sh)) return;
-  curl_share_cleanup(sh);   /* CURLSHE_IN_USE if an easy still attached: leaves it */
-  murl_global_unref();      /* release the global ref this share held */
+  if (curl_share_cleanup(sh) == CURLSHE_OK) murl_global_unref();
+}
+
+/* Drain the calling thread's share now (clearing the tss slot so the destructor
+ * later no-ops). Called from gem_final when the thread's last VM closes — by
+ * then every easy on the thread has been curl_easy_cleanup'd and detached, so
+ * curl_share_cleanup succeeds. */
+static void
+murl_thread_share_drain(void)
+{
+  CURLSH* sh = g_share_key_ok ? (CURLSH*)tss_get(g_share_key) : NULL;
+  if (!sh) return;
+  tss_set(g_share_key, NULL);
+  murl_share_dtor(sh);
 }
 
 /* The calling OS thread's CURLSH, created on first use. Returns NULL (so
@@ -397,7 +447,14 @@ murl_thread_share(void)
     curl_share_cleanup(sh);
     return NULL;
   }
-  murl_global_ref();   /* keep the global layer up until this share's dtor runs */
+  /* Keep the global layer up until this share is drained (gem_final on the
+   * thread's last VM, or the tss destructor at thread exit). The ref cannot fail
+   * here — the calling VM already holds one. */
+  if (unlikely(!murl_global_ref())) {
+    tss_set(g_share_key, NULL);
+    curl_share_cleanup(sh);
+    return NULL;
+  }
   return sh;
 }
 
@@ -1204,7 +1261,12 @@ void
 mrb_mruby_url_gem_init(mrb_state* mrb)
 {
   call_once(&g_once, murl_globals_init);
-  murl_global_ref();
+  /* curl_global_init must succeed before any other libcurl call; if it failed
+   * (e.g. the TLS backend or Winsock did not come up) libcurl is unusable, so
+   * refuse to build the VM's bindings atop a dead library rather than proceed. */
+  if (unlikely(!murl_global_ref()))
+    mrb_raise(mrb, E_RUNTIME_ERROR, "curl_global_init failed");
+  t_vm_count++;   /* this thread now has one more live VM */
 
   struct RClass* url_cls = mrb_define_class_id(mrb, MRB_SYM(URL), mrb->object_class);
 
@@ -1360,16 +1422,22 @@ murl_cleanup_curl(mrb_state* mrb, struct RBasic* obj, void* data)
   return MRB_EACH_OBJ_OK;
 }
 
-/* This VM's easies/multis are gone after the two passes above. The connection
- * share is no longer per-VM — it belongs to the OS thread and is cleaned by its
- * tss destructor at thread exit — so there is no third (share) pass here. Each
- * curl_easy_cleanup above already detached its easy from the thread share
- * (ref_count--), so the share is left in a cleanly releasable state. */
+/* This VM's easies/multis are gone after the two passes above (each
+ * curl_easy_cleanup detached its easy from the thread share). The connection
+ * share belongs to the OS thread, not this VM, so it is drained only when this
+ * is the thread's LAST VM — at which point every VM on the thread has finalized
+ * and no easy is still attached, so curl_share_cleanup succeeds and the global
+ * layer reaches its 1->0 transition deterministically here, with no reliance on
+ * atexit or on the main thread's tss destructor (which does not run at exit).
+ * A thread that exits without finalizing its VM falls back to the tss
+ * destructor (non-fatal CURLSHE_IN_USE, share left — like a leaked easy). */
 void
 mrb_mruby_url_gem_final(mrb_state* mrb)
 {
   mrb_objspace_each_objects(mrb, murl_disarm_callbacks, NULL);
   mrb_objspace_each_objects(mrb, murl_cleanup_curl,     NULL);
+
+  if (t_vm_count > 0 && --t_vm_count == 0) murl_thread_share_drain();
 
   murl_global_unref();   /* drop this VM's hold on the global layer */
 }
