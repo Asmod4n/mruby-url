@@ -505,9 +505,9 @@ class URL
         end
       end
       req.setopt(:mimepost, mime)
-      # Keep the mime alive until the transfer is done — libcurl holds only a
-      # bare pointer to it. Rooting it on the easy handle ties their lifetimes.
-      req.handle.mime = mime
+      # No rooting needed here: mime_new already pins the mime to its easy under
+      # a hidden (non-'@') ivar the GC traces but Ruby can't reach — so the mime
+      # outlives the transfer and can't be freed out from under libcurl.
       req
     end
 

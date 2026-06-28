@@ -16,10 +16,6 @@
 # plain writers here (attr_writer assigns exactly those ivars).
 class URL::Libcurl::Easy
   attr_writer :on_data, :on_header, :on_read
-  # A multipart upload's URL::Libcurl::Mime is stashed here so it stays alive
-  # (GC-rooted) for as long as the easy handle that posts it — libcurl keeps a
-  # bare pointer to the mime via CURLOPT_MIMEPOST and frees nothing itself.
-  attr_writer :mime
 end
 
 class URL::Request

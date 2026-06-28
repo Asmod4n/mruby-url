@@ -102,13 +102,15 @@ murl_easy_get(mrb_state* mrb, mrb_value self)
  *
  * The mime tree is opaque libcurl state, so it has to be built through C calls
  * — but each is a thin pass-through; which parts / names / files to add is
- * decided in Ruby. Ownership (per curl docs + the postit2 example): the whole
- * tree, including its parts, is released by a single curl_mime_free, called
- * AFTER the transfer (perform → curl_easy_cleanup → curl_mime_free — freeing
- * after cleanup is the documented order, no double-free). So the Mime CDATA
- * owns the free; a Part CDATA is non-owning (its mime frees it) and just keeps
- * its owning Mime rooted. The Mime keeps its Easy rooted; Ruby keeps the Mime
- * rooted on the Easy handle until the transfer is done.
+ * decided in Ruby.
+ *
+ * The Mime CDATA owns curl_mime_free (which also frees its parts, so a Part
+ * CDATA is non-owning). Lifetime is rooted from C, invisibly to Ruby: mime_new
+ * stashes the Mime on its easy under a HIDDEN ivar — a symbol with no leading
+ * '@' (MRB_SYM, not MRB_IVSYM). The GC still traces it (so the mime can't be
+ * freed while the easy posts it via the bare CURLOPT_MIMEPOST pointer), but
+ * instance_variable_get/set/remove all require a '@', so Ruby code can neither
+ * read, replace, nor delete it — no way to induce a use-after-free from Ruby.
  * ========================================================================= */
 
 static void
@@ -157,7 +159,11 @@ murl_lc_mime_new(mrb_state* mrb, mrb_value mod)
   struct RClass* cls = mrb_class_get_under_id(mrb, lc, MRB_SYM(Mime));
   struct RData*  d   = mrb_data_object_alloc(mrb, cls, m, &murl_mime_type);
   mrb_value self = mrb_obj_value(d);
-  mrb_iv_set(mrb, self, MRB_SYM(easy), easy_obj);   /* keep the easy alive */
+  /* Root the mime on its easy under a HIDDEN ivar (no leading '@'): GC-traced,
+   * so it outlives the transfer libcurl posts it on, but invisible and
+   * immutable from Ruby — instance_variable_* can't touch a non-'@' name. One
+   * slot per easy; a second mime_new replaces it and the old mime is freed. */
+  mrb_iv_set(mrb, easy_obj, MRB_SYM(mime), self);
   return self;
 }
 
