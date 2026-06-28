@@ -156,6 +156,67 @@ URL(".../users").get.json_lazy.array_each do |doc|
 end
 ```
 
+## Error handling
+
+There are two kinds of failure, and they behave differently:
+
+- **Usage mistakes** — an unbuilt/unknown scheme, a kwarg the scheme doesn't
+  own — **raise** immediately (a `URL::Error` subclass). They're bugs in your
+  calling code.
+- **Transfer failures** — anything that goes wrong once libcurl is running:
+  timeout, DNS, refused connection, TLS rejection, *and* an HTTP status `>= 400`
+  — are returned as **values**. Nothing is raised for you.
+
+So every response you get back must be checked: `resp.error` is `nil` on a clean
+success, or an exception object describing what failed. Check it (or `resp.error?`,
+or a status predicate) before trusting the body.
+
+```ruby
+resp = URL("https://api.example.com/data").get
+
+if resp.error
+  warn "request failed: #{resp.error.class} — #{resp.error.message}"
+else
+  use(resp.json)
+end
+```
+
+`resp.error` is a real exception object you can inspect or raise yourself — it
+just isn't raised *for* you:
+
+- Transport failures map to one class per libcurl error, all under
+  `URL::TransferError` (e.g. `URL::OperationTimedout`, `URL::CouldntConnect`,
+  `URL::PeerFailedVerification`); each carries `#curl_code`, `#curl_message` and
+  `#response`. Where mruby already ships the right class it's reused — a DNS
+  failure comes back as `SocketError`, so `rescue SocketError` just works.
+- An HTTP status `>= 400` is a value too: `resp.error` is a
+  `URL::HttpReturnedError` (with `#response`), and `resp.client_error?` /
+  `resp.server_error?` tell you which band.
+
+Dispatch on it with `case`/`when`:
+
+```ruby
+case resp.error
+when nil                    then use(resp.json)
+when URL::HttpReturnedError then retry_or_log(resp.code)
+when URL::OperationTimedout then back_off
+when SocketError            then mark_host_down
+when URL::TransferError     then warn "curl #{resp.error.curl_code}"
+end
+```
+
+Prefer exceptions? `raise_for_status!` opts in — it raises whatever `resp.error`
+holds (HTTP *or* transport) and otherwise returns `self`, so it chains:
+
+```ruby
+data = URL("https://api.example.com/data").get.raise_for_status!.json
+```
+
+This is uniform across the whole gem: the same `resp.error` value model applies
+to every verb, every protocol, and each `URL::Response` returned by `URL.parallel`
+— one failing request never derails the others. (Runnable tour:
+`examples/error_handling.rb`.)
+
 ## Streaming
 
 Pass a block to a one-shot to receive body chunks as they arrive instead of
