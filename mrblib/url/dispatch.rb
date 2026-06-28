@@ -463,13 +463,26 @@ class URL
       pairs.join("&")
     end
 
-    # Apply user-supplied curl options to the request. Only :netrc needs
-    # massaging — its friendly value is mapped to libcurl's enum here so the C
-    # setopt stays a flat int pass-through; everything else is verbatim.
+    # Apply user-supplied curl options to the request. Two ways in, both ending
+    # at the same flat setopt pass-through:
+    #   * top-level keys (timeout:, verbose:, …) — the curated, named options.
+    #   * setopt: { … } — an explicit escape hatch to forward any libcurl option
+    #     verbatim, for the long tail we don't surface by name. Its pairs are
+    #     merged last so an explicit setopt wins over a named one.
+    # Only :netrc needs massaging — its friendly value is mapped to libcurl's
+    # enum here so the C setopt stays a flat int pass-through; everything else is
+    # verbatim.
     def _apply_opts(req, opts)
+      raw = opts.delete(:setopt)
       opts.each do |k, v|
         v = _netrc_level(v) if k == :netrc
         req.setopt(k, v)
+      end
+      if raw
+        raw.each do |k, v|
+          v = _netrc_level(v) if k == :netrc
+          req.setopt(k, v)
+        end
       end
     end
 

@@ -36,14 +36,26 @@ URL("wss://echo.websocket.org").connect { |ws| ws.send_text("hi"); puts ws.recei
 
 ## Calling URL
 
-`URL(uri)` dispatches on the scheme and returns the right wrapper:
-`URL::HTTP`, `URL::Transfer`, `URL::Gopher`, `URL::Dict`, `URL::IMAP`,
-`URL::POP3`, `URL::SMTP`, `URL::LDAP`, `URL::MQTT`, `URL::RTSP`, `URL::WS`.
-Each class carries only the verbs that fit the protocol. A scheme this libcurl
-can't speak — whether unknown or simply not compiled in — raises `URL::Error`
-from `URL(uri)` itself: no wrapper is constructed for a protocol the build
-can't use, so the failure surfaces immediately, not later at a verb. Check
-ahead of time with `URL.supports?("scheme")` or against `URL::PROTOS`.
+`URL(uri)` dispatches on the scheme and returns a **per-protocol class** — one
+per scheme: `URL::HTTP`/`URL::HTTPS`, `URL::FTP`/`URL::FTPS`, `URL::SFTP`,
+`URL::SCP`, `URL::FILE`, `URL::TFTP`, `URL::TELNET`, `URL::GOPHER`/`URL::GOPHERS`,
+`URL::DICT`, `URL::IMAP`/`URL::IMAPS`, `URL::POP3`/`URL::POP3S`,
+`URL::SMTP`/`URL::SMTPS`, `URL::LDAP`/`URL::LDAPS`, `URL::MQTT`/`URL::MQTTS`,
+`URL::RTSP`, `URL::WS`/`URL::WSS`. Protocols that share an operation shape share
+a parent they subclass: the whole ftp/ssh/file family subclasses
+`URL::Transfer` (`download`/`upload`/`list`), and each TLS variant subclasses
+its plaintext base (`URL::HTTPS < URL::HTTP`, `URL::FTPS < URL::Transfer`, …).
+Each class carries only the verbs that fit the protocol.
+
+A per-protocol class exists **only when this libcurl was built with that
+protocol** — mirroring libcurl, where an unbuilt scheme has no handler at all.
+So on a build without an SSH backend `URL::SFTP` simply doesn't exist
+(referencing it is a `NameError`), and `URL("sftp://…")` raises `URL::Error`
+("protocol not available") from `URL(uri)` itself — no wrapper is constructed
+for a protocol the build can't use, so the failure surfaces immediately, not
+later at a verb. A scheme the gem doesn't know at all raises `URL::Error`
+("unsupported scheme"). Check ahead of time with `URL.supports?("scheme")` or
+against `URL::PROTOS`.
 
 ```ruby
 # Build once, call repeatedly:
@@ -52,10 +64,10 @@ api.get(params: { limit: 10 })
 api.post(json: payload)
 
 # One-shot class method when you know the scheme up front, no factory:
-URL::HTTP.get("https://x", json: {...})
-URL::Transfer.upload("sftp://h/path", io)     # ftp(s) / sftp / scp / file / tftp / telnet
-URL::IMAP.fetch("imaps://h/INBOX", uid: 7)
-URL::WS.connect("wss://h/sock") { |ws| ws.send_text("hi") }
+URL::HTTPS.get("https://x", json: {...})
+URL::SFTP.upload("sftp://h/path", io)         # ftp(s) / sftp / scp / file / tftp / telnet share URL::Transfer's verbs
+URL::IMAPS.fetch("imaps://h/INBOX", uid: 7)
+URL::WSS.connect("wss://h/sock") { |ws| ws.send_text("hi") }
 ```
 
 ## Defaults
@@ -74,12 +86,13 @@ response, or a specific token list (e.g. `"gzip"`) to narrow it.
 
 These high-level kwargs are **owned per scheme** — each wrapper defines its own
 set, nothing is shared. The table below is the **HTTP** set. Other schemes own a
-subset: the `Transfer`/`Gopher`/`Dict`/`POP3`/`LDAP`/`MQTT`/`RTSP`/`WS` wrappers
+subset: the `Transfer`/`GOPHER`/`DICT`/`POP3`/`LDAP`/`MQTT`/`RTSP`/`WS` wrappers
 take `params`/`headers`; `IMAP` and `SMTP` take none (their inputs are explicit
 verb arguments). Passing a high-level kwarg a scheme doesn't own raises
 `ArgumentError` up front — no silent no-op, no cryptic libcurl error. Raw
 `curl_easy` options are *not* high-level kwargs: they always pass through to
-`setopt`, which validates them against libcurl regardless of scheme.
+`setopt`, which validates them against libcurl regardless of scheme — either as
+top-level keys or, explicitly, via the `setopt:` escape hatch (see below).
 
 | kwarg | what it does |
 | --- | --- |
@@ -94,6 +107,7 @@ verb arguments). Passing a high-level kwarg a scheme doesn't own raises
 | `headers: { ... }` | Extra headers. Wins over anything we auto-set. |
 | `timeout: 30.s` / `connect_timeout: 5.s` | Durations (mruby-chrono). Any unit — `500.ms`, `2.min` — handed to libcurl as milliseconds losslessly. |
 | any `curl_easy` opt | `proxy`, `cookiefile`, `cookiejar`, `verbose`, `ssl_verify_peer`, `userpwd`, … (see [Options reference](#options-reference)). |
+| `setopt: { ... }` | Explicit escape hatch for the long tail of `curl_easy` options not surfaced by name. Each pair goes straight to `URL::Request#setopt`, merged **last** so an explicit `setopt:` value wins over the same option set as a top-level key. |
 
 ## Response
 
