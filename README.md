@@ -438,6 +438,7 @@ any single request.
 | `:mail_from` | MAIL_FROM |
 | `:mail_rcpt` | MAIL_RCPT (Array) |
 | `:post_fields` | COPYPOSTFIELDS (size from POSTFIELDSIZE_LARGE) |
+| `:mimepost` | MIMEPOST (a `URL::Libcurl::Mime`; built for you by `multipart:`) |
 | `:range` | RANGE |
 | `:infilesize` | INFILESIZE_LARGE |
 | `:dirlistonly` | DIRLISTONLY |
