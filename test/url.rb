@@ -69,32 +69,29 @@ $sftp_meta   = File.exist?(sftp_meta_f) ? File.read(sftp_meta_f).split("\n") : n
 # ---- assertions -----------------------------------------------------------
 
 assert('URL("uri") returns the scheme-typed wrapper for every supported scheme') do
-  expected = {
-    "http"    => URL::HTTP,     "https"   => URL::HTTP,
-    "ftp"     => URL::Transfer, "ftps"    => URL::Transfer,
-    "sftp"    => URL::Transfer, "scp"     => URL::Transfer,
-    "file"    => URL::Transfer, "tftp"    => URL::Transfer, "telnet" => URL::Transfer,
-    "gopher"  => URL::Gopher,   "gophers" => URL::Gopher,
-    "dict"    => URL::Dict,
-    "imap"    => URL::IMAP,     "imaps"   => URL::IMAP,
-    "pop3"    => URL::POP3,     "pop3s"   => URL::POP3,
-    "smtp"    => URL::SMTP,     "smtps"   => URL::SMTP,
-    "ldap"    => URL::LDAP,     "ldaps"   => URL::LDAP,
-    "mqtt"    => URL::MQTT,     "mqtts"   => URL::MQTT,
-    "rtsp"    => URL::RTSP,
-    "ws"      => URL::WS,       "wss"     => URL::WS,
-  }
-  expected.each do |scheme, klass|
+  # Each scheme maps to its own per-protocol class (URL::HTTP, URL::FTP, …),
+  # named by upcasing the scheme. Those classes exist ONLY when this libcurl
+  # was built with the protocol, so the constant is referenced via const_get
+  # and only when supported — an unbuilt scheme has no class at all.
+  schemes = %w[
+    http https ftp ftps sftp scp file tftp telnet gopher gophers dict
+    imap imaps pop3 pop3s smtp smtps ldap ldaps mqtt mqtts rtsp ws wss
+  ]
+  schemes.each do |scheme|
     sample = case scheme
              when "file" then "file:///etc/hostname"
              else             "#{scheme}://h"
              end
     if URL.supports?(scheme)
+      klass = URL.const_get(scheme.upcase)
       assert_equal klass, URL(sample).class, "URL(#{sample.inspect}) should be #{klass}"
     else
       # A scheme libcurl wasn't built with raises immediately from URL(uri) —
-      # no wrapper is constructed for a protocol the build can't speak.
+      # no wrapper is constructed for a protocol the build can't speak, and the
+      # per-protocol class constant doesn't exist either.
       assert_raise(URL::Error) { URL(sample) }
+      assert_false URL.const_defined?(scheme.upcase),
+                   "URL::#{scheme.upcase} must not exist for unbuilt #{scheme}"
     end
   end
 end
@@ -257,6 +254,17 @@ assert('each scheme owns its high-level kwargs; foreign ones are rejected up fro
   assert_false r.error.nil?
   # HTTP owns all of them, so the same kwargs are accepted there.
   assert_true URL("#{$base}/echo").post(json: { ok: 1 }).success?
+end
+
+assert('setopt: forwards raw libcurl options verbatim (escape hatch)') do
+  # The long tail of curl options we don't surface by name can still be set,
+  # explicitly, via setopt: { ... } — the pairs flow straight to URL::Request#setopt.
+  r = URL("#{$base}/echo").get(setopt: { user_agent: "via-setopt" })
+  assert_true r.success?
+  assert_equal "via-setopt", r.json["headers"]["user-agent"]
+  # An explicit setopt is merged last, so it wins over the same option by name.
+  r2 = URL("#{$base}/echo").get(user_agent: "named", setopt: { user_agent: "raw-wins" })
+  assert_equal "raw-wins", r2.json["headers"]["user-agent"]
 end
 
 assert('multipart/form-data upload (curl_mime) with a plain field and a file part') do
