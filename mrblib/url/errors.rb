@@ -66,6 +66,56 @@ class URL
     end
   end
 
+  # ---- usage errors: specific, inspectable, never a bare URL::Error ---------
+  # Base for "you handed URL(uri) a scheme it can't serve". Carries the offending
+  # scheme and the list of protocols THIS libcurl was built with, so a handler
+  # can branch on the data instead of scraping the message. `rescue
+  # URL::SchemeError` catches both the unknown-scheme and not-built-in cases.
+  class SchemeError < Error
+    attr_reader :scheme, :supported
+
+    def initialize(scheme, supported, message)
+      @scheme    = scheme
+      @supported = supported
+      super(message)
+    end
+  end
+
+  # The scheme isn't one mruby-url recognizes at all (a typo or a made-up
+  # scheme) — there is no protocol by that name to build against.
+  class UnsupportedScheme < SchemeError
+    def initialize(scheme, supported)
+      super(scheme, supported,
+            "unsupported scheme: #{scheme.inspect} — not a URL scheme " \
+            "mruby-url recognizes. Built-in protocols: #{supported.join(', ')}")
+    end
+  end
+
+  # The scheme is a real curl protocol, but THIS libcurl was compiled without it,
+  # so no client class exists for it. The message names the check that would have
+  # caught it ahead of time and lists what the build actually supports.
+  class ProtocolNotAvailable < SchemeError
+    def initialize(scheme, supported)
+      super(scheme, supported,
+            "protocol not available: #{scheme} — a recognized scheme this " \
+            "libcurl was built without. Guard with URL.supports?(#{scheme.inspect}). " \
+            "Built-in protocols: #{supported.join(', ')}")
+    end
+  end
+
+  # An RTSP verb mapped to a request type curl doesn't define. Carries the name
+  # given and the full set of valid requests.
+  class UnknownRTSPRequest < Error
+    attr_reader :request, :valid_requests
+
+    def initialize(request, valid_requests)
+      @request        = request
+      @valid_requests = valid_requests
+      super("unknown RTSP request: #{request.inspect} — valid requests are " \
+            "#{valid_requests.map(&:to_s).sort.join(', ')}")
+    end
+  end
+
   # CURLcode => CamelCase class name, for every code we mint a URL:: class for.
   # Reused built-ins (CURL_BUILTIN_ERROR) and the C-raised CURLE_OUT_OF_MEMORY
   # are intentionally absent. Generated from curl.h's CURLcode enum.

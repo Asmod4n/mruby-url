@@ -421,7 +421,7 @@ class URL
     def _require_protocol!(url)
       scheme = _scheme_of(url)
       return if supports?(scheme)
-      raise URL::Error, "protocol not available: #{scheme}"
+      raise URL::ProtocolNotAvailable.new(scheme, PROTOS)
     end
 
     # Lowercased scheme of a URL given as a String or a URI-like object (one

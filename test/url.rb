@@ -99,8 +99,12 @@ end
 assert('URL(uri) raises immediately for a recognized-but-unbuilt scheme') do
   unbuilt = %w[ws wss sftp scp mqtt mqtts rtsp gopher dict ldap].find { |s| !URL.supports?(s) }
   skip("every candidate scheme is built in this libcurl") unless unbuilt
-  err = assert_raise(URL::Error) { URL("#{unbuilt}://h/x") }
+  err = assert_raise(URL::ProtocolNotAvailable) { URL("#{unbuilt}://h/x") }
+  assert_kind_of URL::SchemeError, err          # branchable family
+  assert_kind_of URL::Error,       err          # ...and still a usage error
   assert_include err.message, "protocol not available"
+  assert_equal unbuilt, err.scheme              # carries the offending scheme
+  assert_equal URL::PROTOS, err.supported       # ...and what the build DOES have
 end
 
 assert('URL("uri").get and URL::HTTP.get("uri") both work') do
@@ -113,9 +117,13 @@ assert('URL("uri").get and URL::HTTP.get("uri") both work') do
   assert_equal 'GET', b.json['method']
 end
 
-assert('URL("uri") raises URL::Error for an unknown scheme') do
-  err = assert_raise(URL::Error) { URL("zzz://x") }
+assert('URL("uri") raises URL::UnsupportedScheme for an unknown scheme') do
+  err = assert_raise(URL::UnsupportedScheme) { URL("zzz://x") }
+  assert_kind_of URL::SchemeError, err
+  assert_kind_of URL::Error,       err
   assert_include err.message, 'unsupported scheme'
+  assert_equal "zzz", err.scheme
+  assert_equal URL::PROTOS, err.supported
 end
 
 assert('URL::Libcurl::SHARE is the per-VM share') do
