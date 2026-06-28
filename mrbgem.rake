@@ -13,6 +13,29 @@ MRuby::Gem::Specification.new('mruby-url') do |spec|
   spec.add_test_dependency 'mruby-env'
   spec.add_test_dependency 'mruby-sleep'
 
+  # ------------------------------------------------------------------
+  # Test run-state directory
+  #
+  # The MRI fixture (test/server.ruby) and the mruby test (test/url.rb)
+  # rendezvous through a throwaway directory: port files, captured payloads
+  # and logs land there instead of polluting the checked-in test/ tree. We
+  # anchor it under the gem's build dir so `rake clean` sweeps it along with
+  # the rest of the build — but in a dedicated sub-folder, kept apart from the
+  # compiled artefacts that dir is really meant for.
+  #
+  # mrbtest does not reliably inherit our process ENV, and we don't spawn it,
+  # so we can't hand test/url.rb the path that way. Instead we drop a one-line
+  # pointer file at a fixed spot in the mruby root: test/url.rb resolves it from
+  # __FILE__ (cwd- and ENV-independent), and the project Rakefile reads the same
+  # pointer to tell the fixture — over ARGV — where to write.
+  # ------------------------------------------------------------------
+  unless Rake.application.top_level_tasks.any? { |t| t.to_s =~ /\b(deep_)?clean\b/ }
+    require 'fileutils'
+    test_state = File.join(spec.build_dir, 'test-run')
+    FileUtils.mkdir_p(test_state)
+    File.write(File.join(spec.build.root, '.url-test-state'), test_state)
+  end
+
   if spec.for_windows?
     cleaning = Rake.application.top_level_tasks.any? { |t| t =~ /\Aclean|deep_clean\z/ }
     # ------------------------------------------------------------------

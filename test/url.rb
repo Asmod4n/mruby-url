@@ -5,9 +5,15 @@
 # hold the pipe open. When this process exits, the write end closes,
 # the child's STDIN.read returns, and the child exits. No cleanup.
 
-$state_dir = ENV['MURL_TEST_STATE_DIR']
+# The gem's mrbgem.rake creates the throwaway run-state dir under the gem build
+# tree and records its path in this pointer file, inside the gitignored mruby/
+# clone. We can't use ENV (mrbtest doesn't reliably inherit it) so we resolve
+# the rendezvous from __FILE__ — the compile-time path of this file — which
+# makes us independent of cwd and of the process environment.
+_pointer   = File.join(File.dirname(File.dirname(__FILE__)), 'mruby', '.url-test-state')
+$state_dir = File.exist?(_pointer) ? File.read(_pointer).strip : nil
 unless $state_dir && File.directory?($state_dir)
-  return "MURL_TEST_STATE_DIR not set or missing — run via 'rake test', not mrbtest directly"
+  return "test state dir unavailable — run via 'rake test', not mrbtest directly"
 end
 
 port_file = File.join($state_dir, 'server_port')

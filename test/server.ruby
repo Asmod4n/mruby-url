@@ -8,10 +8,11 @@
 # No at_exit, no signal handler, no leaked process.
 
 # All run-state (port files, captured payloads, logs) lives in the throwaway
-# directory the Rakefile created and exported. Failing loudly here is fine —
-# the only supported entrypoint is `rake test`.
-STATE_DIR = ENV.fetch('MURL_TEST_STATE_DIR') do
-  abort "MURL_TEST_STATE_DIR not set — run via 'rake test', not this script directly"
+# directory the Rakefile created and passed to us as ARGV[0]. Failing loudly
+# here is fine — the only supported entrypoint is `rake test`.
+STATE_DIR = ARGV[0]
+if STATE_DIR.nil? || STATE_DIR.empty?
+  abort "usage: server.ruby STATE_DIR — run via 'rake test', not this script directly"
 end
 
 # Redirect stderr to a log file *first*, so any failure during require or
