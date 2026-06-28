@@ -25,6 +25,7 @@
 #include <mruby/data.h>
 #include <mruby/string.h>
 #include <mruby/array.h>
+#include <mruby/hash.h>
 #include <mruby/variable.h>
 #include <mruby/class.h>
 #include <mruby/error.h>
@@ -1010,6 +1011,18 @@ murl_lc_multi_add(mrb_state* mrb, mrb_value mod)
   murl_easy_t*  e = murl_easy_get(mrb, easy_obj);
 
   murl_multi_check(mrb, curl_multi_add_handle(m->multi, e->curl));
+
+  /* Root the easy on the multi while curl_multi references its CURL*, under a
+   * HIDDEN ivar (MRB_SYM 'easies', no leading '@'): the GC traces it so the
+   * easy can't be cleaned up mid-transfer, but instance_variable_* can't reach
+   * a non-'@' name, so Ruby can't drop the root and induce a use-after-free.
+   * The Ruby-side session bookkeeping is then just lookup, not a safety root. */
+  mrb_value easies = mrb_iv_get(mrb, multi_obj, MRB_SYM(easies));
+  if (!mrb_hash_p(easies)) {
+    easies = mrb_hash_new(mrb);
+    mrb_iv_set(mrb, multi_obj, MRB_SYM(easies), easies);
+  }
+  mrb_hash_set(mrb, easies, easy_obj, mrb_true_value());
   return multi_obj;
 }
 
@@ -1024,6 +1037,11 @@ murl_lc_multi_remove(mrb_state* mrb, mrb_value mod)
   murl_easy_t*  e = murl_easy_get(mrb, easy_obj);
 
   murl_multi_check(mrb, curl_multi_remove_handle(m->multi, e->curl));
+
+  /* Drop the hidden GC root added in multi_add — the easy is no longer in the
+   * multi, so it may be collected (and curl_easy_cleanup'd) safely. */
+  mrb_value easies = mrb_iv_get(mrb, multi_obj, MRB_SYM(easies));
+  if (mrb_hash_p(easies)) mrb_hash_delete_key(mrb, easies, easy_obj);
   return multi_obj;
 }
 

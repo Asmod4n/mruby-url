@@ -28,8 +28,11 @@ class URL
 
   def initialize
     @multi           = URL::Libcurl.multi_init
-    @handles         = {}        # request.object_id => URL::Request (keeps it alive)
-    @by_easy         = {}        # easy.object_id    => URL::Request (info_read map)
+    # easy.object_id => URL::Request: maps a completed easy back to its Request
+    # in info_read. The GC-safety root that keeps the in-flight easy alive while
+    # curl_multi references it lives in C (multi_add pins it under a hidden ivar
+    # on the multi), so tampering with this Ruby map can't cause a use-after-free.
+    @by_easy         = {}
     @event_loop      = nil
     @_timer_handle   = nil
     @pending_timeout = nil
@@ -71,15 +74,13 @@ class URL
   end
 
   def add(req)
-    URL::Libcurl.multi_add(@multi, req.handle)
-    @handles[req.object_id]         = req
-    @by_easy[req.handle.object_id]  = req
+    URL::Libcurl.multi_add(@multi, req.handle)   # C pins the easy as a GC root
+    @by_easy[req.handle.object_id] = req
     self
   end
 
   def remove(req)
-    URL::Libcurl.multi_remove(@multi, req.handle)
-    @handles.delete(req.object_id)
+    URL::Libcurl.multi_remove(@multi, req.handle)  # C drops the GC root
     @by_easy.delete(req.handle.object_id)
     self
   end
