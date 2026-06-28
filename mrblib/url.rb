@@ -290,7 +290,7 @@ end
 
 class URL
   DEFAULT_USER_AGENT      = "mruby-url".freeze
-  DEFAULT_TIMEOUT_MS      = 30_000
+  DEFAULT_TIMEOUT         = 30.0   # seconds; a chrono duration, same as 30.s
   DEFAULT_FOLLOW_LOCATION = true
 
   # The protocol schemes compiled into the embedded libcurl (lowercased), e.g.

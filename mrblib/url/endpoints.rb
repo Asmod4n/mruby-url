@@ -178,13 +178,13 @@ class URL
     end
 
     # Receive one message. libcurl keeps the subscription open, so this blocks
-    # until `timeout_ms` elapses and returns the message received meanwhile.
-    # Curl frames each message as [2-byte topic length][topic][payload]; the
-    # payload is extracted and the expected keep-alive timeout is normalised
-    # away, so #error is nil on a clean receive.
-    def subscribe(timeout_ms: 5_000, **o)
+    # until `timeout` (a chrono duration, default 5.s) elapses and returns the
+    # message received meanwhile. Curl frames each message as [2-byte topic
+    # length][topic][payload]; the payload is extracted and the expected
+    # keep-alive timeout is normalised away, so #error is nil on a clean receive.
+    def subscribe(timeout: 5.0, **o)
       URL._require_protocol!(@uri)
-      resp    = URL._run_transfer(@uri, o.merge(timeout_ms: timeout_ms), nil, nil)
+      resp    = URL._run_transfer(@uri, o.merge(timeout: timeout), nil, nil)
       payload = URL._mqtt_payload(resp.body)
       # CURLE_OPERATION_TIMEDOUT (28) is how a one-shot subscribe ends once the
       # message arrived; clear it when we actually got a payload.
