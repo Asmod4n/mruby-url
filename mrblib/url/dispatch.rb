@@ -118,6 +118,7 @@ class URL
       auth      = opts.delete(:auth)
       bearer    = opts.delete(:bearer)
       user_hdrs = opts.delete(:headers)
+      multipart = opts.delete(:multipart)
 
       auto_hdrs = {}
 
@@ -151,6 +152,7 @@ class URL
       end
 
       req.setopt(:post_fields, body) if body
+      _apply_multipart(req, multipart) if multipart
       _apply_opts(req, opts)
 
       merged = auto_hdrs
@@ -469,6 +471,44 @@ class URL
         v = _netrc_level(v) if k == :netrc
         req.setopt(k, v)
       end
+    end
+
+    # Build a multipart/form-data body from a Hash and attach it as the request
+    # body (CURLOPT_MIMEPOST). The mime *tree* has to be assembled through the
+    # libcurl handles, but which parts/names/files to add is decided here in
+    # Ruby; the C side only exposes the thin curl_mime_* primitives.
+    #
+    #   multipart: {
+    #     "field"  => "plain value",
+    #     "avatar" => { file: "/path/pic.png", type: "image/png" },
+    #     "note"   => { data: bytes, filename: "n.txt", type: "text/plain" },
+    #   }
+    #
+    # A String value is a plain field; a Hash value is a file/blob part —
+    # `file:` streams from disk (libcurl reads it, never buffered in Ruby),
+    # `data:` is an in-memory blob, and `filename:`/`type:` set the part headers.
+    def _apply_multipart(req, parts)
+      mime = URL::Libcurl.mime_new(req.handle)
+      parts.each do |name, v|
+        part = URL::Libcurl.mime_addpart(mime)
+        URL::Libcurl.mime_name(part, name.to_s)
+        if v.is_a?(Hash)
+          if v[:file]
+            URL::Libcurl.mime_filedata(part, v[:file].to_s)
+          else
+            URL::Libcurl.mime_data(part, (v[:data] || "").to_s)
+          end
+          URL::Libcurl.mime_filename(part, v[:filename].to_s) if v[:filename]
+          URL::Libcurl.mime_type(part, v[:type].to_s)         if v[:type]
+        else
+          URL::Libcurl.mime_data(part, v.to_s)
+        end
+      end
+      req.setopt(:mimepost, mime)
+      # Keep the mime alive until the transfer is done — libcurl holds only a
+      # bare pointer to it. Rooting it on the easy handle ties their lifetimes.
+      req.handle.mime = mime
+      req
     end
 
     # CURLOPT_NETRC enum: ignored(0) / optional(1) / required(2).

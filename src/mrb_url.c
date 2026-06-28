@@ -98,6 +98,157 @@ murl_easy_get(mrb_state* mrb, mrb_value self)
 }
 
 /* =========================================================================
+ * URL::Libcurl::Mime / ::Part  (multipart/form-data via curl_mime_*)
+ *
+ * The mime tree is opaque libcurl state, so it has to be built through C calls
+ * — but each is a thin pass-through; which parts / names / files to add is
+ * decided in Ruby. Ownership (per curl docs + the postit2 example): the whole
+ * tree, including its parts, is released by a single curl_mime_free, called
+ * AFTER the transfer (perform → curl_easy_cleanup → curl_mime_free — freeing
+ * after cleanup is the documented order, no double-free). So the Mime CDATA
+ * owns the free; a Part CDATA is non-owning (its mime frees it) and just keeps
+ * its owning Mime rooted. The Mime keeps its Easy rooted; Ruby keeps the Mime
+ * rooted on the Easy handle until the transfer is done.
+ * ========================================================================= */
+
+static void
+murl_mime_free(mrb_state* mrb, void* p)
+{
+  (void)mrb;
+  if (p) curl_mime_free((curl_mime*)p);
+}
+
+static const struct mrb_data_type murl_mime_type = {
+  "URL::Libcurl::Mime", murl_mime_free
+};
+
+static const struct mrb_data_type murl_part_type = {
+  "URL::Libcurl::Part", NULL   /* freed by its owning curl_mime, never alone */
+};
+
+static curl_mime*
+murl_mime_get(mrb_state* mrb, mrb_value v)
+{
+  curl_mime* m = (curl_mime*)mrb_data_check_get_ptr(mrb, v, &murl_mime_type);
+  if (unlikely(!m)) mrb_raise(mrb, E_RUNTIME_ERROR, "URL::Libcurl::Mime not open");
+  return m;
+}
+
+static curl_mimepart*
+murl_part_get(mrb_state* mrb, mrb_value v)
+{
+  curl_mimepart* p = (curl_mimepart*)mrb_data_check_get_ptr(mrb, v, &murl_part_type);
+  if (unlikely(!p)) mrb_raise(mrb, E_RUNTIME_ERROR, "URL::Libcurl::Part not open");
+  return p;
+}
+
+/* mime_new(easy) -> Mime */
+static mrb_value
+murl_lc_mime_new(mrb_state* mrb, mrb_value mod)
+{
+  mrb_value easy_obj;
+  mrb_get_args(mrb, "o", &easy_obj);
+  murl_easy_t* e = murl_easy_get(mrb, easy_obj);
+
+  curl_mime* m = curl_mime_init(e->curl);
+  if (unlikely(!m)) mrb_raise(mrb, E_RUNTIME_ERROR, "curl_mime_init failed");
+
+  struct RClass* lc  = mrb_class_ptr(mod);
+  struct RClass* cls = mrb_class_get_under_id(mrb, lc, MRB_SYM(Mime));
+  struct RData*  d   = mrb_data_object_alloc(mrb, cls, m, &murl_mime_type);
+  mrb_value self = mrb_obj_value(d);
+  mrb_iv_set(mrb, self, MRB_SYM(easy), easy_obj);   /* keep the easy alive */
+  return self;
+}
+
+/* mime_addpart(mime) -> Part */
+static mrb_value
+murl_lc_mime_addpart(mrb_state* mrb, mrb_value mod)
+{
+  mrb_value mime_obj;
+  mrb_get_args(mrb, "o", &mime_obj);
+  curl_mime* m = murl_mime_get(mrb, mime_obj);
+
+  curl_mimepart* p = curl_mime_addpart(m);
+  if (unlikely(!p)) mrb_raise(mrb, E_RUNTIME_ERROR, "curl_mime_addpart failed");
+
+  struct RClass* lc  = mrb_class_ptr(mod);
+  struct RClass* cls = mrb_class_get_under_id(mrb, lc, MRB_SYM(Part));
+  struct RData*  d   = mrb_data_object_alloc(mrb, cls, p, &murl_part_type);
+  mrb_value self = mrb_obj_value(d);
+  mrb_iv_set(mrb, self, MRB_SYM(mime), mime_obj);   /* root the owning mime */
+  return self;
+}
+
+static void
+murl_mime_check(mrb_state* mrb, CURLcode rc, const char* what)
+{
+  if (unlikely(rc != CURLE_OK))
+    mrb_raisef(mrb, E_RUNTIME_ERROR, "%s: %s", what, curl_easy_strerror(rc));
+}
+
+/* mime_name(part, str) -> part */
+static mrb_value
+murl_lc_mime_name(mrb_state* mrb, mrb_value mod)
+{
+  (void)mod;
+  mrb_value part_obj, name;
+  mrb_get_args(mrb, "oS", &part_obj, &name);
+  murl_mime_check(mrb, curl_mime_name(murl_part_get(mrb, part_obj),
+                                      mrb_string_cstr(mrb, name)), "curl_mime_name");
+  return part_obj;
+}
+
+/* mime_data(part, bytes) -> part  (curl copies the bytes; binary-safe) */
+static mrb_value
+murl_lc_mime_data(mrb_state* mrb, mrb_value mod)
+{
+  (void)mod;
+  mrb_value part_obj, data;
+  mrb_get_args(mrb, "oS", &part_obj, &data);
+  murl_mime_check(mrb, curl_mime_data(murl_part_get(mrb, part_obj),
+                                      RSTRING_PTR(data), (size_t)RSTRING_LEN(data)),
+                  "curl_mime_data");
+  return part_obj;
+}
+
+/* mime_filedata(part, path) -> part  (libcurl streams the file from disk) */
+static mrb_value
+murl_lc_mime_filedata(mrb_state* mrb, mrb_value mod)
+{
+  (void)mod;
+  mrb_value part_obj, path;
+  mrb_get_args(mrb, "oS", &part_obj, &path);
+  murl_mime_check(mrb, curl_mime_filedata(murl_part_get(mrb, part_obj),
+                                          mrb_string_cstr(mrb, path)), "curl_mime_filedata");
+  return part_obj;
+}
+
+/* mime_type(part, str) -> part */
+static mrb_value
+murl_lc_mime_type(mrb_state* mrb, mrb_value mod)
+{
+  (void)mod;
+  mrb_value part_obj, type;
+  mrb_get_args(mrb, "oS", &part_obj, &type);
+  murl_mime_check(mrb, curl_mime_type(murl_part_get(mrb, part_obj),
+                                      mrb_string_cstr(mrb, type)), "curl_mime_type");
+  return part_obj;
+}
+
+/* mime_filename(part, str) -> part */
+static mrb_value
+murl_lc_mime_filename(mrb_state* mrb, mrb_value mod)
+{
+  (void)mod;
+  mrb_value part_obj, name;
+  mrb_get_args(mrb, "oS", &part_obj, &name);
+  murl_mime_check(mrb, curl_mime_filename(murl_part_get(mrb, part_obj),
+                                          mrb_string_cstr(mrb, name)), "curl_mime_filename");
+  return part_obj;
+}
+
+/* =========================================================================
  * URL::Libcurl::Multi  (CDATA = murl_multi_t, wraps CURLM*)
  *
  * murl_socket_cb / murl_timer_cb are thin trampolines to Ruby blocks stored on
@@ -546,6 +697,8 @@ murl_lc_easy_setopt(mrb_state* mrb, mrb_value mod)
   else if (opt == MRB_SYM(tcp_keepintvl))      rc = curl_easy_setopt(h, CURLOPT_TCP_KEEPINTVL, (long)mrb_as_int(mrb, val));
   /* --- unix domain socket (Docker / HTTP-over-unix) --------------------- */
   else if (opt == MRB_SYM(unix_socket_path))   rc = curl_easy_setopt(h, CURLOPT_UNIX_SOCKET_PATH, mrb_string_cstr(mrb, val));
+  /* --- multipart/form-data: val is a URL::Libcurl::Mime built in Ruby --- */
+  else if (opt == MRB_SYM(mimepost))           rc = curl_easy_setopt(h, CURLOPT_MIMEPOST, murl_mime_get(mrb, val));
   else if (opt == MRB_SYM(post_fields)) {
     mrb_value s = mrb_str_to_str(mrb, val);
     curl_easy_setopt(h, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)RSTRING_LEN(s));
@@ -1066,6 +1219,25 @@ mrb_mruby_url_gem_init(mrb_state* mrb)
     mrb_define_class_under_id(mrb, lc, MRB_SYM(Share), mrb->object_class);
   MRB_SET_INSTANCE_TT(share_cls, MRB_TT_CDATA);
   mrb_undef_method_id(mrb, share_cls, MRB_SYM(initialize));
+
+  /* multipart/form-data handles: curl_mime (the tree) and curl_mimepart. */
+  struct RClass* mime_cls =
+    mrb_define_class_under_id(mrb, lc, MRB_SYM(Mime), mrb->object_class);
+  MRB_SET_INSTANCE_TT(mime_cls, MRB_TT_CDATA);
+  mrb_undef_method_id(mrb, mime_cls, MRB_SYM(initialize));
+
+  struct RClass* part_cls =
+    mrb_define_class_under_id(mrb, lc, MRB_SYM(Part), mrb->object_class);
+  MRB_SET_INSTANCE_TT(part_cls, MRB_TT_CDATA);
+  mrb_undef_method_id(mrb, part_cls, MRB_SYM(initialize));
+
+  mrb_define_module_function_id(mrb, lc, MRB_SYM(mime_new),      murl_lc_mime_new,      MRB_ARGS_REQ(1));
+  mrb_define_module_function_id(mrb, lc, MRB_SYM(mime_addpart),  murl_lc_mime_addpart,  MRB_ARGS_REQ(1));
+  mrb_define_module_function_id(mrb, lc, MRB_SYM(mime_name),     murl_lc_mime_name,     MRB_ARGS_REQ(2));
+  mrb_define_module_function_id(mrb, lc, MRB_SYM(mime_data),     murl_lc_mime_data,     MRB_ARGS_REQ(2));
+  mrb_define_module_function_id(mrb, lc, MRB_SYM(mime_filedata), murl_lc_mime_filedata, MRB_ARGS_REQ(2));
+  mrb_define_module_function_id(mrb, lc, MRB_SYM(mime_type),     murl_lc_mime_type,     MRB_ARGS_REQ(2));
+  mrb_define_module_function_id(mrb, lc, MRB_SYM(mime_filename), murl_lc_mime_filename, MRB_ARGS_REQ(2));
 
   /* One Share per VM, published as URL::Libcurl::SHARE so easy_init can attach
    * to it. CONNECT + SSL_SESSION are the safe-and-useful caches to share
