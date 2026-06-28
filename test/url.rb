@@ -230,6 +230,22 @@ assert('newly wired curl options are accepted (not an unsupported option)') do
   assert_include r.json["headers"]["cookie"].to_s, "a=1"
 end
 
+assert('each scheme owns its high-level kwargs; foreign ones are rejected up front') do
+  # file:// is always built. Transfer owns only params/headers, so HTTP-only
+  # convenience kwargs are rejected with ArgumentError before any I/O — not a
+  # silent no-op, not a cryptic libcurl error.
+  assert_raise(ArgumentError) { URL("file:///x").download(json: { a: 1 }) }
+  assert_raise(ArgumentError) { URL("file:///x").download(form: { a: 1 }) }
+  assert_raise(ArgumentError) { URL("file:///x").download(bearer: "t") }
+  assert_raise(ArgumentError) { URL("file:///x").download(multipart: {}) }
+  # Raw curl options are NOT high-level kwargs, so the wrapper lets them through
+  # to setopt (here they just produce an error-as-value, never an ArgumentError).
+  r = URL("file:///nonexistent-#{Process.pid rescue 0}").download(verbose: false)
+  assert_false r.error.nil?
+  # HTTP owns all of them, so the same kwargs are accepted there.
+  assert_true URL("#{$base}/echo").post(json: { ok: 1 }).success?
+end
+
 assert('multipart/form-data upload (curl_mime) with a plain field and a file part') do
   r = URL("#{$base}/multipart").post(multipart: {
     "field"  => "value-123",
