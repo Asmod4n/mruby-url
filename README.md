@@ -50,12 +50,14 @@ Each class carries only the verbs that fit the protocol.
 A per-protocol class exists **only when this libcurl was built with that
 protocol** — mirroring libcurl, where an unbuilt scheme has no handler at all.
 So on a build without an SSH backend `URL::SFTP` simply doesn't exist
-(referencing it is a `NameError`), and `URL("sftp://…")` raises `URL::Error`
-("protocol not available") from `URL(uri)` itself — no wrapper is constructed
+(referencing it is a `NameError`), and `URL("sftp://…")` raises
+`URL::ProtocolNotAvailable` from `URL(uri)` itself — no wrapper is constructed
 for a protocol the build can't use, so the failure surfaces immediately, not
-later at a verb. A scheme the gem doesn't know at all raises `URL::Error`
-("unsupported scheme"). Check ahead of time with `URL.supports?("scheme")` or
-against `URL::PROTOS`.
+later at a verb. A scheme the gem doesn't know at all raises
+`URL::UnsupportedScheme`. Both descend from `URL::SchemeError` (itself a
+`URL::Error`) and carry the offending `.scheme` plus the `.supported` protocol
+list, so a handler can branch on data instead of scraping the message. Check
+ahead of time with `URL.supports?("scheme")` or against `URL::PROTOS`.
 
 ```ruby
 # Build once, call repeatedly:
@@ -214,8 +216,10 @@ blocking verbs do.
 
 Every scheme `URL::PROTOS` lists is reachable, and transfer failures are values
 (`resp.error`), exactly like the HTTP verbs. A scheme this libcurl wasn't built
-with — known or not — raises `URL::Error` straight from `URL(uri)`, before any
-wrapper exists; only failures *during* a transfer come back as values.
+with raises `URL::ProtocolNotAvailable`, and one the gem doesn't know raises
+`URL::UnsupportedScheme` (both `URL::SchemeError`/`URL::Error`), straight from
+`URL(uri)` before any wrapper exists; only failures *during* a transfer come
+back as values.
 
 ```ruby
 URL("ftp://host/pub/file.txt").download.body          # ftp(s), sftp, scp,

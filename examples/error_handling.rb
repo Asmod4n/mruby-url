@@ -40,10 +40,10 @@ BASE = (ARGV[0] && !ARGV[0].empty?) ? ARGV[0] : "https://httpbingo.org"
 # Warm the connection once. The very first TLS handshake to a cold public test
 # server can lag; doing it up front (and on URL.shared, which pools the
 # connection) keeps the timed examples below honest. The result is ignored.
-URL("#{BASE}/get").get(timeout_ms: 20000)
+URL("#{BASE}/get").get(timeout: 20.s)
 
 puts "1. the basic shape — make the request, then look at resp.error"
-resp = URL("#{BASE}/get").get(timeout_ms: 15000)
+resp = URL("#{BASE}/get").get(timeout: 15.s)
 if resp.error
   puts "   failed: #{resp.error.class} - #{resp.error.message}"
 else
@@ -53,7 +53,7 @@ end
 puts
 puts "2. an HTTP error status is a value, not a raise"
 # /status/<n> replies with exactly status <n>.
-resp = URL("#{BASE}/status/503").get(timeout_ms: 15000)
+resp = URL("#{BASE}/status/503").get(timeout: 15.s)
 err  = resp.error
 puts "   #{err.class}  curl_code=#{err.curl_code}"
 puts "   code=#{resp.code}  server_error?=#{resp.server_error?}"
@@ -71,7 +71,7 @@ puts "   #{resp.error.message}"
 puts
 puts "4. a timeout is URL::OperationTimedout (libcurl CURLE_OPERATION_TIMEDOUT)"
 # /delay/<n> waits n seconds before replying; we allow only 0.8s.
-resp = URL("#{BASE}/delay/10").get(timeout_ms: 800)
+resp = URL("#{BASE}/delay/10").get(timeout: 800.ms)
 puts "   #{resp.error.class}  curl_code=#{resp.error.curl_code}"
 puts "   #{resp.error.message}"
 
@@ -80,7 +80,7 @@ puts "5. a TLS failure surfaces as one of the URL::Ssl* classes"
 # Which one — PeerFailedVerification (curl 60) vs SslConnectError (curl 35) —
 # depends on your libcurl's TLS backend (OpenSSL tends to report 60 for an
 # expired cert; others report 35). Both mean "the TLS handshake was rejected".
-resp = URL("https://expired.badssl.com/").get(timeout_ms: 15000)
+resp = URL("https://expired.badssl.com/").get(timeout: 15.s)
 puts "   #{resp.error.class}  curl_code=#{resp.error.curl_code}"
 puts "   #{resp.error.message}"
 
@@ -98,9 +98,9 @@ def classify(url, **opts)
   when URL::TransferError     then "other transport error (curl #{resp.error.curl_code})"
   end
 end
-puts "   /status/204        -> #{classify("#{BASE}/status/204", timeout_ms: 15000)}"
-puts "   /status/404        -> #{classify("#{BASE}/status/404", timeout_ms: 15000)}"
-puts "   /delay/10 @500ms   -> #{classify("#{BASE}/delay/10", timeout_ms: 500)}"
+puts "   /status/204        -> #{classify("#{BASE}/status/204", timeout: 15.s)}"
+puts "   /status/404        -> #{classify("#{BASE}/status/404", timeout: 15.s)}"
+puts "   /delay/10 @500ms   -> #{classify("#{BASE}/delay/10", timeout: 500.ms)}"
 puts "   bad host           -> #{classify("https://no-such-host.invalid/")}"
 
 puts
@@ -108,7 +108,7 @@ puts "7. opt INTO exceptions with raise_for_status!"
 # It raises whatever resp.error holds (HTTP *or* transport) and otherwise returns
 # self, so it chains: raise_for_status!.json
 begin
-  data = URL("#{BASE}/status/500").get(timeout_ms: 15000).raise_for_status!.json
+  data = URL("#{BASE}/status/500").get(timeout: 15.s).raise_for_status!.json
   puts "   got #{data.size} keys"
 rescue URL::HttpReturnedError => e
   puts "   HTTP error: #{e.response.code}"
@@ -120,10 +120,10 @@ puts
 puts "8. parallel fan-out — each Response carries its own error value,"
 puts "   so one failure never derails the others"
 results = URL.parallel do |p|
-  p.get("#{BASE}/status/200", key: :ok,   timeout_ms: 15000)
-  p.get("#{BASE}/status/500", key: :http, timeout_ms: 15000)
+  p.get("#{BASE}/status/200", key: :ok,   timeout: 15.s)
+  p.get("#{BASE}/status/500", key: :http, timeout: 15.s)
   p.get("https://no-such-host.invalid/",  key: :dns)
-  p.get("#{BASE}/delay/10",   key: :slow, timeout_ms: 800)
+  p.get("#{BASE}/delay/10",   key: :slow, timeout: 800.ms)
 end
 results.each do |key, r|
   outcome = r.error ? "#{r.error.class}" : "ok #{r.code}"
