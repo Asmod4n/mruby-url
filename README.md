@@ -171,17 +171,14 @@ end
 
 ## Calling URL from inside a callback
 
-The high-level verbs reuse one shared session per `mrb_state`
-(`URL.shared`), so libcurl's connection pool, TLS sessions and HTTP/2
-streams persist across calls. That session can only drive one transfer at
-a time, so a call made from *inside* a streaming/callback (where the
-shared session is mid-flight) would be re-entrant. mruby-url detects that
-and transparently runs the nested call on a throwaway session — and a
-per-OS-thread `CURLSH` (held in thread-local storage in C, not exposed to
-Ruby) means the throwaway shares the **same connection cache and
-TLS-session-ticket cache** as the shared session, so a nested call to a host
-you already opened resumes TLS (and often reuses the live TCP/HTTP-2
-connection) instead of doing a full handshake. Transparent in both directions:
+The high-level verbs reuse one shared session (`URL.shared`), so the connection
+pool, TLS sessions and HTTP/2 streams persist across calls. That session drives
+one transfer at a time, so a call made from *inside* a streaming/callback (where
+it's mid-flight) would be re-entrant — mruby-url detects that and transparently
+runs the nested call on a throwaway session that **shares the same connection and
+TLS-session cache**, so a nested call to a host you already opened resumes TLS
+(and often reuses the live connection) instead of doing a full handshake.
+Transparent in both directions:
 
 ```ruby
 URL("https://a.example/stream").get do |chunk|
@@ -355,15 +352,13 @@ ws.error   # => #<URL::WebSocketError: websocket upgrade refused: server
 Without a block, `connect` returns the socket and you close it yourself
 (`ws.close(status: 1000)`). `#receive(timeout: 5.s)` returns `nil` if no
 message arrives in time; `#send_*` / `#receive` on a closed socket are
-no-ops returning `nil`. The C layer only adds two framing primitives
-(`curl_ws_send` / `curl_ws_recv`); all message-level logic lives in
-`mrblib/url/websocket.rb`. Only genuine usage errors raise: a non-ws
-scheme, or a libcurl built without WebSocket support (needs 7.86+).
+no-ops returning `nil`. Only genuine usage errors raise: a non-ws scheme, or a
+libcurl built without WebSocket support (needs 7.86+).
 
 ## Tuning the shared session
 
-`URL.shared` is the process-wide session (per `mrb_state`). Tune its pool
-once at startup:
+`URL.shared` is the session every blocking verb reuses. Tune its pool once at
+startup:
 
 ```ruby
 URL.shared.setopt(:pipelining,             2)    # CURLPIPE_MULTIPLEX (HTTP/2)
@@ -524,57 +519,17 @@ On Linux/macOS the gem finds libcurl via `pkg-config`. On Windows it builds
 the vendored `deps/curl` with CMake and links it statically against Schannel
 (no OpenSSL); `mrbgem.rake` handles this.
 
-## Design notes
+## Threads and processes
 
-- **C is an FFI-thin binding only.** `src/mrb_url.c` does only what a generic
-  FFI layer could: call libcurl, marshal primitives across the boundary,
-  register the callbacks libcurl requires, and copy bytes. Everything else —
-  dispatch, option/verb mapping, control flow, per-transfer state, parsing,
-  scheme handling — lives in memory-safe Ruby under `mrblib/`. Hand-written
-  C is the only place a memory-safety bug can hide, so keeping C at FFI level
-  keeps the fuzzable surface near zero. See `CLAUDE.md`.
-- The C layer exposes flat `URL::Libcurl` primitives over an `Easy`
-  (`curl_easy_*`) and a `Multi` (`curl_multi_*`) CDATA handle.
-  `URL::Request` and the session (`URL`) are thin Ruby wrappers over them.
-- C callbacks stay minimal: write/header copy bytes in and yield under
-  `mrb_protect_error`; read copies one bounded chunk out; the socket and
-  timer callbacks are store-only (they record into plain C, and Ruby acts on
-  it afterwards). The C side never `longjmp`s through libcurl — the first
-  exception is stashed on `mrb->exc`, the callback returns libcurl's abort
-  code, and it's re-raised on the way back to Ruby.
-- `curl_global_init`/`curl_global_cleanup` are refcounted, not tied to any one
-  `mrb_state`. A C11 `call_once` builds the mutex and a thread-local key; under
-  the mutex the global layer comes up on the first **holder** and is torn down
-  after the last, where holders are both live VMs *and* live per-thread shares
-  (below). So spinning VMs up and down — even across threads — never races or
-  tears down the TLS/Winsock layer under a live transfer.
-- **Connection / TLS session reuse** is wired through libcurl's `CURLSH`, held
-  in **OS-thread-local storage** (`tss_t`), not per VM and not exposed to Ruby.
-  It's created lazily on the first `easy_init` on a thread, and every `easy_init`
-  on that thread attaches via `CURLOPT_SHARE` — so the shared session, any
-  throwaway session, **and any other `mrb_state` running on the same OS thread**
-  reuse one TCP-connection cache and one TLS-session-ticket cache (users can
-  spawn several VMs per thread; binding the share to the thread lets them share a
-  warm pool). A request fired from inside a callback therefore resumes TLS (and
-  often the live TCP/HTTP/2 connection) instead of doing a full handshake. We
-  share `CONNECT` + `SSL_SESSION` only — `DNS`/`PSL` are auto-shared at the multi
-  level, `COOKIE`/`HSTS` are documented thread-unsafe and set per-easy. Lock
-  callbacks are deliberately unset: a thread-local `CURLSH` is only ever touched
-  by its owning OS thread (which runs one VM at a time), so access is serialised
-  by construction and libcurl's `if(share->lockfunc)` guard makes unset the cheap
-  no-op. The share is freed by its thread-local destructor at **thread exit**
-  (`curl_share_cleanup`; well-behaved code has closed its VMs first so every easy
-  has detached). Trade-off: no connection/TLS reuse *across* OS threads — each
-  thread warms its own pool — which is the price of staying lock-free.
-- `URL::Request` is private (`#initialize` undef'd; `_open` factory). The
-  verbs use it internally. If you get one back from `info_read` you can call
-  `#response_code`, `#effective_url`, `#total_time`, `#content_type`,
-  `#setopt`, `#headers=`, `#on_data`, `#on_header`, `#on_read` on it.
-- Per-transfer state lives in `URL::TransferState`, not on the Request.
-- `IO.for_fd` runs with `autoclose = false` everywhere we touch
-  libcurl-owned fds — libcurl owns those lifecycles; we must not close them.
-- Redirect chains: parsed `Response#headers` keeps only the final response;
-  the full sequence stays in `#raw_headers`.
+Connections and TLS sessions are reused automatically across calls — including
+across several VMs running on the same OS thread — so repeat requests to a host
+skip the handshake. Two rules to stay safe:
+
+- **Keep each `mrb_state` and its requests on one OS thread.** Don't drive a VM
+  from a different thread than the one it was created on (the same single-owning
+  -thread rule mruby itself imposes on an `mrb_state`).
+- **Don't `fork()` after a request and then use the gem in the child** — libcurl
+  isn't fork-safe; the child inherits the parent's live sockets.
 
 ## Roadmap
 
@@ -582,5 +537,3 @@ Every scheme libcurl is built with is exposed; further work is
 protocol-specific conveniences as they come up (richer RTSP transport
 negotiation, MQTT-over-WebSockets glue, FTP active-mode helpers, …),
 plus whatever falls out of CI feedback on the less-exercised TLS variants.
-The C surface is intentionally tiny and meant to stay that way — new
-behaviour lives in `mrblib/` next to the existing dispatch.
