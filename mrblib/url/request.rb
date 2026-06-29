@@ -40,6 +40,17 @@ class URL::Request
     URL::Libcurl.easy_setopt(@handle, :url, url) if url
   end
 
+  # dup / clone: give the copy its OWN libcurl handle. Object#initialize_copy
+  # would leave the two Requests sharing one Easy; instead dup the handle (the
+  # Easy's own initialize_copy duplicates the underlying CURL* via
+  # curl_easy_duphandle), so the copy is independent and usable. The session is
+  # shared on purpose — the copy belongs to the same session.
+  def initialize_copy(orig)
+    super
+    @handle = orig.handle.dup
+    self
+  end
+
   def setopt(opt, val)
     URL::Libcurl.easy_setopt(@handle, opt, val)
     self

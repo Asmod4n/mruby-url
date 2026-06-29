@@ -71,6 +71,15 @@ class URL::WebSocket
     end
   end
 
+  # A live WebSocket owns a connection (and the libcurl easy handle behind it)
+  # that can't be duplicated — curl_easy_duphandle copies options but not the
+  # established socket. Refuse dup/clone; open another with URL("wss://…").connect.
+  def initialize_copy(orig)
+    raise NotImplementedError,
+          "can't dup/clone #{self.class}: a live WebSocket owns a connection " \
+          "that can't be duplicated"
+  end
+
   # True while the socket is live and usable. False after a failed handshake, a
   # peer close, or #close.
   def open?;   !@closed; end

@@ -68,6 +68,15 @@ class URL
     self
   end
 
+  # A session owns a libcurl multi handle, which has no curl_multi_duphandle —
+  # a dup/clone would share the one CURLM (and its in-flight transfers) unsafely.
+  # Refuse it; open an independent session with URL.open instead.
+  def initialize_copy(orig)
+    raise NotImplementedError,
+          "can't dup/clone #{self.class}: a session owns a libcurl multi handle " \
+          "that can't be duplicated — use URL.open for a new session"
+  end
+
   def setopt(opt, val)
     URL::Libcurl.multi_setopt(@multi, opt, val)
     self
