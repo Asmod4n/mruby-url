@@ -148,6 +148,54 @@ assert('Throwaway session against the same host still succeeds (share-attached)'
   assert_true resp.success?
 end
 
+assert('URL::Libcurl::Easy dup/clone duplicates the handle into an independent, usable one') do
+  # Ruby dup/clone of a CDATA used to leave the copy with no handle. Now it runs
+  # curl_easy_duphandle, so the copy is an independent working handle that keeps
+  # the source's options (here the URL) and performs on its own.
+  e1 = URL::Libcurl.easy_init
+  URL::Libcurl.easy_setopt(e1, :url, "#{$base}/echo")
+  e2 = e1.dup
+  assert_not_equal e1.object_id, e2.object_id
+  assert_kind_of URL::Libcurl::Easy, e2
+  assert_equal 0,   URL::Libcurl.easy_perform(e2)
+  assert_equal 200, URL::Libcurl.easy_getinfo(e2, :response_code)
+  # The original is untouched and still works (no shared/freed state).
+  assert_equal 0,   URL::Libcurl.easy_perform(e1)
+  assert_equal 200, URL::Libcurl.easy_getinfo(e1, :response_code)
+end
+
+assert('a duped handle gets its OWN copy of the source header slist') do
+  e1 = URL::Libcurl.easy_init
+  URL::Libcurl.easy_setopt(e1, :url, "#{$base}/echo")
+  URL::Libcurl.easy_setopt(e1, :httpheader, ["X-Dup: carried"])
+  e2 = e1.dup
+  body = String.new
+  e2.on_data = ->(c) { body << c }   # callbacks rewired to the copy's struct
+  assert_equal 0, URL::Libcurl.easy_perform(e2)
+  assert_include JSON.parse(body)["headers"]["x-dup"].to_s, "carried"
+end
+
+assert('URL::Request#dup gives an independent easy handle') do
+  a = URL::Request._open(URL.shared, "#{$base}/echo")
+  b = a.dup
+  assert_not_equal a.handle.object_id, b.handle.object_id
+  assert_kind_of URL::Libcurl::Easy, b.handle
+end
+
+assert('handles with no duplicable libcurl resource refuse dup/clone') do
+  # The multi handle has no curl_multi_duphandle, and the mime tree/parts are
+  # tied to the easy that built them — dup/clone would share or orphan the C
+  # handle, so they raise instead of handing back a broken copy.
+  assert_raise(NotImplementedError) { URL.open.dup }                 # session (multi handle)
+  assert_raise(NotImplementedError) { URL.open.clone }
+  assert_raise(NotImplementedError) { URL::Libcurl.multi_init.dup }  # Multi CDATA
+
+  e = URL::Libcurl.easy_init
+  m = URL::Libcurl.mime_new(e)
+  assert_raise(NotImplementedError) { m.dup }                        # Mime CDATA
+  assert_raise(NotImplementedError) { URL::Libcurl.mime_addpart(m).dup }  # Part CDATA
+end
+
 assert('URL.get echo') do
   r = URL("#{$base}/echo").get(params: { a: '1', b: 'x y' })
   assert_true r.success?

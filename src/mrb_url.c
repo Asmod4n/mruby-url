@@ -680,6 +680,26 @@ murl_timer_cb(CURLM* multi, long timeout_ms, void* userp)
  * easy_init -> Easy
  * ========================================================================= */
 
+/* Point this easy's write/header/read callbacks at e (so the C trampolines read
+ * the callback blocks off e->self) and attach the per-thread share. Shared by
+ * easy_init and the duphandle path; detach is automatic on curl_easy_cleanup. */
+static void
+murl_easy_wire(murl_easy_t* e)
+{
+  CURL* h = e->curl;
+  curl_easy_setopt(h, CURLOPT_PRIVATE,        e);
+  curl_easy_setopt(h, CURLOPT_WRITEFUNCTION,  murl_write_cb);
+  curl_easy_setopt(h, CURLOPT_WRITEDATA,      e);
+  curl_easy_setopt(h, CURLOPT_HEADERFUNCTION, murl_header_cb);
+  curl_easy_setopt(h, CURLOPT_HEADERDATA,     e);
+  curl_easy_setopt(h, CURLOPT_READFUNCTION,   murl_read_cb);
+  curl_easy_setopt(h, CURLOPT_READDATA,       e);
+  curl_easy_setopt(h, CURLOPT_NOSIGNAL,       1L);
+
+  CURLSH* sh = murl_thread_share();
+  if (sh) curl_easy_setopt(h, CURLOPT_SHARE, sh);
+}
+
 static mrb_value
 murl_lc_easy_init(mrb_state* mrb, mrb_value mod)
 {
@@ -701,21 +721,113 @@ murl_lc_easy_init(mrb_state* mrb, mrb_value mod)
   if (unlikely(!h)) mrb_raise(mrb, E_RUNTIME_ERROR, "curl_easy_init failed");
   e->curl = h;
 
-  curl_easy_setopt(h, CURLOPT_PRIVATE,        e);
-  curl_easy_setopt(h, CURLOPT_WRITEFUNCTION,  murl_write_cb);
-  curl_easy_setopt(h, CURLOPT_WRITEDATA,      e);
-  curl_easy_setopt(h, CURLOPT_HEADERFUNCTION, murl_header_cb);
-  curl_easy_setopt(h, CURLOPT_HEADERDATA,     e);
-  curl_easy_setopt(h, CURLOPT_READFUNCTION,   murl_read_cb);
-  curl_easy_setopt(h, CURLOPT_READDATA,       e);
-  curl_easy_setopt(h, CURLOPT_NOSIGNAL,       1L);
-
-  /* Attach to this OS thread's share so this easy uses the per-thread connection
-   * cache and TLS session-ticket cache. Detach is automatic on curl_easy_cleanup. */
-  CURLSH* sh = murl_thread_share();
-  if (sh) curl_easy_setopt(h, CURLOPT_SHARE, sh);
+  murl_easy_wire(e);
 
   return self;
+}
+
+/* =========================================================================
+ * URL::Libcurl::Easy#initialize_copy  (dup / clone via curl_easy_duphandle)
+ *
+ * Ruby dup/clone shallow-copies the CDATA, leaving the copy with no usable
+ * handle. Instead duplicate the underlying CURL* with curl_easy_duphandle, so a
+ * dup/clone is an independent, working handle carrying the same options.
+ *
+ * curl_easy_duphandle's dupset does `dst->set = src->set` — a SHALLOW struct
+ * copy — so the new handle (a) points WRITEDATA/HEADERDATA/READDATA/PRIVATE at
+ * the SOURCE's murl_easy_t and (b) shares the source's caller-owned slists
+ * (HTTPHEADER/QUOTE/MAIL_RCPT); it also does not copy the share. So murl_easy_wire
+ * re-points the callbacks/share at the new struct, and the three slists are
+ * deep-copied into copies the new handle owns (and this struct frees). The user
+ * callback blocks are carried over so the clone behaves like the original; the
+ * mimepost is deep-copied by libcurl itself, so the hidden mime root is not.
+ * ========================================================================= */
+
+/* Deep-copy a curl_slist; the result is owned by the caller. NULL for an
+ * empty source; raises NoMemoryError (freeing the partial copy) on OOM. */
+static struct curl_slist*
+murl_slist_dup(mrb_state* mrb, const struct curl_slist* src)
+{
+  struct curl_slist* dst = NULL;
+  for (const struct curl_slist* p = src; p; p = p->next) {
+    struct curl_slist* n = curl_slist_append(dst, p->data);
+    if (unlikely(!n)) {
+      curl_slist_free_all(dst);
+      mrb_exc_raise(mrb, mrb_obj_value(mrb->nomem_err));
+    }
+    dst = n;
+  }
+  return dst;
+}
+
+static mrb_value
+murl_lc_easy_init_copy(mrb_state* mrb, mrb_value self)
+{
+  mrb_value orig;
+  mrb_get_args(mrb, "o", &orig);
+
+  murl_easy_t* src = (murl_easy_t*)mrb_data_get_ptr(mrb, orig, &murl_easy_type);
+  if (unlikely(!src || !src->curl))
+    mrb_raise(mrb, E_RUNTIME_ERROR, "URL::Libcurl::Easy not open");
+
+  CURL* nh = curl_easy_duphandle(src->curl);
+  if (unlikely(!nh)) mrb_raise(mrb, E_RUNTIME_ERROR, "curl_easy_duphandle failed");
+
+  murl_easy_t* e = (murl_easy_t*)mrb_malloc(mrb, sizeof(*e));
+  e->mrb         = mrb;
+  e->self        = self;
+  e->curl        = nh;
+  e->req_headers = NULL;
+  e->mail_rcpt   = NULL;
+  e->quote       = NULL;
+  /* Attach before the slist deep-copies below: if one raises (OOM), the GC sweep
+   * of self still frees nh and any partial slist already stored here. */
+  mrb_data_init(self, e, &murl_easy_type);
+
+  murl_easy_wire(e);   /* callbacks -> e, plus this thread's share */
+
+  /* Replace the slists the shallow set-copy left aliasing the source's
+   * caller-owned lists with independent copies this handle owns. */
+  if (src->req_headers) {
+    e->req_headers = murl_slist_dup(mrb, src->req_headers);
+    curl_easy_setopt(nh, CURLOPT_HTTPHEADER, e->req_headers);
+  } else {
+    curl_easy_setopt(nh, CURLOPT_HTTPHEADER, NULL);
+  }
+  if (src->mail_rcpt) {
+    e->mail_rcpt = murl_slist_dup(mrb, src->mail_rcpt);
+    curl_easy_setopt(nh, CURLOPT_MAIL_RCPT, e->mail_rcpt);
+  } else {
+    curl_easy_setopt(nh, CURLOPT_MAIL_RCPT, NULL);
+  }
+  if (src->quote) {
+    e->quote = murl_slist_dup(mrb, src->quote);
+    curl_easy_setopt(nh, CURLOPT_QUOTE, e->quote);
+  } else {
+    curl_easy_setopt(nh, CURLOPT_QUOTE, NULL);
+  }
+
+  /* Carry the user callback blocks so the clone behaves like the original. The
+   * hidden mime root (MRB_SYM(mime)) is intentionally NOT copied — libcurl
+   * duplicated the mimepost into the new handle, which owns its copy. */
+  mrb_iv_set(mrb, self, MRB_IVSYM(on_data),   mrb_iv_get(mrb, orig, MRB_IVSYM(on_data)));
+  mrb_iv_set(mrb, self, MRB_IVSYM(on_header), mrb_iv_get(mrb, orig, MRB_IVSYM(on_header)));
+  mrb_iv_set(mrb, self, MRB_IVSYM(on_read),   mrb_iv_get(mrb, orig, MRB_IVSYM(on_read)));
+
+  return self;
+}
+
+/* initialize_copy for the CDATA handles libcurl cannot duplicate: Multi (there
+ * is no curl_multi_duphandle) and Mime/Part (tied to the easy that built them).
+ * A shallow dup/clone would share or orphan the C handle, so refuse it with a
+ * clear error rather than hand back a broken or aliased copy. */
+static mrb_value
+murl_lc_no_dup(mrb_state* mrb, mrb_value self)
+{
+  mrb_raisef(mrb, E_NOTIMP_ERROR,
+             "can't dup/clone %s: its libcurl handle cannot be duplicated",
+             mrb_obj_classname(mrb, self));
+  return self; /* unreachable */
 }
 
 /* =========================================================================
@@ -1331,22 +1443,28 @@ mrb_mruby_url_gem_init(mrb_state* mrb)
     mrb_define_class_under_id(mrb, lc, MRB_SYM(Easy), mrb->object_class);
   MRB_SET_INSTANCE_TT(easy_cls, MRB_TT_CDATA);
   mrb_undef_method_id(mrb, easy_cls, MRB_SYM(initialize));
+  /* dup/clone duplicates the underlying CURL* (curl_easy_duphandle) so the copy
+   * is an independent, working handle rather than an empty CDATA. */
+  mrb_define_method_id(mrb, easy_cls, MRB_SYM(initialize_copy), murl_lc_easy_init_copy, MRB_ARGS_REQ(1));
 
   struct RClass* multi_cls =
     mrb_define_class_under_id(mrb, lc, MRB_SYM(Multi), mrb->object_class);
   MRB_SET_INSTANCE_TT(multi_cls, MRB_TT_CDATA);
   mrb_undef_method_id(mrb, multi_cls, MRB_SYM(initialize));
+  mrb_define_method_id(mrb, multi_cls, MRB_SYM(initialize_copy), murl_lc_no_dup, MRB_ARGS_REQ(1));
 
   /* multipart/form-data handles: curl_mime (the tree) and curl_mimepart. */
   struct RClass* mime_cls =
     mrb_define_class_under_id(mrb, lc, MRB_SYM(Mime), mrb->object_class);
   MRB_SET_INSTANCE_TT(mime_cls, MRB_TT_CDATA);
   mrb_undef_method_id(mrb, mime_cls, MRB_SYM(initialize));
+  mrb_define_method_id(mrb, mime_cls, MRB_SYM(initialize_copy), murl_lc_no_dup, MRB_ARGS_REQ(1));
 
   struct RClass* part_cls =
     mrb_define_class_under_id(mrb, lc, MRB_SYM(Part), mrb->object_class);
   MRB_SET_INSTANCE_TT(part_cls, MRB_TT_CDATA);
   mrb_undef_method_id(mrb, part_cls, MRB_SYM(initialize));
+  mrb_define_method_id(mrb, part_cls, MRB_SYM(initialize_copy), murl_lc_no_dup, MRB_ARGS_REQ(1));
 
   mrb_define_module_function_id(mrb, lc, MRB_SYM(mime_new),      murl_lc_mime_new,      MRB_ARGS_REQ(1));
   mrb_define_module_function_id(mrb, lc, MRB_SYM(mime_addpart),  murl_lc_mime_addpart,  MRB_ARGS_REQ(1));
