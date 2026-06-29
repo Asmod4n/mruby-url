@@ -1,10 +1,13 @@
 name: curl release watch
 
 # Once a week, look at the latest upstream curl release and keep exactly one
-# open tracking issue for it. If a newer release appears while the previous
-# tracking issue is still open (i.e. it wasn't acted on), the old one is closed
-# and a fresh one is opened for the new release. An issue that was already filed
-# for a given version — even one the maintainer closed — is never re-created.
+# open tracking issue for it — but only when our vendored libcurl is actually
+# behind. The check compares the commit our `deps/curl` submodule is pinned to
+# against the commit the latest release tag resolves to; if they match there is
+# nothing to track. If a newer release appears while the previous tracking issue
+# is still open (i.e. it wasn't acted on), the old one is closed and a fresh one
+# is opened for the new release. An issue that was already filed for a given
+# version — even one the maintainer closed — is never re-created.
 
 on:
   schedule:
@@ -21,6 +24,11 @@ jobs:
     if: github.repository == 'asmod4n/mruby-url'
     runs-on: ubuntu-latest
     steps:
+      # Needed so we can read the deps/curl submodule pin from our own tree.
+      # The gitlink lives in the superproject tree, so we don't need to fetch
+      # the submodule contents themselves.
+      - uses: actions/checkout@v4
+
       - uses: actions/github-script@v7
         with:
           script: |
@@ -35,6 +43,34 @@ jobs:
             if (!m) { core.setFailed(`Unrecognized curl tag: ${tag}`); return; }
             const version = `${m[1]}.${m[2]}.${m[3]}`;
             const marker  = `<!-- curl-watch:${version} -->`;
+
+            // --- what curl commit is our deps/curl submodule pinned to? ---
+            // This is the source of truth for "what we ship". The watcher must
+            // compare against it, not merely against the issues it filed before,
+            // or it will flag a release that's already vendored.
+            const { execSync } = require('child_process');
+            let submoduleSha = '';
+            try {
+              // "160000 commit <sha>\tdeps/curl"
+              const line = execSync('git ls-tree HEAD deps/curl', { encoding: 'utf8' }).trim();
+              submoduleSha = (line.split(/\s+/)[2] || '').toLowerCase();
+            } catch (e) {
+              core.warning(`Could not read deps/curl submodule pin: ${e.message}`);
+            }
+
+            // --- the commit the latest release tag resolves to (peel annotated tag) ---
+            let releaseSha = '';
+            try {
+              const ref = await github.rest.git.getRef({ owner: 'curl', repo: 'curl', ref: `tags/${tag}` });
+              if (ref.data.object.type === 'tag') {
+                const t = await github.rest.git.getTag({ owner: 'curl', repo: 'curl', tag_sha: ref.data.object.sha });
+                releaseSha = t.data.object.sha.toLowerCase();
+              } else {
+                releaseSha = ref.data.object.sha.toLowerCase();
+              }
+            } catch (e) {
+              core.warning(`Could not resolve ${tag} to a commit: ${e.message}`);
+            }
 
             // --- make sure our label exists ---
             try {
@@ -51,6 +87,26 @@ jobs:
             const issues = await github.paginate(github.rest.issues.listForRepo, {
               owner, repo, labels: LABEL, state: 'all', per_page: 100,
             });
+
+            // Already on the latest release? Then there is no update to track.
+            // The bump that closed the gap may have landed by hand, so retire any
+            // tracking issue we still have open and stop. (If either SHA couldn't
+            // be determined we fall through and keep the old, visible behaviour
+            // rather than silently skip.)
+            if (submoduleSha && releaseSha && submoduleSha === releaseSha) {
+              for (const i of issues.filter(i => i.state === 'open')) {
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: i.number,
+                  body: `\`deps/curl\` is already pinned to \`${tag}\` (${releaseSha}); closing as done.`,
+                });
+                await github.rest.issues.update({
+                  owner, repo, issue_number: i.number, state: 'closed', state_reason: 'completed',
+                });
+                core.info(`Closed #${i.number}; deps/curl already on ${version}.`);
+              }
+              core.info(`deps/curl already tracks curl ${version}; nothing to do.`);
+              return;
+            }
 
             // Already filed for this version? Respect it — even if it was closed
             // (maintainer dealt with it). Never re-create the same one.
