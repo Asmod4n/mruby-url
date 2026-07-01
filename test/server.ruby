@@ -377,7 +377,7 @@ end
 # handshake (compute Sec-WebSocket-Accept), then echo every data frame back
 # with the same opcode, answer PING with PONG, and mirror CLOSE. Client->server
 # frames are masked (per spec); server->client frames are not. Just enough to
-# exercise send_text / send_binary / receive / close end to end — no TLS, plain
+# exercise send / receive / close end to end — no TLS, plain
 # ws:// is enough for the framing path.
 
 WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'.freeze
