@@ -605,7 +605,7 @@ proto_assert('URL.websocket text echo round-trip', 'ws', $ws_port) do
   ws = URL("ws://127.0.0.1:#{$ws_port}/").connect
   assert_true ws.open?
   assert_nil  ws.error
-  ws.send_text('hello ws')
+  ws.send('hello ws')
   msg = ws.receive(timeout: 5)
   assert_false msg.nil?
   assert_true  msg.text?
@@ -617,10 +617,27 @@ end
 proto_assert('URL.websocket binary echo round-trip', 'ws', $ws_port) do
   ws = URL("ws://127.0.0.1:#{$ws_port}/").connect
   payload = "\x00\x01\x02\x03\xfe\xff"
-  ws.send_binary(payload)
+  ws.send(payload)
   msg = ws.receive(timeout: 5)
   assert_true  msg.binary?
   assert_equal payload, msg.data
+  ws.close
+end
+
+proto_assert('URL.websocket #send auto-detects text vs binary frames', 'ws', $ws_port) do
+  # The payload decides the frame type — valid UTF-8 goes out as a TEXT frame,
+  # anything else as BINARY (String#is_utf8? from mruby-string-is-utf8).
+  ws = URL("ws://127.0.0.1:#{$ws_port}/").connect
+  ws.send('héllo utf8')
+  msg = ws.receive(timeout: 5)
+  assert_true  msg.text?
+  assert_equal 'héllo utf8', msg.data
+
+  raw = "\xfe\xff\x00\x01"
+  ws.send(raw)
+  msg = ws.receive(timeout: 5)
+  assert_true  msg.binary?
+  assert_equal raw, msg.data
   ws.close
 end
 
@@ -628,7 +645,7 @@ proto_assert('URL.websocket block form yields a live socket then closes it', 'ws
   got = nil
   ws = URL("ws://127.0.0.1:#{$ws_port}/").connect do |w|
     assert_true w.open?
-    w.send_text('blocky')
+    w.send('blocky')
     got = w.receive(timeout: 5)
   end
   assert_equal 'blocky', got.data
@@ -641,7 +658,7 @@ proto_assert('URL.websocket failed upgrade is a value, not a raise', 'ws', $ws_p
   ws = URL("ws://127.0.0.1:#{$server_port}/echo").connect
   assert_false ws.open?
   assert_true  ws.error.is_a?(URL::TransferError)
-  assert_nil   ws.send_text('x')        # no-op on a closed socket, never raises
+  assert_nil   ws.send('x')             # no-op on a closed socket, never raises
   assert_nil   ws.receive(timeout: 0)
 end
 

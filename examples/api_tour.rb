@@ -239,7 +239,7 @@ section "9. WebSocket (ws / wss)"
 # connect returns a live URL::WebSocket; the block form auto-closes on exit.
 if URL.supports?("ws")
   # URL("wss://echo.websocket.org").connect do |ws|
-  #   ws.send("hello")                 # type: :text (default) or :binary
+  #   ws.send("hello")                 # frame type from payload: valid UTF-8 → text, else binary (RFC 6455)
   #   msg = ws.receive(timeout: 2.s)   # a URL::WebSocket::Message, or nil on timeout
   #   msg.text? / msg.binary? / msg.close?
   #   ws.each { |m| break if m.close?; puts m.data }   # iterate frames

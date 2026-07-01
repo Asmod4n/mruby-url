@@ -33,6 +33,7 @@
 #include <mruby/numeric.h>
 #include <mruby/num_helpers.h>
 #include <mruby/branch_pred.h>
+#include <mruby/string_is_utf8.h>
 
 #include <curl/curl.h>
 /* After curl: on Windows curl pulls in winsock2.h, which defines struct timeval
@@ -1123,8 +1124,17 @@ murl_lc_easy_ws_recv(mrb_state* mrb, mrb_value mod)
   return out;
 }
 
-/* easy_ws_send(easy, str, flags_int, fragsize=0) -> sent_count | nil
- *   nil means CURLE_AGAIN (the socket isn't writable yet). */
+/* easy_ws_send(easy, str, flags_int, fragsize=0) -> [sent_count, flags_used] | nil
+ *   nil means CURLE_AGAIN (the socket isn't writable yet).
+ *
+ * When flags carries no frame-type bit, the payload itself picks the type:
+ * valid UTF-8 goes out as CURLWS_TEXT, anything else as CURLWS_BINARY — the
+ * one distinction RFC 6455 §5.6 draws. mrb_str_is_utf8() is the same simdutf
+ * call String#is_utf8? wraps, so this adds no logic a Ruby caller couldn't
+ * run; it stays a stateless classification of the bytes already in hand.
+ * The flags actually used are returned so a continuation loop (CURLWS_OFFSET)
+ * can reuse the detected type instead of re-classifying a UTF-8 fragment that
+ * may be split mid-character. */
 static mrb_value
 murl_lc_easy_ws_send(mrb_state* mrb, mrb_value mod)
 {
@@ -1136,12 +1146,19 @@ murl_lc_easy_ws_send(mrb_state* mrb, mrb_value mod)
 
   murl_easy_t* e = murl_easy_get(mrb, easy_obj);
 
+  if (!(flags & (CURLWS_TEXT | CURLWS_BINARY | CURLWS_PING | CURLWS_PONG | CURLWS_CLOSE)))
+    flags |= mrb_str_is_utf8(data) ? CURLWS_TEXT : CURLWS_BINARY;
+
   size_t sent = 0;
   CURLcode rc = curl_ws_send(e->curl, RSTRING_PTR(data), (size_t)RSTRING_LEN(data),
                              &sent, (curl_off_t)fragsize, (unsigned int)flags);
   if (rc == CURLE_AGAIN) return mrb_nil_value();
   murl_easy_check(mrb, rc);
-  return mrb_convert_size_t(mrb, sent);
+
+  mrb_value out = mrb_ary_new_capa(mrb, 2);
+  mrb_ary_push(mrb, out, mrb_convert_size_t(mrb, sent));
+  mrb_ary_push(mrb, out, mrb_int_value(mrb, flags));
+  return out;
 }
 
 #else  /* libcurl built without WebSocket support */

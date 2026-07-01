@@ -26,7 +26,7 @@ URL("https://huge.example.com/file").get { |chunk| sink << chunk }
 URL("ftp://host/pub/").list.lines
 URL("sftp://host/path/big.bin").upload(File.open("big.bin", "rb"))
 URL("imaps://user:pw@mail/INBOX").fetch(uid: 42).body
-URL("wss://echo.websocket.org").connect { |ws| ws.send_text("hi"); puts ws.receive.data }
+URL("wss://echo.websocket.org").connect { |ws| ws.send("hi"); puts ws.receive.data }
 ```
 
 > **Status:** every scheme is implemented and covered by fixture-server
@@ -69,7 +69,7 @@ api.post(json: payload)
 URL::HTTPS.get("https://x", json: {...})
 URL::SFTP.upload("sftp://h/path", io)         # ftp(s) / sftp / scp / file / tftp / telnet share URL::Transfer's verbs
 URL::IMAPS.fetch("imaps://h/INBOX", uid: 7)
-URL::WSS.connect("wss://h/sock") { |ws| ws.send_text("hi") }
+URL::WSS.connect("wss://h/sock") { |ws| ws.send("hi") }
 ```
 
 ## Defaults
@@ -385,11 +385,14 @@ is used by SMTP `deliver`, so a mail body can be any of those too.
 connection and returns a `URL::WebSocket` once the upgrade handshake
 completes. Messages are sent and received whole — fragmentation and
 oversized frames are reassembled for you, and inbound PINGs are answered
-automatically.
+automatically. `send` picks the frame type from the payload itself:
+valid UTF-8 goes out as a TEXT frame, anything else as BINARY — which is
+exactly the distinction the wire format draws (RFC 6455 §5.6), so there
+is nothing to choose.
 
 ```ruby
 URL("wss://echo.websocket.org").connect do |ws|
-  ws.send_text("hello")
+  ws.send("hello")
   msg = ws.receive            # => URL::WebSocket::Message (text? / binary? / close?)
   puts msg.data
   ws.each { |m| handle(m) }   # iterate until the peer closes
