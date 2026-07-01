@@ -79,9 +79,11 @@ class URL::Request
   def activesocket; URL::Libcurl.easy_getinfo(@handle, :activesocket); end
 
   # WebSocket framing primitives — thin pass-throughs to the C glue. ws_recv
-  # returns [bytes, flags, bytesleft] or nil on CURLE_AGAIN; ws_send returns the
-  # byte count sent or nil on CURLE_AGAIN. All message-level logic (reassembly,
-  # frame dispatch, the send loop) lives in URL::WebSocket.
+  # returns [bytes, flags, bytesleft] or nil on CURLE_AGAIN; ws_send returns
+  # [byte count sent, flags used] or nil on CURLE_AGAIN (flags == 0 lets the C
+  # side classify the payload as TEXT or BINARY by UTF-8 validity). All
+  # message-level logic (reassembly, frame dispatch, the send loop) lives in
+  # URL::WebSocket.
   def ws_recv(buflen);                    URL::Libcurl.easy_ws_recv(@handle, buflen);                 end
   def ws_send(data, flags, fragsize = 0); URL::Libcurl.easy_ws_send(@handle, data, flags, fragsize); end
 

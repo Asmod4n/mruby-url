@@ -11,6 +11,7 @@ MRuby::Gem::Specification.new('mruby-url') do |spec|
   spec.add_dependency 'mruby-chrono'       # duration literals (30.s/500.ms) + lossless seconds->ms in C
   spec.add_dependency 'mruby-socket'
   spec.add_dependency 'mruby-string-ext'   # String#byteslice for Ruby-side upload chunking
+  spec.add_dependency 'mruby-string-is-utf8' # String#is_utf8? — WebSocket#send picks TEXT vs BINARY frames
   spec.add_test_dependency 'mruby-env'
   spec.add_test_dependency 'mruby-sleep'
 

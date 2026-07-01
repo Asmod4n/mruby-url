@@ -94,19 +94,14 @@ class URL::WebSocket
 
   # ---- sending ------------------------------------------------------------
 
-  # Send a message. type: is :text (default) or :binary.
-  def send(data, type: :text)
-    flag =
-      case type
-      when :text   then TEXT
-      when :binary then BINARY
-      else raise ArgumentError, "type must be :text or :binary, got #{type.inspect}"
-      end
-    _send_message(data.to_s, flag)
+  # Send a message. The frame type is decided by the payload itself, down in
+  # the C primitive: valid UTF-8 goes out as a TEXT frame, anything else as
+  # BINARY (mrb_str_is_utf8 from mruby-string-is-utf8). There is deliberately
+  # no way to choose — the WebSocket wire distinction *is* "valid UTF-8 or
+  # not" (RFC 6455 §5.6), so the payload already carries the answer.
+  def send(data)
+    _send_message(data.to_s, 0)
   end
-
-  def send_text(data);   _send_message(data.to_s, TEXT);   end
-  def send_binary(data); _send_message(data.to_s, BINARY); end
 
   # An unsolicited PING (libcurl answers an inbound PING with a PONG itself, so
   # you rarely need #pong). `payload` is an optional application body.
@@ -227,27 +222,30 @@ class URL::WebSocket
     end
   end
 
-  # Send a whole message, looping over partial sends. The first call carries the
-  # type/control flag; any remainder is a continuation of the same frame, tagged
-  # OFFSET so libcurl doesn't start a new frame.
+  # Send a whole message, looping over partial sends. The first call carries
+  # the control flag — or 0, letting C classify the payload as TEXT/BINARY —
+  # and hands back the flags actually used; any remainder is a continuation of
+  # the same frame, re-sent with those flags plus OFFSET so libcurl doesn't
+  # start a new frame (and no fragment is ever re-classified).
   def _send_message(data, flag)
     return nil if @closed   # no-op on a closed/failed socket; never raises
 
-    sent = _send_once(data, flag)
+    sent, flag = _send_once(data, flag)
     total = data.bytesize
     while sent < total
-      rest  = data.byteslice(sent, total - sent)
-      sent += _send_once(rest, flag | OFFSET)
+      rest    = data.byteslice(sent, total - sent)
+      n, flag = _send_once(rest, flag | OFFSET)
+      sent   += n
     end
     sent
   end
 
   # One ws_send, blocking on writability while libcurl reports CURLE_AGAIN
-  # (ws_send => nil). Returns the byte count actually accepted this call.
+  # (ws_send => nil). Returns [bytes_accepted, flags_used] for this call.
   def _send_once(data, flags)
     loop do
-      n = @req.ws_send(data, flags, 0)
-      return n if n
+      r = @req.ws_send(data, flags, 0)
+      return r if r
 
       IO.select(nil, [@io], nil, nil)
     end
