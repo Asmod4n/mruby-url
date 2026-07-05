@@ -43,20 +43,19 @@ class URL
 
     # Verb-agnostic blocking drive shared by the HTTP verbs, SMTP delivery and
     # the IMAP verbs.
-    # Attaches `req` to `session`'s reused IO.select loop, pumps it until the
+    # Attaches `req` to `session`'s reused blocking SyncDriver, pumps it until the
     # request completes, and wraps the outcome in a URL::Response. The caller
     # supplies a fully configured Request and its TransferState; this only owns
     # the add/run/remove lifecycle and the busy flag, so HTTP and SMTP share
     # exactly the same hybrid shared/fresh-session machinery.
     def _drive_sync(session, url, req, state)
-      loop = session._sync_loop
-      session.event_loop = loop
+      driver = session._sync_driver
 
       session.add(req)
       session._busy = true
 
       begin
-        loop.run_until(req) do |r, code|
+        driver.run_until(req) do |r, code|
           state.error_code = code if r.equal?(req) && code != 0
         end
         _response_from(url, req, state)
@@ -66,14 +65,19 @@ class URL
       end
     end
 
-    # Drive a batch of requests concurrently on one session and collect their
-    # responses. Reuses the shared session (so the connection pool, TLS sessions
-    # and HTTP/2 multiplexing carry over) unless it's mid-callback, in which case
-    # a throwaway one is used — the same hybrid rule the blocking verbs follow.
-    # All requests are added up front, then one IO.select loop drives them
-    # together; each response is handed to on_complete (key, resp) the moment its
-    # transfer finishes, and the full { key => URL::Response } Hash is returned
-    # once all are done. Like the verbs, a runtime failure is a Response whose
+    # Drive a batch of registered requests concurrently on one session and
+    # collect their responses. Reuses the shared session (so the connection
+    # pool, TLS sessions and HTTP/2 multiplexing carry over) unless it's
+    # mid-callback, in which case a throwaway one is used — the same hybrid
+    # rule the blocking verbs follow. Each entry is { key:, url:, build:,
+    # post: } where `build` is a proc taking the session and returning a
+    # configured [Request, TransferState] pair (any of the _build_* helpers,
+    # so every protocol can ride the batch, not just HTTP) and `post`, when
+    # set, rewraps the finished Response (MQTT subscribe). All requests are
+    # added up front, then one perform/poll drive runs them together; each
+    # response is handed to on_complete (key, resp) the moment its transfer
+    # finishes, and the full { key => URL::Response } Hash is returned once
+    # all are done. Like the verbs, a runtime failure is a Response whose
     # resp.error is set — never a raise.
     def _drive_parallel(entries, on_complete)
       return {} if entries.empty?
@@ -81,33 +85,33 @@ class URL
       session = shared
       session = open if session._busy?
 
-      loop = session._sync_loop
-      session.event_loop = loop
+      driver = session._sync_driver
 
       by_req  = {}
       results = {}
 
       entries.each do |e|
-        req, state = _build_request(session, e[:method], e[:url], e[:body], e[:opts], e[:on_chunk])
-        by_req[req.object_id] = [e[:key], e[:url], req, state]
+        req, state = e[:build].call(session)
+        by_req[req.object_id] = [e[:key], e[:url], req, state, e[:post]]
         session.add(req)
       end
 
       session._busy = true
       begin
-        loop.run_n(entries.size) do |req, code|
+        driver.run_n(entries.size) do |req, code|
           entry = by_req[req.object_id]
           next unless entry
-          key, url, r, state = entry
+          key, url, r, state, post = entry
           state.error_code = code if code != 0
           resp = _response_from(url, r, state)
+          resp = post.call(resp) if post
           results[key] = resp
           on_complete.call(key, resp) if on_complete
         end
         results
       ensure
         session._busy = false
-        by_req.each_value { |(_k, _u, r, _s)| session.remove(r) rescue nil }
+        by_req.each_value { |(_k, _u, r, _s, _p)| session.remove(r) rescue nil }
       end
     end
 
@@ -225,6 +229,16 @@ class URL
       [req, state]
     end
 
+    # Blocking SMTP/SMTPS delivery: pick the shared session (or a fresh one
+    # when re-entrant), build the mail request, drive it. Same shape as _imap
+    # below.
+    def _deliver(server_url, from, recipients, body, opts)
+      session = shared
+      session = open if session._busy?
+      req, state = _build_mail_request(session, server_url, from, recipients, body, opts)
+      _drive_sync(session, server_url, req, state)
+    end
+
     # Shared front of an IMAP verb: pick the shared session (or a fresh one when
     # re-entrant), build the request, drive it. Centralises the session choice
     # so each verb arm is a one-liner that just names its IMAP command. A NO/BAD
@@ -267,7 +281,7 @@ class URL
     # Run a plain transfer for any supported scheme and return a URL::Response.
     # `on_chunk` streams the body instead of buffering; `upload_data`, when set,
     # turns it into an upload driven by the read callback. Reuses the same
-    # shared/throwaway session + IO.select drive as the HTTP verbs, so all
+    # shared/throwaway session + SyncDriver drive as the HTTP verbs, so all
     # protocols share one code path.
     def _run_transfer(url, opts, on_chunk, upload_data)
       session = shared
@@ -411,7 +425,22 @@ class URL
         total_time:    req.total_time,
         content_type:  req.content_type,
         error_code:    state.error_code,
+        retry_after:   req.retry_after,
       )
+    end
+
+    # Block for `seconds` using libcurl's own wait (curl_multi_poll on an
+    # idle session — it sleeps the full timeout even with nothing attached,
+    # portably, Windows included; IO.select can't do that there). Used
+    # between retry rounds on the blocking paths only; event-loop
+    # integrations never reach this. A nil/zero wait is a no-op.
+    def _wait(seconds)
+      ms = (seconds.to_f * 1000).to_i
+      return nil if ms <= 0
+      session = shared
+      session = open if session._busy?
+      session.poll(ms)
+      nil
     end
 
     # Guard that the embedded libcurl was built with the URL's scheme. Called by
@@ -549,9 +578,73 @@ class URL
     flag
   end
 
-  # IOSelectLoop bound to this session, created once and reused across
-  # blocking calls so libcurl's socket registrations survive between requests.
-  def _sync_loop
-    @sync_loop ||= IOSelectLoop.new(self)
+  # The blocking SyncDriver bound to this session, created once and reused
+  # across calls. It drives via curl_multi_perform/poll, so no event loop is
+  # attached on the blocking paths at all.
+  def _sync_driver
+    @sync_driver ||= SyncDriver.new(self)
+  end
+
+  # --- executors ------------------------------------------------------------
+  #
+  # The scheme-typed endpoint classes (mrblib/url/endpoints.rb) don't run
+  # their verbs directly — they hand the operation to an executor. SyncExec is
+  # the default and runs it immediately (today's blocking/async behaviour);
+  # URL::Batch::Exec (mrblib/url.rb) registers it for the next
+  # URL.parallel_perform instead. Same verb code, two execution modes.
+
+  # Each method hands the _build_* helpers a dup of opts (they strip keys as
+  # they consume them) and stamps the Response with a proc that re-invokes the
+  # same method — that's what Response#retry calls on a blocking verb's failed
+  # Response, re-running up to its `times` budget and stopping early on
+  # success. The stamp recurses naturally: a retried Response is stamped too.
+  module SyncExec
+    class << self
+      def fire(method, url, body, opts, &on_chunk)
+        resp = URL._fire(method, url, body, opts.dup, &on_chunk)
+        _stamp(resp) { fire(method, url, body, opts, &on_chunk) }
+      end
+
+      def transfer(url, opts, on_chunk, upload_data, post = nil)
+        resp = URL._run_transfer(url, opts.dup, on_chunk, upload_data)
+        resp = post.call(resp) if post
+        _stamp(resp) { transfer(url, opts, on_chunk, upload_data, post) }
+      end
+
+      def imap(mailbox_url, command, opts, url_suffix = nil, on_chunk = nil)
+        resp = URL._imap(mailbox_url, command, opts.dup, url_suffix, on_chunk)
+        _stamp(resp) { imap(mailbox_url, command, opts, url_suffix, on_chunk) }
+      end
+
+      def deliver(server_url, from, recipients, body, opts)
+        resp = URL._deliver(server_url, from, recipients, body, opts.dup)
+        _stamp(resp) { deliver(server_url, from, recipients, body, opts) }
+      end
+
+      def websocket(url, opts)
+        URL._open_websocket(url, opts)
+      end
+
+      private
+
+      # Blocking retry: redo the request up to `times` times, stop on the
+      # first success, hand back the last Response. Before each re-run, wait
+      # the explicit `wait`, or the seconds the server asked for in the failed
+      # response's Retry-After header, or nothing.
+      def _stamp(resp, &redo_request)
+        if resp.is_a?(URL::Response)
+          resp._retry_with(lambda { |times, wait|
+            fresh = resp
+            times.times do
+              URL._wait(wait || fresh.retry_after || 0)
+              fresh = redo_request.call
+              break unless fresh.error
+            end
+            fresh
+          })
+        end
+        resp
+      end
+    end
   end
 end

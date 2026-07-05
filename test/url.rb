@@ -423,48 +423,191 @@ end
 
 # ---- Parallel fan-out -------------------------------------------------------
 
-assert('URL.parallel runs requests concurrently, keyed, with on_complete') do
+assert('URL(uri).parallel registers; URL.parallel_perform drives, returning nothing') do
   seen = {}
-  results = URL.parallel do |p|
-    p.get("#{$base}/echo", params: { n: '1' }, key: :a)
-    p.post("#{$base}/echo", json: { x: 2 },    key: :b)
-    p.get("#{$base}/status/404",                key: :c)
-    p.on_complete { |key, resp| seen[key] = resp.code }
-  end
+  URL("#{$base}/echo").parallel(:get, params: { n: '1' }) { |r| seen[:a] = r }
+  URL("#{$base}/echo").parallel(:post, json: { x: 2 })    { |r| seen[:b] = r }
+  URL("#{$base}/status/404").parallel(:get)               { |r| seen[:c] = r }
+  assert_equal 0, seen.size            # nothing ran at registration
 
-  assert_equal 3, results.size
-  assert_kind_of URL::Response, results[:a]
-  assert_true  results[:a].success?
-  assert_equal '1',    results[:a].json['query']['n']
-  assert_equal 'POST', results[:b].json['method']
-  assert_true  results[:c].client_error?
-  assert_equal 404, results[:c].code
-  assert_kind_of URL::HttpReturnedError, results[:c].error  # HTTP error as a value, in the batch too
-  assert_equal 3,   seen.size
-  assert_equal 404, seen[:c]
+  assert_nil URL.parallel_perform      # pure driver: handlers are the only output
+
+  assert_equal 3, seen.size
+  assert_kind_of URL::Response, seen[:a]
+  assert_true  seen[:a].success?
+  assert_equal '1',    seen[:a].json['query']['n']
+  assert_equal 'POST', seen[:b].json['method']
+  assert_true  seen[:c].client_error?
+  assert_equal 404, seen[:c].code
+  assert_kind_of URL::HttpReturnedError, seen[:c].error  # HTTP error as a value, in the batch too
 end
 
-assert('URL.parallel defaults keys to submission index; duplicate URLs stay distinct') do
-  results = URL.parallel do |p|
-    p.get("#{$base}/echo")
-    p.get("#{$base}/echo")
-  end
-  assert_equal [0, 1], results.keys.sort
-  assert_true results[0].success?
-  assert_true results[1].success?
-end
-
-assert('URL.parallel yields answers as they arrive (fast lands before slow)') do
+assert('URL.parallel_perform resolves answers as they arrive (fast lands before slow)') do
   order = []
-  results = URL.parallel do |p|
-    p.get("#{$base}/slow/300", key: :slow)
-    p.get("#{$base}/echo",     key: :fast)
-    p.on_complete { |key, _resp| order << key }
+  URL("#{$base}/slow/300").parallel(:get) { |_r| order << :slow }
+  URL("#{$base}/echo").parallel(:get)     { |_r| order << :fast }
+  URL.parallel_perform
+  # Ran concurrently on one session: the instant echo completes before the
+  # 300ms one, so its handler fires first — serial dispatch would give :slow.
+  assert_equal [:fast, :slow], order
+end
+
+assert('URL(uri).parallel fans out non-HTTP verbs the same way') do
+  skip "libcurl built without file" unless URL.supports?("file")
+
+  path = File.join($state_dir, 'parallel-perform.txt')
+  File.open(path, 'wb') { |f| f.write("parallel-perform-body\n") }
+  furl = "file://#{path}"
+
+  from_file = nil
+  from_http = nil
+  URL(furl).parallel(:download)       { |r| from_file = r }
+  URL("#{$base}/echo").parallel(:get) { |r| from_http = r }
+  URL.parallel_perform
+
+  assert_nil from_file.error                       # file:// has no HTTP status
+  assert_equal "parallel-perform-body\n", from_file.body
+  assert_true from_http.success?
+end
+
+assert('URL::SCHEME.parallel mirrors the instance form') do
+  got = nil
+  URL::HTTP.parallel("#{$base}/echo", :get, params: { k: 'v' }) { |r| got = r }
+  URL.parallel_perform
+  assert_true got.success?
+  assert_equal 'v', got.json['query']['k']
+end
+
+assert('URL.parallel_perform with nothing registered is a no-op') do
+  assert_nil URL.parallel_perform
+end
+
+assert('parallel registration keeps usage errors as raises, before any I/O') do
+  # Unknown scheme raises from URL(uri) itself, as always.
+  assert_raise(URL::SchemeError) { URL("nosuchscheme://x").parallel(:get) }
+
+  # A verb the scheme doesn't have raises at registration.
+  assert_raise(ArgumentError) { URL("#{$base}/echo").parallel(:download) }
+
+  # WebSocket connect yields a live socket, not a Response — can't batch.
+  if URL.supports?("ws")
+    assert_raise(ArgumentError) { URL("ws://127.0.0.1:1/sock").parallel(:connect) }
   end
-  assert_equal 2, results.size
-  # Ran concurrently on one session: the instant echo completes before the 300ms
-  # one, so on_complete sees :fast first — serial dispatch would give :slow.
-  assert_equal :fast, order.first
+
+  # Failed registrations above must not leave stragglers behind.
+  assert_nil URL.parallel_perform
+end
+
+assert('Response#retry(times) inside a parallel handler retries within the SAME perform') do
+  codes    = []
+  outcomes = []
+  URL("#{$base}/status/500").parallel(:get) do |r|
+    codes << r.code
+    outcomes << r.retry(2) if r.error     # budget rides with the registration —
+  end                                     # no hand-rolled attempt counter needed
+  URL.parallel_perform                    # one call drives all three rounds
+  assert_equal [500, 500, 500], codes     # initial + 2 retries, same handler each time
+  assert_equal false, outcomes.last       # exhausted budget: retry refused, perform drained
+  assert_nil URL.parallel_perform         # nothing left pending
+end
+
+assert('Response#retry defaults to a single retry') do
+  codes = []
+  URL("#{$base}/status/500").parallel(:get) do |r|
+    codes << r.code
+    r.retry if r.error                    # times defaults to 1
+  end
+  URL.parallel_perform
+  assert_equal [500, 500], codes
+end
+
+assert('Response#retry preserves the verb arguments across retry rounds') do
+  urls = []
+  first = true
+  URL("#{$base}/status/404").parallel(:get, params: { n: '1' }) do |r|
+    urls << r.effective_url
+    if first
+      first = false
+      r.retry                             # opts must survive the rebuild
+    end
+  end
+  URL.parallel_perform
+  assert_equal 2, urls.size
+  assert_include urls[0], 'n=1'
+  assert_include urls[1], 'n=1'
+end
+
+assert('a parallel Response cannot be retried once its handler returned') do
+  escaped = nil
+  URL("#{$base}/status/500").parallel(:get) { |r| escaped = r }
+  URL.parallel_perform
+  assert_kind_of URL::HttpReturnedError, escaped.error
+  err = assert_raise(URL::Error) { escaped.retry }
+  assert_include err.message, 'handler'
+  assert_nil URL.parallel_perform         # nothing was registered by the refusal
+end
+
+assert('Response#retry re-runs a failed blocking request and returns the new Response') do
+  r = URL("#{$base}/status/500").get
+  assert_kind_of URL::HttpReturnedError, r.error
+  r2 = r.retry                            # blocking origin: redo now
+  assert_kind_of URL::Response, r2
+  assert_false r.equal?(r2)
+  assert_equal 500, r2.code
+  r3 = r2.retry(3)                        # up to 3 re-runs, returns the last Response
+  assert_kind_of URL::Response, r3
+  assert_equal 500, r3.code
+  assert_raise(ArgumentError) { r.retry(0) }     # the budget must be an Integer >= 1
+  assert_raise(ArgumentError) { r.retry("2") }
+end
+
+assert('Response#retry on a blocking request preserves the verb arguments') do
+  r = URL("#{$base}/status/404").get(params: { n: '1' })
+  assert_include r.effective_url, 'n=1'
+  r2 = r.retry
+  assert_include r2.effective_url, 'n=1'  # opts were not consumed by round one
+end
+
+assert('Response#retry_after surfaces the server\'s Retry-After header') do
+  r = URL("#{$base}/retry-after/2").get
+  assert_equal 503, r.code
+  assert_equal 2, r.retry_after            # libcurl parsed the header
+  assert_nil URL("#{$base}/echo").get.retry_after   # absent header -> nil
+end
+
+assert('Response#retry honors wait: and the server\'s Retry-After') do
+  # Explicit wait: short pause, blocking retry still works end to end.
+  r = URL("#{$base}/status/500").get
+  r2 = r.retry(wait: 100.ms)
+  assert_equal 500, r2.code
+
+  # No wait: given -> the server-sent Retry-After (here 1s) is used between
+  # rounds. One retry of the 503 must therefore take >= 1s wall time; the
+  # transfers themselves are instant, so total_time is a lower-bound proxy
+  # only for the request, not the wait — assert behaviour, not the clock:
+  # the retry completes and still reports the 503 + its Retry-After.
+  r3 = URL("#{$base}/retry-after/1").get.retry
+  assert_equal 503, r3.code
+  assert_equal 1, r3.retry_after
+
+  # Parallel: wait riding on the resubmission; drains within one perform.
+  codes = []
+  URL("#{$base}/retry-after/1").parallel(:get) do |resp|
+    codes << resp.code
+    resp.retry(1, wait: 50.ms) if resp.error   # explicit wait overrides the 1s ask
+  end
+  URL.parallel_perform
+  assert_equal [503, 503], codes
+
+  # Validation: wait must be a non-negative duration/seconds.
+  assert_raise(ArgumentError) { r.retry(wait: -1) }
+  assert_raise(ArgumentError) { r.retry(wait: :soon) }
+end
+
+assert('Response#retry is for failures only — a success raises') do
+  r = URL("#{$base}/echo").get
+  err = assert_raise(URL::Error) { r.retry }
+  assert_include err.message, 'nothing to retry'
 end
 
 # ---- SMTPS via URL.send: the upload/read path on an RFC-named verb ---------

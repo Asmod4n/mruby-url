@@ -119,13 +119,12 @@ end
 puts
 puts "8. parallel fan-out — each Response carries its own error value,"
 puts "   so one failure never derails the others"
-results = URL.parallel do |p|
-  p.get("#{BASE}/status/200", key: :ok,   timeout: 15.s)
-  p.get("#{BASE}/status/500", key: :http, timeout: 15.s)
-  p.get("https://no-such-host.invalid/",  key: :dns)
-  p.get("#{BASE}/delay/10",   key: :slow, timeout: 800.ms)
-end
-results.each do |key, r|
+report = lambda do |key, r|
   outcome = r.error ? "#{r.error.class}" : "ok #{r.code}"
   puts "   #{key.to_s.ljust(5)} -> #{outcome}"
 end
+URL("#{BASE}/status/200").parallel(:get, timeout: 15.s)  { |r| report.call(:ok,   r) }
+URL("#{BASE}/status/500").parallel(:get, timeout: 15.s)  { |r| report.call(:http, r) }
+URL("https://no-such-host.invalid/").parallel(:get)      { |r| report.call(:dns,  r) }
+URL("#{BASE}/delay/10").parallel(:get, timeout: 800.ms)  { |r| report.call(:slow, r) }
+URL.parallel_perform

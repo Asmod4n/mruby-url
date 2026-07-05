@@ -253,17 +253,15 @@ else
 end
 
 # ---------------------------------------------------------------------------
-section "10. Parallel fan-out — URL.parallel"
+section "10. Parallel fan-out — URL(uri).parallel + URL.parallel_perform"
 # ---------------------------------------------------------------------------
-# Queue requests on the yielded batch (same verbs as URL, each with an optional
-# key:); they run concurrently on one session and come back as { key => Response }.
-# on_complete fires per response the moment its transfer lands.
-results = URL.parallel do |p|
-  p.get("#{BASE}/get",            key: :a)
-  p.post("#{BASE}/post", json: {}, key: :b)
-  p.on_complete { |key, resp| puts "  landed #{key}: #{resp.code}" }
-end
-puts "parallel keys: #{results.keys.inspect}"
+# Register transfers with parallel(:verb, ...) — no I/O yet — then drive them
+# all concurrently on one session with URL.parallel_perform. Each registered
+# block receives its resolved Response the moment the transfer lands;
+# parallel_perform itself returns nothing — it only drives.
+URL("#{BASE}/get").parallel(:get)             { |r| puts "  landed a: #{r.code}" }
+URL("#{BASE}/post").parallel(:post, json: {}) { |r| puts "  landed b: #{r.code}" }
+URL.parallel_perform
 
 # ---------------------------------------------------------------------------
 section "11. Sessions & the connection pool"

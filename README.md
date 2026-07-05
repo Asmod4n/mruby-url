@@ -213,7 +213,7 @@ data = URL("https://api.example.com/data").get.raise_for_status!.json
 ```
 
 This is uniform across the whole gem: the same `resp.error` value model applies
-to every verb, every protocol, and each `URL::Response` returned by `URL.parallel`
+to every verb, every protocol, and each `URL::Response` a parallel handler receives
 — one failing request never derails the others. (Runnable tour:
 `examples/error_handling.rb`.)
 
@@ -250,25 +250,59 @@ end
 
 ## Parallel fan-out
 
-`URL.parallel` drives many requests concurrently on one session — the
-connection pool, TLS sessions and HTTP/2 multiplexing all carry over —
-and collects the responses keyed however you want:
+Register transfers with `parallel(:verb, ...)` — any scheme, any verb the
+scheme's wrapper has, with the verb's normal arguments — then drive them all
+concurrently on one session with `URL.parallel_perform` (connection pool, TLS
+sessions and HTTP/2 multiplexing all carry over). Registration runs no I/O;
+each transfer's resolved `URL::Response` is passed to the block it was
+registered with, as it completes:
 
 ```ruby
-results = URL.parallel do |p|
-  p.get("https://a.example/feed",  key: :feed)
-  p.post("https://b.example/login", key: :login, json: creds)
-  p.get("ftp://h/manifest.txt",     key: :manifest)
-  p.on_complete { |key, resp| warm[key] = resp }   # live, as they finish
-end
-results[:feed].json
-results[:login].json
+URL("https://a.example/feed").parallel(:get)                 { |r| feed  = r.json }
+URL("https://b.example/login").parallel(:post, json: creds)  { |r| token = r }
+URL("ftp://h/manifest.txt").parallel(:download)              { |r| manifest = r.body }
+URL("imaps://h/INBOX").parallel(:fetch, uid: 1)              { |r| mail  = r.body }
+
+URL.parallel_perform   # pure driver, returns nothing — the handler blocks are
+                       # where the Responses arrive, as each transfer lands
 ```
 
-Runtime failures stay values (`resp.error`); only usage errors (unknown
-scheme, missing protocol) raise. A re-entrant call from inside one of the
-on-complete handlers falls back to a throwaway session, the same way the
-blocking verbs do.
+The class-level form mirrors it: `URL::HTTPS.parallel("https://x", :get) { |r| ... }`.
+
+Usage errors raise at registration, before any I/O — a verb the scheme
+doesn't have, an unknown scheme, a protocol this libcurl wasn't built with.
+WebSocket `connect` can't be registered (it returns a live socket, not a
+`Response`) and raises `ArgumentError`. Runtime failures stay values
+(`resp.error` on the delivered Response), exactly like the blocking verbs; a
+verb called from inside a handler runs immediately on a throwaway session,
+the same re-entrancy rule as everywhere else.
+
+Every **failed** `URL::Response` can redo its request with `retry` — same
+URL, verb and arguments. A blocking verb's Response re-runs right there and
+returns the fresh Response; a parallel Response resubmits its transfer (with
+the same handler) for the *next* perform — and can do so **only inside its
+handler block**, the one place a parallel Response exists:
+
+```ruby
+r = URL("https://x").get
+r = r.retry(3) if r.error                 # blocking: up to 3 immediate re-runs,
+                                          # stops on success, returns the last Response
+
+URL("https://x").parallel(:get) do |r|
+  r.retry(3) if r.error                   # parallel: budget rides with the transfer
+end
+URL.parallel_perform                      # one call — retries run as extra rounds;
+                                          # after 3 resubmissions retry returns false
+                                          # and the perform drains
+```
+
+`times` defaults to 1. `wait:` sets the pause before each re-run (any chrono
+duration or seconds — `500.ms`, `2.s`). When omitted, the server decides:
+429/503 responses often carry a `Retry-After` header, libcurl parses it
+(exposed as `resp.retry_after`, in seconds, `nil` when absent), and the retry
+waits exactly that long — no header, no wait. `retry` is for failures only —
+on a Response whose `error` is nil it raises `URL::Error`, and so does
+retrying a parallel Response after its handler has returned.
 
 ## Other protocols
 
@@ -432,7 +466,10 @@ URL.shared.setopt(:max_total_connections,  256)
 
 ## Integrating a real event loop
 
-By default the verbs block on a built-in `IO.select` loop. To drive
+By default the verbs block on a built-in driver that rides libcurl's own
+event-less multi API (`curl_multi_perform` + `curl_multi_poll`) — libcurl
+tracks every fd and timeout internally, so nothing platform-specific runs in
+Ruby. To drive
 transfers on a platform loop (glib, libuv, …) instead, subclass
 `URL::EventLoop` and implement four primitives:
 
@@ -462,27 +499,31 @@ or set it per session via `session.event_loop = my_loop`.
 
 ### Driving a session by hand
 
-`URL::IOSelectLoop` is the built-in `EventLoop` subclass. You can wire a
-session, requests and a loop together yourself when you want IO.select but
-custom orchestration:
+`URL::IOSelectLoop` is the reference `EventLoop` implementation — the
+blocking verbs don't use it (they ride libcurl's `curl_multi_perform`/`poll`
+directly), it exists as the example of what an integration must provide:
+store the fds and timer the session asks for, and fire the blocks it handed
+you when they're ready. Nothing else; `socket_action`, completion reaping and
+timeout bookkeeping all live in the session, so every integration gets them
+for free.
 
 ```ruby
 session = URL.open
-loop    = URL::IOSelectLoop.new(session)
+loop    = URL::IOSelectLoop.new
 session.event_loop = loop
 
 req = URL::Request._open(session, "https://example.com")
 req.on_data { |chunk| sink(chunk) }
 session.add(req)
+session.socket_action   # kick off: registers fds/timers with the loop
 
-loop.run do |completed_req, code|       # one call per completion
-  # code == 0 => CURLE_OK
-end
+loop.run                # pumps IO.select, firing the session's blocks,
+                        # until nothing is watched and no timer is armed
 ```
 
-`loop.run_until(target) { |req, code| ... }` drives only until `target`
-completes — needed for the shared session, whose kept-alive sockets outlive
-any single request.
+A real platform loop has no `run` of its own to call — its host application's
+loop plays that role; it only implements `watch`/`unwatch`/`arm_timer`/
+`cancel_timer` exactly as `IOSelectLoop` does.
 
 ## Options reference
 
