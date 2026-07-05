@@ -71,6 +71,14 @@ server.mount_proc('/multipart') do |req, res|
 end
 
 # /status/418 -> 418, etc. Covers success?/client_error?/server_error?.
+# /retry-after/2 -> 503 with "Retry-After: 2", the way overloaded servers ask
+# clients to back off. Exercises CURLINFO_RETRY_AFTER -> Response#retry_after.
+server.mount_proc('/retry-after') do |req, res|
+  res.status = 503
+  res['Retry-After'] = req.path.split('/').last
+  res.body = 'busy'
+end
+
 server.mount_proc('/status') do |req, res|
   res.status = req.path.split('/').last.to_i
   res.body   = ''

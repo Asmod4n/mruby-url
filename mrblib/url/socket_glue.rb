@@ -10,7 +10,7 @@
 class URL
   # Called once per recorded socket change. `what` is :in / :out / :inout, or
   # :remove. @_action_block is the C-provided proc the loop invokes when the
-  # fd becomes ready; IOSelectLoop ignores it, a platform loop stores it.
+  # fd becomes ready; every EventLoop integration stores and later fires it.
   def _socket_ready(fd, what)
     sockets = (@sockets ||= {})
 
