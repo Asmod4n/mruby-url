@@ -14,6 +14,28 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Fail fast if a tool-generated session URL sneaks into the tree or into a
+  # commit message — those identifiers must never be published (see the
+  # history-rewrite note in the README). The tree grep excludes this workflow
+  # (it must name the patterns) and the README (it documents the rewrite).
+  hygiene:
+    name: no session URLs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 50
+      - name: Reject session URLs in files and recent commit messages
+        run: |
+          set -e
+          pattern='claude\.ai/code|session_01|Claude-Session:'
+          if git grep -nE "$pattern" -- . ':!.github/workflows/ci.yml' ':!README.md'; then
+            echo '::error::session URL found in the tree'; exit 1
+          fi
+          if git log -50 --format=%B | grep -nE "$pattern"; then
+            echo '::error::session URL found in a commit message'; exit 1
+          fi
+
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
