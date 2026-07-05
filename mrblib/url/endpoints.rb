@@ -20,7 +20,7 @@
 # Each verb hands its operation to an executor (@exec) instead of calling the
 # engine helpers in dispatch.rb directly. URL::SyncExec — the default — runs
 # it immediately (via _fire, _run_transfer, _imap, _deliver,
-# _open_websocket); URL::Batch::Exec registers the same operation for the
+# _open_websocket); URL::BatchExec registers the same operation for the
 # next URL.parallel_perform, which is what SchemeKwargs#parallel builds its
 # queueing copy with. Plain Ruby — no define_singleton_method, no
 # method_missing.
@@ -58,14 +58,12 @@ class URL
       if verb == :parallel || !respond_to?(verb)
         raise ArgumentError, "#{self.class} has no verb #{verb.inspect}"
       end
-      batch  = URL._pending_batch
-      queued = self.class.new(@uri, URL::Batch::Exec.new(batch, nil))
-      key = if opts.empty?
-              queued.__send__(verb, *args)
-            else
-              queued.__send__(verb, *args, **opts)
-            end
-      batch._handler(key, on_response)
+      queued = self.class.new(@uri, URL::BatchExec.new(URL._pending, on_response))
+      if opts.empty?
+        queued.__send__(verb, *args)
+      else
+        queued.__send__(verb, *args, **opts)
+      end
       self
     end
 
@@ -428,7 +426,7 @@ class URL
   # before any I/O for a scheme this libcurl can't speak: "protocol not
   # available" when it's a real protocol just not compiled in, "unsupported
   # scheme" when it isn't a scheme the gem knows at all. `exec` is internal:
-  # SchemeKwargs#parallel builds its queueing copy with a Batch::Exec so the
+  # SchemeKwargs#parallel builds its queueing copy with a BatchExec so the
   # verb registers instead of runs.
   def self.call(uri, exec = URL::SyncExec)
     scheme = _scheme_of(uri)

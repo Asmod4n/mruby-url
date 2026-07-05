@@ -53,10 +53,11 @@ class URL::WebSocket
   # (0 on success). A non-zero code — or a missing active socket — yields a
   # closed socket carrying the failure as a value on #error; nothing is raised.
   def initialize(req, error_code = 0)
-    @req   = req
-    @error = nil
+    @req    = req            # keeps the easy handle (and its connection) alive
+    @handle = req.handle
+    @error  = nil
 
-    fd = error_code == 0 ? req.activesocket : nil
+    fd = error_code == 0 ? URL::Libcurl.easy_getinfo(@handle, :activesocket) : nil
     if error_code == 0 && fd
       @fd = fd                # libcurl owns this fd; we only wait on it
       # A bare multi handle used purely as libcurl's portable waiting
@@ -187,12 +188,12 @@ class URL::WebSocket
   # common "server answered with a page instead of upgrading" case reads clearly
   # instead of curl's opaque "HTTP response code said error".
   def _build_connect_error(error_code)
-    where  = @req.effective_url
-    status = @req.response_code rescue nil
+    where  = URL::Libcurl.easy_getinfo(@handle, :effective_url)
+    status = URL::Libcurl.easy_getinfo(@handle, :response_code) rescue nil
     upgrade_refused = status && status >= 100 && status != 101
 
     if error_code != 0
-      detail = URL::Request.strerror(error_code)
+      detail = URL::Libcurl.easy_strerror(error_code)
       msg =
         if upgrade_refused
           "websocket upgrade refused: server replied HTTP #{status} " \
@@ -219,7 +220,7 @@ class URL::WebSocket
   # libcurl's own portable wait; a nil timeout blocks in 1s slices.
   def _recv_chunk(timeout)
     loop do
-      frame = @req.ws_recv(RECV_CHUNK)
+      frame = URL::Libcurl.easy_ws_recv(@handle, RECV_CHUNK)
       return frame if frame
 
       if timeout
@@ -253,7 +254,7 @@ class URL::WebSocket
   # (ws_send => nil). Returns [bytes_accepted, flags_used] for this call.
   def _send_once(data, flags)
     loop do
-      r = @req.ws_send(data, flags, 0)
+      r = URL::Libcurl.easy_ws_send(@handle, data, flags, 0)
       return r if r
 
       URL::Libcurl.multi_poll(@wait_multi, 1000, @fd, :out)

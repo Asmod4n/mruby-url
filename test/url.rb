@@ -176,7 +176,7 @@ assert('a duped handle gets its OWN copy of the source header slist') do
 end
 
 assert('URL::Request#dup gives an independent easy handle') do
-  a = URL::Request._open(URL.shared, "#{$base}/echo")
+  a = URL::Request.new(URL.shared, "#{$base}/echo")
   b = a.dup
   assert_not_equal a.handle.object_id, b.handle.object_id
   assert_kind_of URL::Libcurl::Easy, b.handle

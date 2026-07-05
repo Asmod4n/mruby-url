@@ -13,6 +13,4 @@ class URL::TransferState
     @error_code  = 0
   end
 
-  def append_body(chunk);  @body << chunk;       end
-  def append_header(line); @raw_headers << line; end
 end
