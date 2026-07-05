@@ -73,6 +73,25 @@ jobs:
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
 
+      # Cache the vendored libcurl build. The install prefix is all the gem
+      # consumes (headers + static lib), so it lives outside mruby's build dir
+      # (which `rake` recreates) and is keyed on the exact deps/curl submodule
+      # commit — a curl bump busts the cache, nothing else does. mrbgem.rake
+      # skips the whole CMake build when the prefix is already populated.
+      - name: Windows — vendored libcurl cache key
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $sha = git rev-parse HEAD:deps/curl
+          echo "CURL_SUBMODULE_SHA=$sha" >> $env:GITHUB_ENV
+          echo "MURL_CURL_INSTALL=$env:GITHUB_WORKSPACE\curl-prebuilt" >> $env:GITHUB_ENV
+      - name: Windows — cache vendored libcurl
+        if: runner.os == 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: curl-prebuilt
+          key: libcurl-msvc-${{ env.CURL_SUBMODULE_SHA }}-v1
+
       # Force the MSVC toolchain explicitly via the dedicated build config, rather
       # than relying on mruby's env auto-detection (which falls back to gcc when no
       # VS environment is detected).

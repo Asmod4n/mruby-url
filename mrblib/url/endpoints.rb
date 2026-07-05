@@ -17,9 +17,13 @@
 # /file family has no single primary scheme); the parents that *are* their own
 # primary protocol (HTTP, IMAP, …) are gated like any other.
 #
-# Each verb dispatches into the engine helpers in dispatch.rb (_fire,
-# _run_transfer, _imap, _build_mail_request, _open_websocket). Plain Ruby —
-# no define_singleton_method, no method_missing.
+# Each verb hands its operation to an executor (@exec) instead of calling the
+# engine helpers in dispatch.rb directly. URL::SyncExec — the default — runs
+# it immediately (via _fire, _run_transfer, _imap, _deliver,
+# _open_websocket); URL::Batch::Exec registers the same operation for the
+# next URL.parallel_perform, which is what SchemeKwargs#parallel builds its
+# queueing copy with. Plain Ruby — no define_singleton_method, no
+# method_missing.
 #
 # Kwargs are owned per scheme. Each class lists in KWARGS the *high-level*
 # convenience kwargs it handles; _ck rejects a high-level kwarg owned by another
@@ -38,6 +42,33 @@ class URL
   end
 
   module SchemeKwargs
+    # Register this URL's `verb` for the next URL.parallel_perform instead of
+    # running it now. Takes the verb's normal arguments and kwargs; the block
+    # is called with the resolved URL::Response once the transfer completes
+    # during parallel_perform (it is NOT the sync verbs' streaming block —
+    # inside a batch the body is buffered into the Response). Argument errors
+    # raise here, at registration, before any I/O; the transfer itself starts
+    # only inside URL.parallel_perform. Returns self, so several
+    # registrations on one URL can chain.
+    #
+    #   URL("ftp://h/a.txt").parallel(:download) { |resp| save(resp.body) }
+    #   URL("https://h/b").parallel(:get)        { |resp| use(resp.json) }
+    #   URL.parallel_perform
+    def parallel(verb, *args, **opts, &on_response)
+      if verb == :parallel || !respond_to?(verb)
+        raise ArgumentError, "#{self.class} has no verb #{verb.inspect}"
+      end
+      batch  = URL._pending_batch
+      queued = self.class.new(@uri, URL::Batch::Exec.new(batch, nil))
+      key = if opts.empty?
+              queued.__send__(verb, *args)
+            else
+              queued.__send__(verb, *args, **opts)
+            end
+      batch._handler(key, on_response)
+      self
+    end
+
     private
 
     def _ck(opts)
@@ -51,15 +82,15 @@ class URL
       include URL::SchemeKwargs
       KWARGS = %i[params json form multipart auth bearer headers].freeze
 
-      def initialize(uri); @uri = uri.to_s; URL._require_protocol!(@uri); end
+      def initialize(uri, exec = URL::SyncExec); @uri = uri.to_s; @exec = exec; URL._require_protocol!(@uri); end
 
-      def get(**o, &b);                URL._fire(:GET,     @uri, nil,  _ck(o), &b); end
-      def head(**o, &b);               URL._fire(:HEAD,    @uri, nil,  _ck(o), &b); end
-      def options(**o, &b);            URL._fire(:OPTIONS, @uri, nil,  _ck(o), &b); end
-      def delete(body = nil, **o, &b); URL._fire(:DELETE,  @uri, body, _ck(o), &b); end
-      def post(body = nil, **o, &b);   URL._fire(:POST,    @uri, body, _ck(o), &b); end
-      def put(body = nil, **o, &b);    URL._fire(:PUT,     @uri, body, _ck(o), &b); end
-      def patch(body = nil, **o, &b);  URL._fire(:PATCH,   @uri, body, _ck(o), &b); end
+      def get(**o, &b);                @exec.fire(:GET,     @uri, nil,  _ck(o), &b); end
+      def head(**o, &b);               @exec.fire(:HEAD,    @uri, nil,  _ck(o), &b); end
+      def options(**o, &b);            @exec.fire(:OPTIONS, @uri, nil,  _ck(o), &b); end
+      def delete(body = nil, **o, &b); @exec.fire(:DELETE,  @uri, body, _ck(o), &b); end
+      def post(body = nil, **o, &b);   @exec.fire(:POST,    @uri, body, _ck(o), &b); end
+      def put(body = nil, **o, &b);    @exec.fire(:PUT,     @uri, body, _ck(o), &b); end
+      def patch(body = nil, **o, &b);  @exec.fire(:PATCH,   @uri, body, _ck(o), &b); end
 
       def self.get(uri, **o, &b);                 new(uri).get(**o, &b); end
       def self.head(uri, **o, &b);                new(uri).head(**o, &b); end
@@ -68,6 +99,7 @@ class URL
       def self.post(uri, body = nil, **o, &b);    new(uri).post(body, **o, &b); end
       def self.put(uri, body = nil, **o, &b);     new(uri).put(body, **o, &b); end
       def self.patch(uri, body = nil, **o, &b);   new(uri).patch(body, **o, &b); end
+      def self.parallel(uri, verb, *a, **o, &b);  new(uri).parallel(verb, *a, **o, &b); end
     end
     class HTTPS < HTTP; end if supports?("https")
   end
@@ -79,21 +111,22 @@ class URL
     include URL::SchemeKwargs
     KWARGS = %i[params headers].freeze
 
-    def initialize(uri); @uri = uri.to_s; URL._require_protocol!(@uri); end
+    def initialize(uri, exec = URL::SyncExec); @uri = uri.to_s; @exec = exec; URL._require_protocol!(@uri); end
 
     def download(**o, &b)
-      URL._run_transfer(@uri, _ck(o), b, nil)
+      @exec.transfer(@uri, _ck(o), b, nil)
     end
     def upload(data, **o)
-      URL._run_transfer(@uri, _ck(o), nil, data)
+      @exec.transfer(@uri, _ck(o), nil, data)
     end
     def list(**o)
-      URL._run_transfer(@uri, _ck(o).merge(dirlistonly: true), nil, nil)
+      @exec.transfer(@uri, _ck(o).merge(dirlistonly: true), nil, nil)
     end
 
     def self.download(uri, **o, &b); new(uri).download(**o, &b); end
     def self.upload(uri, data, **o); new(uri).upload(data, **o); end
     def self.list(uri, **o);         new(uri).list(**o); end
+    def self.parallel(uri, verb, *a, **o, &b); new(uri).parallel(verb, *a, **o, &b); end
   end
   class FTP    < Transfer; end if supports?("ftp")
   class FTPS   < Transfer; end if supports?("ftps")
@@ -109,15 +142,16 @@ class URL
       include URL::SchemeKwargs
       KWARGS = %i[params headers].freeze
 
-      def initialize(uri); @uri = uri.to_s; URL._require_protocol!(@uri); end
+      def initialize(uri, exec = URL::SyncExec); @uri = uri.to_s; @exec = exec; URL._require_protocol!(@uri); end
 
       def get(**o, &b)
-        URL._run_transfer(@uri, _ck(o), b, nil)
+        @exec.transfer(@uri, _ck(o), b, nil)
       end
       alias download get
 
       def self.get(uri, **o, &b);      new(uri).get(**o, &b); end
       def self.download(uri, **o, &b); new(uri).download(**o, &b); end
+      def self.parallel(uri, verb, *a, **o, &b); new(uri).parallel(verb, *a, **o, &b); end
     end
     class GOPHERS < GOPHER; end if supports?("gophers")
   end
@@ -128,15 +162,16 @@ class URL
       include URL::SchemeKwargs
       KWARGS = %i[params headers].freeze
 
-      def initialize(uri); @uri = uri.to_s; URL._require_protocol!(@uri); end
+      def initialize(uri, exec = URL::SyncExec); @uri = uri.to_s; @exec = exec; URL._require_protocol!(@uri); end
 
       def define(word, database: "!", **o)
         base = @uri
         base = base[0..-2] while base.end_with?("/")
-        URL._run_transfer("#{base}/d:#{word}:#{database}", _ck(o), nil, nil)
+        @exec.transfer("#{base}/d:#{word}:#{database}", _ck(o), nil, nil)
       end
 
       def self.define(uri, word, database: "!", **o); new(uri).define(word, database: database, **o); end
+      def self.parallel(uri, verb, *a, **o, &b);       new(uri).parallel(verb, *a, **o, &b); end
     end
   end
 
@@ -146,25 +181,26 @@ class URL
       include URL::SchemeKwargs
       KWARGS = [].freeze   # mailbox/uid/flags are explicit verb args
 
-      def initialize(uri); @uri = uri.to_s; URL._require_protocol!(@uri); end
+      def initialize(uri, exec = URL::SyncExec); @uri = uri.to_s; @exec = exec; URL._require_protocol!(@uri); end
 
       def fetch(uid:, **o, &b)
-        URL._imap(@uri, nil, _ck(o), ";UID=#{uid}", b)
+        @exec.imap(@uri, nil, _ck(o), ";UID=#{uid}", b)
       end
       def move(uid:, to:, **o)
-        URL._imap(@uri, "UID MOVE #{uid} #{to}", _ck(o))
+        @exec.imap(@uri, "UID MOVE #{uid} #{to}", _ck(o))
       end
       def store(uid:, flags:, op: "+", **o)
-        URL._imap(@uri, "UID STORE #{uid} #{op}FLAGS (#{flags})", _ck(o))
+        @exec.imap(@uri, "UID STORE #{uid} #{op}FLAGS (#{flags})", _ck(o))
       end
       def expunge(**o)
-        URL._imap(@uri, "EXPUNGE", _ck(o))
+        @exec.imap(@uri, "EXPUNGE", _ck(o))
       end
 
       def self.fetch(uri, uid:, **o, &b);              new(uri).fetch(uid: uid, **o, &b); end
       def self.move(uri, uid:, to:, **o);              new(uri).move(uid: uid, to: to, **o); end
       def self.store(uri, uid:, flags:, op: "+", **o); new(uri).store(uid: uid, flags: flags, op: op, **o); end
       def self.expunge(uri, **o);                      new(uri).expunge(**o); end
+      def self.parallel(uri, verb, *a, **o, &b);       new(uri).parallel(verb, *a, **o, &b); end
     end
     class IMAPS < IMAP; end if supports?("imaps")
   end
@@ -175,10 +211,10 @@ class URL
       include URL::SchemeKwargs
       KWARGS = %i[params headers].freeze
 
-      def initialize(uri); @uri = uri.to_s; URL._require_protocol!(@uri); end
+      def initialize(uri, exec = URL::SyncExec); @uri = uri.to_s; @exec = exec; URL._require_protocol!(@uri); end
 
       def list(**o)
-        URL._run_transfer(@uri, _ck(o).merge(dirlistonly: true), nil, nil)
+        @exec.transfer(@uri, _ck(o).merge(dirlistonly: true), nil, nil)
       end
       def fetch(n = nil, **o, &b)
         target = @uri
@@ -187,13 +223,14 @@ class URL
           base = base[0..-2] while base.end_with?("/")
           target = "#{base}/#{n}"
         end
-        URL._run_transfer(target, _ck(o), b, nil)
+        @exec.transfer(target, _ck(o), b, nil)
       end
       def download(n = nil, **o, &b); fetch(n, **o, &b); end
 
       def self.list(uri, **o);                  new(uri).list(**o); end
       def self.fetch(uri, n = nil, **o, &b);    new(uri).fetch(n, **o, &b); end
       def self.download(uri, n = nil, **o, &b); new(uri).download(n, **o, &b); end
+      def self.parallel(uri, verb, *a, **o, &b); new(uri).parallel(verb, *a, **o, &b); end
     end
     class POP3S < POP3; end if supports?("pop3s")
   end
@@ -204,18 +241,16 @@ class URL
       include URL::SchemeKwargs
       KWARGS = [].freeze   # from:/to:/body are explicit
 
-      def initialize(uri); @uri = uri.to_s; URL._require_protocol!(@uri); end
+      def initialize(uri, exec = URL::SyncExec); @uri = uri.to_s; @exec = exec; URL._require_protocol!(@uri); end
 
       def deliver(body, from:, to:, **opts)
         _ck(opts)
-        session = URL.shared
-        session = URL.open if session._busy?
         recipients = to.is_a?(Array) ? to : [to]
-        req, state = URL._build_mail_request(session, @uri, from, recipients, body, opts)
-        URL._drive_sync(session, @uri, req, state)
+        @exec.deliver(@uri, from, recipients, body, opts)
       end
 
       def self.deliver(uri, body, from:, to:, **o); new(uri).deliver(body, from: from, to: to, **o); end
+      def self.parallel(uri, verb, *a, **o, &b);    new(uri).parallel(verb, *a, **o, &b); end
     end
     class SMTPS < SMTP; end if supports?("smtps")
   end
@@ -226,13 +261,14 @@ class URL
       include URL::SchemeKwargs
       KWARGS = %i[params headers].freeze
 
-      def initialize(uri); @uri = uri.to_s; URL._require_protocol!(@uri); end
+      def initialize(uri, exec = URL::SyncExec); @uri = uri.to_s; @exec = exec; URL._require_protocol!(@uri); end
 
       def search(**o)
-        URL._run_transfer(@uri, _ck(o), nil, nil)
+        @exec.transfer(@uri, _ck(o), nil, nil)
       end
 
       def self.search(uri, **o); new(uri).search(**o); end
+      def self.parallel(uri, verb, *a, **o, &b); new(uri).parallel(verb, *a, **o, &b); end
     end
     class LDAPS < LDAP; end if supports?("ldaps")
   end
@@ -243,26 +279,33 @@ class URL
       include URL::SchemeKwargs
       KWARGS = %i[params headers].freeze
 
-      def initialize(uri); @uri = uri.to_s; URL._require_protocol!(@uri); end
+      def initialize(uri, exec = URL::SyncExec); @uri = uri.to_s; @exec = exec; URL._require_protocol!(@uri); end
 
       def publish(payload, **o)
-        URL._run_transfer(@uri, _ck(o).merge(post_fields: payload.to_s), nil, nil)
+        @exec.transfer(@uri, _ck(o).merge(post_fields: payload.to_s), nil, nil)
       end
 
       def subscribe(timeout: 5.0, **o)
-        resp    = URL._run_transfer(@uri, _ck(o).merge(timeout: timeout), nil, nil)
-        payload = URL._mqtt_payload(resp.body)
-        ecode = (resp.error_code == 28 && payload && !payload.empty?) ? 0 : resp.error_code
-        URL::Response.new(
-          url: @uri, effective_url: resp.effective_url, code: resp.code,
-          body: payload || "", raw_headers: resp.raw_headers,
-          total_time: resp.total_time, content_type: resp.content_type,
-          error_code: ecode
-        )
+        # The payload rewrap rides along as a post-processing step so it runs
+        # after the transfer completes in both execution modes (sync and
+        # parallel).
+        uri  = @uri
+        post = lambda do |resp|
+          payload = URL._mqtt_payload(resp.body)
+          ecode = (resp.error_code == 28 && payload && !payload.empty?) ? 0 : resp.error_code
+          URL::Response.new(
+            url: uri, effective_url: resp.effective_url, code: resp.code,
+            body: payload || "", raw_headers: resp.raw_headers,
+            total_time: resp.total_time, content_type: resp.content_type,
+            error_code: ecode, retry_after: resp.retry_after
+          )
+        end
+        @exec.transfer(@uri, _ck(o).merge(timeout: timeout), nil, nil, post)
       end
 
       def self.publish(uri, payload, **o);  new(uri).publish(payload, **o); end
       def self.subscribe(uri, **o);         new(uri).subscribe(**o); end
+      def self.parallel(uri, verb, *a, **o, &b); new(uri).parallel(verb, *a, **o, &b); end
     end
     class MQTTS < MQTT; end if supports?("mqtts")
   end
@@ -278,7 +321,7 @@ class URL
         teardown: 7, get_parameter: 8, set_parameter: 9, record: 10, receive: 11,
       }.freeze
 
-      def initialize(uri); @uri = uri.to_s; URL._require_protocol!(@uri); end
+      def initialize(uri, exec = URL::SyncExec); @uri = uri.to_s; @exec = exec; URL._require_protocol!(@uri); end
 
       def options(transport: nil, stream_uri: nil, **o);         _request(:options,         transport, stream_uri, o); end
       def describe(transport: nil, stream_uri: nil, **o);        _request(:describe,        transport, stream_uri, o); end
@@ -301,6 +344,7 @@ class URL
       def self.set_parameter(uri, **o);  new(uri).set_parameter(**o); end
       def self.announce(uri, **o);       new(uri).announce(**o); end
       def self.record(uri, **o);         new(uri).record(**o); end
+      def self.parallel(uri, verb, *a, **o, &b); new(uri).parallel(verb, *a, **o, &b); end
 
       private
 
@@ -309,7 +353,7 @@ class URL
         opts = _ck(opts).merge(rtsp_request: enum)
         opts[:rtsp_stream_uri] = stream_uri if stream_uri
         opts[:rtsp_transport]  = transport  if transport
-        URL._run_transfer(@uri, opts, nil, nil)
+        @exec.transfer(@uri, opts, nil, nil)
       end
     end
   end
@@ -320,10 +364,10 @@ class URL
       include URL::SchemeKwargs
       KWARGS = %i[params headers].freeze
 
-      def initialize(uri); @uri = uri.to_s; URL._require_protocol!(@uri); end
+      def initialize(uri, exec = URL::SyncExec); @uri = uri.to_s; @exec = exec; URL._require_protocol!(@uri); end
 
       def connect(**opts, &block)
-        ws = URL._open_websocket(@uri, _ck(opts))
+        ws = @exec.websocket(@uri, _ck(opts))
         if block && ws.open?
           begin
             block.call(ws)
@@ -383,11 +427,13 @@ class URL
   # Build the right per-protocol wrapper for a URL string. Raises URL::Error
   # before any I/O for a scheme this libcurl can't speak: "protocol not
   # available" when it's a real protocol just not compiled in, "unsupported
-  # scheme" when it isn't a scheme the gem knows at all.
-  def self.call(uri)
+  # scheme" when it isn't a scheme the gem knows at all. `exec` is internal:
+  # SchemeKwargs#parallel builds its queueing copy with a Batch::Exec so the
+  # verb registers instead of runs.
+  def self.call(uri, exec = URL::SyncExec)
     scheme = _scheme_of(uri)
     klass  = SCHEME_CLIENTS[scheme]
-    return klass.new(uri) if klass
+    return klass.new(uri, exec) if klass
     if KNOWN_SCHEMES.include?(scheme)
       raise URL::ProtocolNotAvailable.new(scheme, PROTOS)
     else

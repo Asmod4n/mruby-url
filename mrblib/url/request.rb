@@ -74,9 +74,12 @@ class URL::Request
   def content_type;  URL::Libcurl.easy_getinfo(@handle, :content_type);  end
 
   # The live socket fd of an established connection (CURLINFO_ACTIVESOCKET), or
-  # nil if there isn't one. Used by URL::WebSocket to IO.select between the
+  # nil if there isn't one. Used by URL::WebSocket to wait (via curl_multi_poll) between the
   # ws_send / ws_recv framing primitives.
   def activesocket; URL::Libcurl.easy_getinfo(@handle, :activesocket); end
+  # Seconds the server asked us to wait before retrying (Retry-After header,
+  # parsed by libcurl); nil when the response carried none.
+  def retry_after;  URL::Libcurl.easy_getinfo(@handle, :retry_after);  end
 
   # WebSocket framing primitives — thin pass-throughs to the C glue. ws_recv
   # returns [bytes, flags, bytesleft] or nil on CURLE_AGAIN; ws_send returns

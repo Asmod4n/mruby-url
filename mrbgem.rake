@@ -42,12 +42,20 @@ MRuby::Gem::Specification.new('mruby-url') do |spec|
 
         curl_src   = "#{spec.dir}/deps/curl"
         curl_build = "#{spec.build_dir}/curl-build"
-        curl_inst  = "#{spec.build_dir}/curl-install"
+        # MURL_CURL_INSTALL points the install prefix somewhere stable (CI
+        # caches it keyed on the deps/curl submodule commit); default stays
+        # inside the build dir.
+        curl_inst  = ENV['MURL_CURL_INSTALL'] || "#{spec.build_dir}/curl-install"
 
         is_msvc = spec.build.toolchains.include?('visualcpp') ||
                   spec.build.cc.command =~ /(^|[\\\/])cl(\.exe)?$/i
 
-        FileUtils.mkdir_p(curl_build)
+        # A populated install prefix (restored from cache) skips the CMake
+        # build entirely — headers + static lib are all the gem consumes.
+        prebuilt = Dir.exist?("#{curl_inst}/include/curl") &&
+                   !Dir.glob("#{curl_inst}/lib/*curl*.lib").empty?
+
+        FileUtils.mkdir_p(curl_build) unless prebuilt
 
         args = [
           "-S \"#{curl_src}\"",
@@ -87,8 +95,10 @@ MRuby::Gem::Specification.new('mruby-url') do |spec|
         # flags, defines like MRB_UTF8_STRING) would just produce noise or
         # contaminate curl's translation units with mruby-specific defines.
     
-        sh "cmake #{args.join(' ')}"
-        sh "cmake --build \"#{curl_build}\" --config Release --target install"
+        unless prebuilt
+          sh "cmake #{args.join(' ')}"
+          sh "cmake --build \"#{curl_build}\" --config Release --target install"
+        end
 
         # Wire libcurl into the gem's compile + link.
         spec.cc.include_paths     << "#{curl_inst}/include"
