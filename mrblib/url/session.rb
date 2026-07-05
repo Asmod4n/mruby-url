@@ -22,10 +22,6 @@ class URL
     new
   end
 
-  def self.strerror(code)
-    URL::Libcurl.multi_strerror(code)
-  end
-
   def initialize
     @multi           = URL::Libcurl.multi_init
     # easy.object_id => URL::Request: maps a completed easy back to its Request
@@ -40,7 +36,7 @@ class URL
     # libcurl's socket/timer callbacks call straight back into these blocks (run
     # under mrb_protect_error in C). on_socket replays each fd change to the
     # event loop; on_timer records the timeout that socket_action's drain loop
-    # and _flush_pending_timer consume — no C-side buffering.
+    # and the timer re-arm at the end of socket_action consume — no C-side buffering.
     @multi.on_socket = lambda do |fd, what|
       _socket_ready(fd, what) if @event_loop
     end
@@ -48,20 +44,18 @@ class URL
       @pending_timeout = ms
     end
 
-    # The proc an event loop invokes when a watched fd becomes ready: drive the
-    # transfer, reap completions, drop them from the multi. Mirrors the old C
-    # action cfunc.
+    # The procs an event loop invokes on fd readiness / timer expiry: drive
+    # the transfer, then reap completions off the multi. Mirror the old C
+    # action/timer cfuncs.
     @_action_block = lambda do |io, cond|
       socket_action(io, cond)
-      _reap_done
+      info_read { |req, _code| remove(req) rescue nil }
       true
     end
 
-    # The proc an event loop invokes when the armed timer fires (timeout case).
-    # Mirrors the old C timer cfunc.
     @_timer_block = lambda do
       socket_action
-      _reap_done
+      info_read { |req, _code| remove(req) rescue nil }
       false
     end
 
@@ -105,9 +99,9 @@ class URL
   def socket_action(fd = URL::Libcurl::SOCKET_TIMEOUT, ev = nil)
     fd = fd.fileno if fd.respond_to?(:fileno)
 
-    # on_socket fires _socket_ready during the call; on_timer records the new
-    # timeout into @pending_timeout. libcurl can ask to be re-driven immediately
-    # by reporting a 0ms timeout, so drain that here before arming the timer.
+    # on_socket fires _socket_ready during the call; on_timer records the
+    # new timeout into @pending_timeout. libcurl can ask to be re-driven
+    # immediately by reporting a 0ms timeout — drained below before arming.
     @pending_timeout = nil
     running = URL::Libcurl.multi_socket_action(@multi, fd, ev)
     timeout = @pending_timeout
@@ -120,7 +114,15 @@ class URL
       timeout = @pending_timeout
     end
 
-    _flush_pending_timer(timeout)
+    # Arm/cancel the event loop's timer from the timeout libcurl reported:
+    # nil leaves any existing timer alone, <= 0 cancels, > 0 re-arms.
+    if !timeout.nil? && @event_loop
+      if @_timer_handle
+        @event_loop.cancel_timer(@_timer_handle)
+        @_timer_handle = nil
+      end
+      @_timer_handle = @event_loop.arm_timer(timeout, &@_timer_block) if timeout > 0
+    end
 
     running
   end
@@ -141,61 +143,15 @@ class URL
     URL::Libcurl.multi_poll(@multi, ms)
   end
 
-  # Yield (or collect) one [request, result_code] pair per completed transfer.
-  #
-  # The C primitive reports completions as [easy, code]; map each easy back to
-  # the owning URL::Request before handing it out, so callers see the same
-  # objects they added.
-  def info_read(&block)
-    if block
-      while (pair = URL::Libcurl.multi_info_read(@multi))
-        req = @by_easy[pair[0].object_id]
-        block.call(req, pair[1]) if req
-      end
-      self
-    else
-      done = []
-      while (pair = URL::Libcurl.multi_info_read(@multi))
-        req = @by_easy[pair[0].object_id]
-        done << [req, pair[1]] if req
-      end
-      done
+  # Yield one [request, result_code] pair per completed transfer. The C
+  # primitive reports completions as [easy, code]; map each easy back to the
+  # owning URL::Request so callers see the same objects they added.
+  def info_read
+    while (pair = URL::Libcurl.multi_info_read(@multi))
+      req = @by_easy[pair[0].object_id]
+      yield req, pair[1] if req
     end
+    self
   end
 
-  # --- internal helpers (were C: flush_pending_*, action/timer cfuncs) -------
-
-  # Reap completed transfers and drop them from the multi. Used by the
-  # action/timer procs that drive a platform event loop.
-  def _reap_done
-    info_read.each do |pair|
-      req = pair[0]
-      begin
-        remove(req)
-      rescue StandardError
-        # already gone / not attached
-      end
-    end
-  end
-  private :_reap_done
-
-  # Arm/cancel the event loop's timer from the timeout libcurl reported.
-  #   nil  -> unset: leave any existing timer alone
-  #   <= 0 -> cancel only
-  #   > 0  -> cancel the old timer and arm a fresh one
-  def _flush_pending_timer(timeout_ms)
-    return if timeout_ms.nil?
-    return if @event_loop.nil?
-
-    if @_timer_handle
-      @event_loop.cancel_timer(@_timer_handle)
-      @_timer_handle = nil
-    end
-
-    return if timeout_ms <= 0
-
-    @_timer_handle = @event_loop.arm_timer(timeout_ms, &@_timer_block)
-    nil
-  end
-  private :_flush_pending_timer
 end
