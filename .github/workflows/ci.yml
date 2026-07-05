@@ -1,8 +1,10 @@
 name: CI
 
+# No push trigger: main only changes by merging a PR whose head was already
+# tested on the identical tree, so re-running CI on the merge commit is pure
+# duplication. workflow_dispatch stays as the manual button for running CI
+# on main (e.g. after a direct push, which otherwise runs nothing).
 on:
-  push:
-    branches: [ main ]
   pull_request:
   workflow_dispatch:
 
