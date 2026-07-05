@@ -125,6 +125,22 @@ class URL
     running
   end
 
+  # Event-less drive: one curl_multi_perform pass. libcurl checks all its own
+  # fds and timers internally — no socket/timer callbacks, no event loop.
+  # Returns the number of still-running transfers. The blocking SyncDriver is
+  # built on perform + poll; the EventLoop interface is only for external
+  # loop integrations.
+  def perform
+    URL::Libcurl.multi_perform(@multi)
+  end
+
+  # Wait up to `ms` for activity on any of libcurl's own fds (or just sleep
+  # the full timeout when nothing is attached) — curl_multi_poll, libcurl's
+  # portable wait. Caps at libcurl's next internal timeout automatically.
+  def poll(ms)
+    URL::Libcurl.multi_poll(@multi, ms)
+  end
+
   # Yield (or collect) one [request, result_code] pair per completed transfer.
   #
   # The C primitive reports completions as [easy, code]; map each easy back to

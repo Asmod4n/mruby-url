@@ -7,7 +7,7 @@
 #   URL("imaps://h/INBOX").fetch / .move / .store / .expunge
 #   URL("smtps://h").deliver(body, from:, to:)
 #   URL("wss://h/sock").connect           — see mrblib/url/endpoints.rb
-#   URL.parallel { |p| p.get(...) }       — fan-out, see below
+#   URL("https://x").parallel(:get) { |r| ... }; URL.parallel_perform — fan-out
 #   URL.shared          - the reused per-state session (tune its pool)
 #   URL.default_loop=   - plug in a platform event loop once at startup
 #   URL::Response       - what the verbs return
@@ -16,7 +16,7 @@
 #                         family (Response#error) descends from it — see
 #                         mrblib/url/errors.rb
 #
-# The internal plumbing (request dispatch, the built-in IO.select loop,
+# The internal plumbing (request dispatch, the built-in blocking driver,
 # transfer buffering, the Request callback setters) lives under mrblib/url/.
 # Dir.glob sorts "url.rb" before "url/...", so this file loads first and the
 # user-facing classes here — including URL::EventLoop, which the internal
@@ -70,10 +70,10 @@ end
 
 class URL::Response
   attr_reader :url, :effective_url, :code, :body, :raw_headers,
-              :total_time, :content_type, :error_code
+              :total_time, :content_type, :error_code, :retry_after
 
   def initialize(url:, effective_url:, code:, body:, raw_headers:,
-                 total_time:, content_type:, error_code:)
+                 total_time:, content_type:, error_code:, retry_after: nil)
     @url           = url
     @effective_url = effective_url
     @code          = code
@@ -82,6 +82,7 @@ class URL::Response
     @total_time    = total_time
     @content_type  = content_type
     @error_code    = error_code
+    @retry_after   = retry_after
   end
 
   def headers
@@ -140,6 +141,61 @@ class URL::Response
     e = error
     raise e if e
     self
+  end
+
+  # Redo the request that produced this failed Response — same URL, verb and
+  # arguments — at most `times` times. Failures only: on a Response whose
+  # #error is nil there is nothing to redo and this raises URL::Error.
+  #
+  # What "redo" means depends on where the Response came from:
+  #   * a blocking verb's Response re-runs the request right here, up to
+  #     `times` times, stopping early on success, and returns the last
+  #     Response:
+  #       r = URL("https://x").get
+  #       r = r.retry(3) if r.error
+  #   * a Response delivered to a parallel handler block resubmits its
+  #     transfer (with the same handler); the resubmission runs as the running
+  #     URL.parallel_perform's next round — one perform call finishes the job,
+  #     retries included. `times` is the budget of the whole registration
+  #     lineage: once the transfer has been retried that often, further retry
+  #     calls return false instead of resubmitting, so the perform drains by
+  #     itself — no hand-rolled attempt counter:
+  #       URL("https://x").parallel(:get) { |r| r.retry(3) if r.error }
+  #       URL.parallel_perform            # at most 4 attempts, then done
+  #     This works ONLY while the handler runs — it is the one place a
+  #     parallel Response exists; afterwards retry raises URL::Error.
+  #
+  # `wait:` is how long to pause before each re-run — any chrono duration or
+  # seconds (500.ms, 2.s, 1.5). When omitted, the server decides: if the
+  # failed response carried a Retry-After header (as 429/503 replies often
+  # do — libcurl parses it, see #retry_after), that many seconds are waited;
+  # otherwise the retry starts immediately.
+  #
+  # Caveat: an upload whose body is an IO / Enumerator resumes from wherever
+  # the failed attempt left it — String bodies re-upload from the start.
+  def retry(times = 1, wait: nil)
+    unless times.is_a?(Integer) && times >= 1
+      raise ArgumentError, "retry times must be an Integer >= 1, got #{times.inspect}"
+    end
+    unless wait.nil? || (wait.respond_to?(:to_f) && wait.to_f >= 0)
+      raise ArgumentError, "retry wait must be a duration/seconds >= 0, got #{wait.inspect}"
+    end
+    if error.nil?
+      raise URL::Error, "nothing to retry — the transfer succeeded (#{@effective_url})"
+    end
+    unless @retry_proc
+      raise URL::Error,
+            "this Response can no longer be retried — a parallel Response only retries inside its handler block"
+    end
+    @retry_proc.call(times, wait)
+  end
+
+  # Internal: how to redo the request that produced this Response. Stamped by
+  # URL::SyncExec (re-run now, return the new Response) and, only for the
+  # duration of the handler call, by URL.parallel_perform (re-register for the
+  # next perform, return self).
+  def _retry_with(prc)
+    @retry_proc = prc
   end
 
   def content_length
@@ -224,53 +280,85 @@ class URL::Response
 end
 
 # ============================================================================
-#  URL::Batch — the request builder yielded by URL.parallel
+#  URL::Batch — internal collector behind URL(uri).parallel
 #
-#  Inside `URL.parallel { |p| ... }` you get one of these as `p`. Queue requests
-#  with the same verbs you'd call on URL (get/head/delete/options/post/put/
-#  patch), each tagged with an optional key: (defaults to its submission index,
-#  so duplicate URLs stay distinct). Register on_complete to receive each
-#  response as its transfer lands. The driving + result collection live in
-#  URL._drive_parallel (mrblib/url/dispatch.rb).
+#  URL(uri).parallel(:verb, ...) registers a transfer here instead of running
+#  it; URL.parallel_perform drives everything registered and resolves each
+#  transfer's Response into the block it was registered with. Users never see
+#  this class. Each entry is { key:, url:, build:, post: } where `build`
+#  configures the Request on the batch session at drive time and `post`, when
+#  set, rewraps the finished Response (MQTT subscribe); keys are registration
+#  indices, used internally to route each Response to its handler.
 # ============================================================================
 
 class URL::Batch
   def initialize
-    @entries     = []
-    @on_complete = nil
+    @entries  = []
+    @handlers = {}
   end
 
-  def get(url, key: nil, **opts, &block);                _add(:GET,     url, nil,  key, opts, block); end
-  def head(url, key: nil, **opts, &block);               _add(:HEAD,    url, nil,  key, opts, block); end
-  def delete(url, body = nil, key: nil, **opts, &block); _add(:DELETE,  url, body, key, opts, block); end
-  def options(url, key: nil, **opts, &block);            _add(:OPTIONS, url, nil,  key, opts, block); end
-  def post(url, body = nil, key: nil, **opts, &block);   _add(:POST,    url, body, key, opts, block); end
-  def put(url, body = nil, key: nil, **opts, &block);    _add(:PUT,     url, body, key, opts, block); end
-  def patch(url, body = nil, key: nil, **opts, &block);  _add(:PATCH,   url, body, key, opts, block); end
-
-  # Called with (key, URL::Response) as each transfer finishes — in completion
-  # order, not submission order.
-  def on_complete(&block)
-    @on_complete = block
-    self
-  end
-
-  # Internal: consumed by URL._drive_parallel.
+  # Internal: consumed by URL._drive_parallel / URL.parallel_perform.
   attr_reader :entries
-  def completion_block; @on_complete; end
 
-  private
+  # Internal: append one registered transfer; returns its key. `attempts`
+  # counts how often this registration lineage has been retried and `wait`
+  # is the pause this entry asked for before running — both ride along so
+  # Response#retry(times, wait:) works across rounds.
+  def _push(url, key, post, build, attempts = 0, wait = 0)
+    key = @entries.size if key.nil?
+    @entries << { key: key, url: url, build: build, post: post, attempts: attempts, wait: wait }
+    key
+  end
 
-  def _add(method, url, body, key, opts, on_chunk)
-    @entries << {
-      method:   method,
-      url:      url,
-      body:     body,
-      key:      key.nil? ? @entries.size : key,
-      opts:     opts,
-      on_chunk: on_chunk,
-    }
-    self
+  def _handler(key, block)
+    @handlers[key] = block if block
+    key
+  end
+
+  def _handler_for(key)
+    @handlers[key]
+  end
+end
+
+# The executor SchemeKwargs#parallel hands to the queueing copy of its
+# wrapper: the verb's operation is stored as a batch entry (a _build_* call
+# deferred until URL._drive_parallel has picked the session) instead of
+# running immediately. Mirror image of URL::SyncExec (mrblib/url/dispatch.rb)
+# — same interface, registering instead of driving. Every method returns the
+# entry's key.
+class URL::Batch::Exec
+  def initialize(batch, key)
+    @batch = batch
+    @key   = key
+  end
+
+  # Each build lambda dups the opts before handing them to the _build_* helper
+  # (the helpers strip keys as they consume them), so the same entry can be
+  # built again — that's what makes Response#retry re-registration safe.
+  def fire(method, url, body, opts, &on_chunk)
+    @batch._push(url, @key, nil,
+                 lambda { |s| URL._build_request(s, method, url, body, opts.dup, on_chunk) })
+  end
+
+  def transfer(url, opts, on_chunk, upload_data, post = nil)
+    @batch._push(url, @key, post,
+                 lambda { |s| URL._build_transfer(s, url, opts.dup, on_chunk, upload_data) })
+  end
+
+  def imap(mailbox_url, command, opts, url_suffix = nil, on_chunk = nil)
+    @batch._push(mailbox_url, @key, nil,
+                 lambda { |s| URL._build_imap_request(s, mailbox_url, command, opts.dup, url_suffix, on_chunk) })
+  end
+
+  def deliver(server_url, from, recipients, body, opts)
+    @batch._push(server_url, @key, nil,
+                 lambda { |s| URL._build_mail_request(s, server_url, from, recipients, body, opts.dup) })
+  end
+
+  def websocket(url, _opts)
+    raise ArgumentError,
+          "WebSocket connect cannot be registered for URL.parallel_perform — " \
+          "it returns a live socket, not a Response (#{url})"
   end
 end
 
@@ -327,29 +415,77 @@ class URL
     #  Parallel fan-out
     # ----------------------------------------------------------------------
 
-    # Run several requests concurrently on one session and collect them as they
-    # finish. Inside the block, queue requests on the yielded URL::Batch (same
-    # verbs as URL), each tagged with an optional key: (defaults to its
-    # submission index, so duplicate URLs stay distinct). Returns a Hash of
-    # { key => URL::Response } once all complete; register p.on_complete to also
-    # receive each response the moment its transfer lands.
+    # Internal: the batch URL(uri).parallel registers into, created lazily on
+    # the first registration and consumed (and cleared) by parallel_perform.
+    def _pending_batch
+      @_pending_batch ||= Batch.new
+    end
+
+    # Drive every transfer registered with URL(uri).parallel since the last
+    # perform — all concurrently on one session. This is ONLY a driver: it
+    # returns nil. Each transfer's resolved URL::Response is passed to the
+    # block it was registered with, in completion order — the handler block
+    # is the one place a parallel Response exists (a block-less registration
+    # resolves silently). Registrations are pending process-wide until
+    # performed.
     #
-    #   results = URL.parallel do |p|
-    #     p.get("https://a.example/feed",   key: :feed)
-    #     p.post("https://b.example/login", key: :login, json: { ... })
-    #     p.on_complete { |key, resp| warm(key, resp) }
-    #   end
-    #   results[:feed].json
+    #   URL("https://a.example/feed").parallel(:get)  { |r| feed = r.json }
+    #   URL("https://b.example/login").parallel(:post, json: creds) { |r| token = r }
+    #   URL("ftp://h/manifest.txt").parallel(:download) { |r| manifest = r.body }
+    #   URL.parallel_perform
+    #
+    # Inside its handler a failed Response can resubmit itself with
+    # #retry(times) — the resubmission is picked up by THIS perform: after
+    # each round, anything the handlers registered (retries or fresh parallel
+    # registrations) is driven as the next round, until nothing is pending.
+    # One parallel_perform call therefore finishes the whole job, retries
+    # included; the `times` budget rides with each registration, so even an
+    # unconditional `r.retry(3) if r.error` drains by itself (see
+    # URL::Response#retry). Once its handler returns, a Response can no
+    # longer be retried.
     #
     # Runs on URL.shared by default — so the connection pool, TLS sessions and
-    # HTTP/2 multiplexing carry over — falling back to a throwaway session when
-    # called re-entrantly from inside a callback. Runtime failures are values
-    # like everywhere else: each Response's #error is set, nothing is raised.
-    def parallel
-      raise ArgumentError, "URL.parallel requires a block" unless block_given?
-      batch = Batch.new
-      yield batch
-      _drive_parallel(batch.entries, batch.completion_block)
+    # HTTP/2 multiplexing carry over — falling back to a throwaway session
+    # when called re-entrantly from inside a callback. Runtime failures are
+    # values like everywhere else: each Response's #error is set, nothing is
+    # raised; usage errors raise at registration time, before any I/O.
+    def parallel_perform
+      while (batch = @_pending_batch)
+        @_pending_batch = nil
+        return nil if batch.entries.empty?
+
+        # Retried entries may have asked to wait (explicit wait: or the
+        # server's Retry-After). Rounds are driven together, so pause for the
+        # longest ask — every retry waits at least as long as it wanted.
+        _wait(batch.entries.map { |e| e[:wait].to_f }.max)
+
+        by_key = {}
+        batch.entries.each { |e| by_key[e[:key]] = e }
+
+        _drive_parallel(batch.entries, lambda { |key, resp|
+          handler = batch._handler_for(key)
+          if handler
+            entry = by_key[key]
+            resp._retry_with(lambda { |times, wait|
+              if entry[:attempts] >= times
+                false               # budget spent: don't resubmit, let the perform drain
+              else
+                b = _pending_batch
+                b._handler(b._push(entry[:url], nil, entry[:post], entry[:build],
+                                   entry[:attempts] + 1, wait || resp.retry_after || 0),
+                           handler)
+                resp
+              end
+            })
+            begin
+              handler.call(resp)
+            ensure
+              resp._retry_with(nil)   # a parallel Response only retries inside its handler
+            end
+          end
+        })
+      end
+      nil
     end
   end
 

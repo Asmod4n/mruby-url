@@ -58,8 +58,11 @@ class URL::WebSocket
 
     fd = error_code == 0 ? req.activesocket : nil
     if error_code == 0 && fd
-      @io = IO.for_fd(fd)
-      @io.autoclose = false   # libcurl owns this fd
+      @fd = fd                # libcurl owns this fd; we only wait on it
+      # A bare multi handle used purely as libcurl's portable waiting
+      # primitive (curl_multi_poll with @fd as an extra fd) — no transfers
+      # ever attach to it.
+      @wait_multi = URL::Libcurl.multi_init
       @closed = false
     else
       # Either a CURLcode failure, or curl returned OK with no upgraded socket
@@ -212,13 +215,19 @@ class URL::WebSocket
 
   # One ws_recv, blocking on readability while libcurl reports CURLE_AGAIN
   # (ws_recv => nil). Returns the [data, flags, bytesleft] triple, or :timeout.
+  # Readiness comes from curl_multi_poll with the ws socket as an extra fd —
+  # libcurl's own portable wait; a nil timeout blocks in 1s slices.
   def _recv_chunk(timeout)
     loop do
       frame = @req.ws_recv(RECV_CHUNK)
       return frame if frame
 
-      r, = IO.select([@io], nil, nil, timeout)
-      return :timeout if r.nil?
+      if timeout
+        ready = URL::Libcurl.multi_poll(@wait_multi, (timeout.to_f * 1000).to_i, @fd, :in)
+        return :timeout if ready == 0
+      else
+        URL::Libcurl.multi_poll(@wait_multi, 1000, @fd, :in)
+      end
     end
   end
 
@@ -247,7 +256,7 @@ class URL::WebSocket
       r = @req.ws_send(data, flags, 0)
       return r if r
 
-      IO.select(nil, [@io], nil, nil)
+      URL::Libcurl.multi_poll(@wait_multi, 1000, @fd, :out)
     end
   end
 end

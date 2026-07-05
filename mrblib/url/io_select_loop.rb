@@ -1,45 +1,29 @@
 # mrblib/url/io_select_loop.rb
 #
-# URL::IOSelectLoop — the built-in EventLoop used for blocking requests when
-# no platform loop is set. Pull-driven: pumps IO.select until the request of
-# interest completes. Internal plumbing; users get it implicitly through the
-# high-level verbs.
+# URL::SyncDriver — the built-in blocking driver behind the synchronous verbs
+# and URL.parallel_perform. It is NOT an EventLoop: it rides libcurl's
+# event-less multi API (curl_multi_perform + curl_multi_poll), where libcurl
+# tracks every fd and timeout internally. Nothing here watches sockets or
+# arms timers — curl already knows how; Ruby only decides when to stop.
+#
+# URL::IOSelectLoop — a reference EventLoop implementation kept as the
+# example for platform-loop integrators. It implements ONLY the four
+# EventLoop primitives, using nothing but the blocks the session hands it —
+# exactly what any real integration (libuv, EventMachine, a game loop) has
+# to provide, no more.
 
-class URL::IOSelectLoop < URL::EventLoop
+class URL::SyncDriver
+  # Cap for one poll. curl_multi_poll returns earlier on socket activity or
+  # when libcurl's own next timeout is nearer, so this is a ceiling, not a
+  # latency — it only bounds how long a spurious idle wait could last.
+  POLL_MS = 1000
+
   def initialize(session)
-    @session    = session
-    @watching   = {}   # fd_int => { io:, readiness: }
-    @timeout_ms = -1
+    @session = session
   end
 
-  def watch(io, readiness, &_block)
-    fd = io.fileno
-    @watching[fd] = { io: io, readiness: readiness }
-    fd
-  end
-
-  def unwatch(handle)
-    @watching.delete(handle)
-  end
-
-  def arm_timer(ms, &_block)
-    @timeout_ms = ms
-    :timer
-  end
-
-  def cancel_timer(_handle)
-    @timeout_ms = -1
-  end
-
-  # Drive every attached transfer to completion — until no fd is watched and no
-  # timer is pending. Yields [request, code] per completion.
-  def run(&on_complete)
-    _pump(-> { @watching.empty? && @timeout_ms < 0 }, &on_complete)
-  end
-
-  # Drive until `target` completes (or the loop falls idle), rather than until
-  # every socket is gone. Required for the reused shared session, whose
-  # kept-alive sockets can outlive any single request.
+  # Drive until `target` completes (or nothing is left running). Yields
+  # [request, code] per completion, each the moment it is reaped.
   def run_until(target, &on_complete)
     finished = false
     _pump(-> { finished }) do |req, code|
@@ -48,9 +32,8 @@ class URL::IOSelectLoop < URL::EventLoop
     end
   end
 
-  # Drive until `count` transfers have completed, regardless of kept-alive
-  # sockets lingering on the shared session. Each completion is yielded the
-  # moment it is reaped — the basis for URL.parallel's "answers as they arrive".
+  # Drive until `count` transfers have completed — the basis for
+  # URL.parallel_perform's "answers as they arrive".
   def run_n(count, &on_complete)
     remaining = count
     _pump(-> { remaining <= 0 }) do |req, code|
@@ -61,14 +44,53 @@ class URL::IOSelectLoop < URL::EventLoop
 
   private
 
-  # One pull-driven loop: socket_action + info_read, then IO.select over the
-  # watched fds and repeat, until `stop` returns true or there is genuinely
-  # nothing left to wait on. Every reaped completion is handed to on_complete.
+  # perform -> reap -> poll, until `stop` says done or curl runs dry. All
+  # readiness/timeout knowledge stays inside libcurl.
   def _pump(stop, &on_complete)
-    @session.socket_action
-    @session.info_read { |req, code| on_complete&.call(req, code) }
+    loop do
+      running = @session.perform
+      @session.info_read { |req, code| on_complete&.call(req, code) }
+      break if stop.call
+      break if running == 0   # nothing in flight can complete the stop condition
+      @session.poll(POLL_MS)
+    end
+  end
+end
 
-    until stop.call
+# Example EventLoop: pumps IO.select over the fds the session asks it to
+# watch and fires the session-provided blocks — the same two things any
+# external loop integration does. The heavy lifting (socket_action, reaping,
+# timeout bookkeeping) lives in the session; a loop only supplies readiness
+# and timer callbacks.
+class URL::IOSelectLoop < URL::EventLoop
+  def initialize
+    @watching = {}    # fd => { io:, readiness:, block: }
+    @timer    = nil   # { ms:, block: }
+  end
+
+  def watch(io, readiness, &block)
+    fd = io.fileno
+    @watching[fd] = { io: io, readiness: readiness, block: block }
+    fd
+  end
+
+  def unwatch(handle)
+    @watching.delete(handle)
+  end
+
+  def arm_timer(ms, &block)
+    @timer = { ms: ms, block: block }
+    :timer
+  end
+
+  def cancel_timer(_handle)
+    @timer = nil
+  end
+
+  # Pump until nothing is watched and no timer is armed. A real platform loop
+  # wouldn't have this method — its own run loop plays this role.
+  def run
+    until @watching.empty? && @timer.nil?
       reads  = []
       writes = []
       @watching.each_value do |w|
@@ -76,19 +98,26 @@ class URL::IOSelectLoop < URL::EventLoop
         writes << w[:io] if w[:readiness] == :out || w[:readiness] == :inout
       end
 
-      break if reads.empty? && writes.empty? && @timeout_ms < 0
+      sel_timeout = @timer && @timer[:ms] >= 0 ? @timer[:ms] / 1000.0 : nil
+      break if reads.empty? && writes.empty? && sel_timeout.nil?
 
-      sel_timeout = @timeout_ms < 0 ? nil : @timeout_ms / 1000.0
       r, w, _e = IO.select(reads, writes, nil, sel_timeout)
 
       if r.nil? && w.nil?
-        @session.socket_action
+        t = @timer
+        @timer = nil
+        t[:block].call if t
       else
-        r&.each { |io| @session.socket_action(io, :in)  }
-        w&.each { |io| @session.socket_action(io, :out) }
+        r&.each { |io| _fire(io, :in)  }
+        w&.each { |io| _fire(io, :out) }
       end
-
-      @session.info_read { |req, code| on_complete&.call(req, code) }
     end
+  end
+
+  private
+
+  def _fire(io, cond)
+    w = @watching[io.fileno]
+    w[:block].call(io, cond) if w && w[:block]
   end
 end
