@@ -1,10 +1,8 @@
 name: CI
 
-# No push trigger: main only changes by merging a PR whose head was already
-# tested on the identical tree, so re-running CI on the merge commit is pure
-# duplication. workflow_dispatch stays as the manual button for running CI
-# on main (e.g. after a direct push, which otherwise runs nothing).
 on:
+  push:
+    branches: [ main ]
   pull_request:
   workflow_dispatch:
 
@@ -15,6 +13,11 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Merging a PR pushes a merge commit whose tree the PR run just tested, so the
+# push-triggered duplicate is skipped by matching the merge-commit message.
+# Direct pushes to main (and everything else) run normally. Note: relies on
+# merge commits ("Merge pull request #N..."); if the repo ever switches to
+# squash merges, this guard stops matching and the duplicate run returns.
 jobs:
   # Fail fast if a tool-generated session URL sneaks into the tree or into a
   # commit message — those identifiers must never be published (see the
@@ -22,6 +25,7 @@ jobs:
   # (it must name the patterns) and the README (it documents the rewrite).
   hygiene:
     name: no session URLs
+    if: github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'Merge pull request')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -40,6 +44,7 @@ jobs:
 
   test:
     name: test (${{ matrix.os }})
+    if: github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'Merge pull request')
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
