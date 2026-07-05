@@ -512,7 +512,7 @@ session = URL.open
 loop    = URL::IOSelectLoop.new
 session.event_loop = loop
 
-req = URL::Request._open(session, "https://example.com")
+req = URL::Request.new(session, "https://example.com")
 req.on_data { |chunk| sink(chunk) }
 session.add(req)
 session.socket_action   # kick off: registers fds/timers with the loop

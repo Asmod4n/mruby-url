@@ -10,34 +10,32 @@ JSON.zero_copy_parsing = true
 
 class URL
   class << self
+    # With a default_loop set: attach to the platform loop and return nil
+    # immediately (the session lives until info_read sees the request
+    # complete). Otherwise block: drive on the shared session — or a
+    # throwaway one when called re-entrantly from inside its callbacks — and
+    # return the Response.
     def _fire(method, url, body, opts, &on_chunk)
       if @default_loop
-        _fire_async(method, url, body, opts, &on_chunk)
+        session = open
+        session.event_loop = @default_loop
+        req, _state = _build_request(session, method, url, body, opts, on_chunk)
+        session.add(req)
+        session.socket_action
+        nil
       else
-        _fire_sync(method, url, body, opts, &on_chunk)
+        _blocking(url) { |s| _build_request(s, method, url, body, opts, on_chunk) }
       end
     end
 
-    # Non-blocking: attach to the platform loop and return immediately.
-    # The session lives until info_read sees the request complete, at which
-    # point the action block calls session.remove and lets GC clean up.
-    def _fire_async(method, url, body, opts, &on_chunk)
-      session = open
-      session.event_loop = @default_loop
-      req, _state = _build_request(session, method, url, body, opts, on_chunk)
-      session.add(req)
-      session.socket_action
-      nil
-    end
-
-    # Blocking. Reuse the shared session, except when it's already mid-flight
-    # because we were called from inside one of its callbacks — then it can't
-    # drive a second transfer, so this nested fetch gets a throwaway session.
-    def _fire_sync(method, url, body, opts, &on_chunk)
+    # Blocking front shared by every synchronous operation: pick the shared
+    # session — or a throwaway one when it's mid-flight because we were
+    # called from inside one of its callbacks — let the block configure the
+    # request on it, then drive to completion.
+    def _blocking(url)
       session = shared
       session = open if session._busy?
-
-      req, state = _build_request(session, method, url, body, opts, on_chunk)
+      req, state = yield session
       _drive_sync(session, url, req, state)
     end
 
@@ -65,54 +63,42 @@ class URL
       end
     end
 
-    # Drive a batch of registered requests concurrently on one session and
-    # collect their responses. Reuses the shared session (so the connection
-    # pool, TLS sessions and HTTP/2 multiplexing carry over) unless it's
-    # mid-callback, in which case a throwaway one is used — the same hybrid
-    # rule the blocking verbs follow. Each entry is { key:, url:, build:,
-    # post: } where `build` is a proc taking the session and returning a
-    # configured [Request, TransferState] pair (any of the _build_* helpers,
-    # so every protocol can ride the batch, not just HTTP) and `post`, when
-    # set, rewraps the finished Response (MQTT subscribe). All requests are
-    # added up front, then one perform/poll drive runs them together; each
-    # response is handed to on_complete (key, resp) the moment its transfer
-    # finishes, and the full { key => URL::Response } Hash is returned once
-    # all are done. Like the verbs, a runtime failure is a Response whose
-    # resp.error is set — never a raise.
-    def _drive_parallel(entries, on_complete)
-      return {} if entries.empty?
-
+    # Drive registered entries concurrently on one session, yielding
+    # (entry, response) the moment each transfer finishes. Reuses the shared
+    # session (so the connection pool, TLS sessions and HTTP/2 multiplexing
+    # carry over) unless it's mid-callback, in which case a throwaway one is
+    # used — the same hybrid rule the blocking verbs follow. Each entry's
+    # `build` proc configures a [Request, TransferState] pair on the session
+    # (any of the _build_* helpers, so every protocol rides the same drive);
+    # `post`, when set, rewraps the finished Response (MQTT subscribe). Like
+    # the verbs, a runtime failure is a Response whose resp.error is set —
+    # never a raise.
+    def _drive_parallel(entries)
       session = shared
       session = open if session._busy?
 
-      driver = session._sync_driver
-
-      by_req  = {}
-      results = {}
-
+      by_req = {}
       entries.each do |e|
         req, state = e[:build].call(session)
-        by_req[req.object_id] = [e[:key], e[:url], req, state, e[:post]]
+        by_req[req.object_id] = [e, req, state]
         session.add(req)
       end
 
       session._busy = true
       begin
-        driver.run_n(entries.size) do |req, code|
-          entry = by_req[req.object_id]
+        session._sync_driver.run_n(entries.size) do |req, code|
+          entry, r, state = by_req[req.object_id]
           next unless entry
-          key, url, r, state, post = entry
           state.error_code = code if code != 0
-          resp = _response_from(url, r, state)
-          resp = post.call(resp) if post
-          results[key] = resp
-          on_complete.call(key, resp) if on_complete
+          resp = _response_from(entry[:url], r, state)
+          resp = entry[:post].call(resp) if entry[:post]
+          yield entry, resp
         end
-        results
       ensure
         session._busy = false
-        by_req.each_value { |(_k, _u, r, _s, _p)| session.remove(r) rescue nil }
+        by_req.each_value { |(_e, r, _s)| session.remove(r) rescue nil }
       end
+      nil
     end
 
     def _build_request(session, method, url, body, opts, on_chunk)
@@ -131,7 +117,7 @@ class URL
         auto_hdrs["Content-Type"] = "application/json"
         auto_hdrs["Accept"]       = "application/json"
       elsif form_body
-        body = _encode_form(form_body)
+        body = _encode_kv(form_body)
         auto_hdrs["Content-Type"] = "application/x-www-form-urlencoded"
       end
 
@@ -147,7 +133,7 @@ class URL
       end
 
       url_str = _stringify_url(url, params)
-      req     = URL::Request._open(session, url_str)
+      req     = URL::Request.new(session, url_str)
 
       case method
       when :GET    then # nothing
@@ -170,9 +156,9 @@ class URL
       if on_chunk
         req.on_data { |chunk| on_chunk.call(chunk) }
       else
-        req.on_data { |chunk| state.append_body(chunk) }
+        req.on_data { |chunk| state.body << chunk }
       end
-      req.on_header { |line| state.append_header(line) }
+      req.on_header { |line| state.raw_headers << line }
 
       [req, state]
     end
@@ -185,7 +171,7 @@ class URL
       opts[:timeout] = DEFAULT_TIMEOUT unless opts.key?(:timeout)
 
       url_str = _stringify_url(server_url, nil)
-      req     = URL::Request._open(session, url_str)
+      req     = URL::Request.new(session, url_str)
 
       _, reader = _upload_reader(body)
       req.setopt(:upload, true)
@@ -196,8 +182,8 @@ class URL
       req.on_read(&reader)
 
       state = URL::TransferState.new
-      req.on_data   { |chunk| state.append_body(chunk) }
-      req.on_header { |line|  state.append_header(line) }
+      req.on_data   { |chunk| state.body << chunk }
+      req.on_header { |line|  state.raw_headers << line }
 
       [req, state]
     end
@@ -213,7 +199,7 @@ class URL
 
       url_str = _stringify_url(mailbox_url, nil)
       url_str = "#{url_str}#{url_suffix}" if url_suffix
-      req     = URL::Request._open(session, url_str)
+      req     = URL::Request.new(session, url_str)
 
       req.setopt(:custom_request, command) if command
       _apply_opts(req, opts)
@@ -222,21 +208,16 @@ class URL
       if on_chunk
         req.on_data { |chunk| on_chunk.call(chunk) }
       else
-        req.on_data { |chunk| state.append_body(chunk) }
+        req.on_data { |chunk| state.body << chunk }
       end
-      req.on_header { |line| state.append_header(line) }
+      req.on_header { |line| state.raw_headers << line }
 
       [req, state]
     end
 
-    # Blocking SMTP/SMTPS delivery: pick the shared session (or a fresh one
-    # when re-entrant), build the mail request, drive it. Same shape as _imap
-    # below.
+    # Blocking SMTP/SMTPS delivery.
     def _deliver(server_url, from, recipients, body, opts)
-      session = shared
-      session = open if session._busy?
-      req, state = _build_mail_request(session, server_url, from, recipients, body, opts)
-      _drive_sync(session, server_url, req, state)
+      _blocking(server_url) { |s| _build_mail_request(s, server_url, from, recipients, body, opts) }
     end
 
     # Shared front of an IMAP verb: pick the shared session (or a fresh one when
@@ -246,10 +227,7 @@ class URL
     # error_code is non-zero (so resp.error holds a URL::TransportError), not as
     # a raise.
     def _imap(mailbox_url, command, opts, url_suffix = nil, on_chunk = nil)
-      session = shared
-      session = open if session._busy?
-      req, state = _build_imap_request(session, mailbox_url, command, opts, url_suffix, on_chunk)
-      _drive_sync(session, mailbox_url, req, state)
+      _blocking(mailbox_url) { |s| _build_imap_request(s, mailbox_url, command, opts, url_suffix, on_chunk) }
     end
 
     # Open a WebSocket: build a CONNECT_ONLY=2 request and run the upgrade
@@ -265,12 +243,12 @@ class URL
       params    = opts.delete(:params)
 
       url_str = _stringify_url(url, params)
-      req     = URL::Request._open(shared, url_str)
+      req     = URL::Request.new(shared, url_str)
       req.setopt(:connect_only, 2)   # 2 = WebSocket: curl runs the upgrade, then hands back
       _apply_opts(req, opts)
       req.headers = user_hdrs if user_hdrs && !user_hdrs.empty?
 
-      code = req.perform
+      code = URL::Libcurl.easy_perform(req.handle)
       URL::WebSocket.new(req, code)
     end
 
@@ -284,10 +262,7 @@ class URL
     # shared/throwaway session + SyncDriver drive as the HTTP verbs, so all
     # protocols share one code path.
     def _run_transfer(url, opts, on_chunk, upload_data)
-      session = shared
-      session = open if session._busy?
-      req, state = _build_transfer(session, url, opts, on_chunk, upload_data)
-      _drive_sync(session, url, req, state)
+      _blocking(url) { |s| _build_transfer(s, url, opts, on_chunk, upload_data) }
     end
 
     def _build_transfer(session, url, opts, on_chunk, upload_data)
@@ -297,7 +272,7 @@ class URL
       params    = opts.delete(:params)
 
       url_str = params ? _stringify_url(url, params) : url.to_s
-      req     = URL::Request._open(session, url_str)
+      req     = URL::Request.new(session, url_str)
 
       if upload_data
         size, reader = _upload_reader(upload_data)
@@ -314,9 +289,9 @@ class URL
       if on_chunk
         req.on_data { |c| on_chunk.call(c) }
       else
-        req.on_data { |c| state.append_body(c) }
+        req.on_data { |c| state.body << c }
       end
-      req.on_header { |l| state.append_header(l) }
+      req.on_header { |l| state.raw_headers << l }
 
       [req, state]
     end
@@ -416,16 +391,17 @@ class URL
     end
 
     def _response_from(url, req, state)
+      h = req.handle
       URL::Response.new(
         url:           url,
-        effective_url: req.effective_url,
-        code:          req.response_code,
+        effective_url: URL::Libcurl.easy_getinfo(h, :effective_url),
+        code:          URL::Libcurl.easy_getinfo(h, :response_code),
         body:          state.body,
         raw_headers:   state.raw_headers,
-        total_time:    req.total_time,
-        content_type:  req.content_type,
+        total_time:    URL::Libcurl.easy_getinfo(h, :total_time),
+        content_type:  URL::Libcurl.easy_getinfo(h, :content_type),
         error_code:    state.error_code,
-        retry_after:   req.retry_after,
+        retry_after:   URL::Libcurl.easy_getinfo(h, :retry_after),
       )
     end
 
@@ -474,10 +450,6 @@ class URL
       result = "#{base_without_frag}#{sep}#{qs}"
       result = "#{result}##{frag}" if frag
       result
-    end
-
-    def _encode_form(form)
-      _encode_kv(form)
     end
 
     def _encode_kv(h)
@@ -590,7 +562,7 @@ class URL
   # The scheme-typed endpoint classes (mrblib/url/endpoints.rb) don't run
   # their verbs directly — they hand the operation to an executor. SyncExec is
   # the default and runs it immediately (today's blocking/async behaviour);
-  # URL::Batch::Exec (mrblib/url.rb) registers it for the next
+  # URL::BatchExec (mrblib/url.rb) registers it for the next
   # URL.parallel_perform instead. Same verb code, two execution modes.
 
   # Each method hands the _build_* helpers a dup of opts (they strip keys as

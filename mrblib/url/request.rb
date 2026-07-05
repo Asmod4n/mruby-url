@@ -21,19 +21,9 @@ end
 class URL::Request
   attr_reader :handle
 
-  # Mirrors the old C URL::Request._open: make a fresh easy handle, optionally
-  # set its URL, and remember the owning session. The easy handle's GC frees
-  # the underlying CURL*; the write/header/read callbacks are already wired by
-  # Libcurl.easy_init.
-  def self._open(session, url = nil)
-    new(session, url)
-  end
-
-  # Delegate the libcurl-error helper to the flat primitive.
-  def self.strerror(code)
-    URL::Libcurl.easy_strerror(code)
-  end
-
+  # Make a fresh easy handle, optionally set its URL, and remember the owning
+  # session. The easy handle's GC frees the underlying CURL*; the
+  # write/header/read callbacks are already wired by Libcurl.easy_init.
   def initialize(session, url = nil)
     @session = session
     @handle  = URL::Libcurl.easy_init
@@ -67,34 +57,6 @@ class URL::Request
     URL::Libcurl.easy_setopt(@handle, :httpheader, lines)
     hash
   end
-
-  def response_code; URL::Libcurl.easy_getinfo(@handle, :response_code); end
-  def effective_url; URL::Libcurl.easy_getinfo(@handle, :effective_url); end
-  def total_time;    URL::Libcurl.easy_getinfo(@handle, :total_time);    end
-  def content_type;  URL::Libcurl.easy_getinfo(@handle, :content_type);  end
-
-  # The live socket fd of an established connection (CURLINFO_ACTIVESOCKET), or
-  # nil if there isn't one. Used by URL::WebSocket to wait (via curl_multi_poll) between the
-  # ws_send / ws_recv framing primitives.
-  def activesocket; URL::Libcurl.easy_getinfo(@handle, :activesocket); end
-  # Seconds the server asked us to wait before retrying (Retry-After header,
-  # parsed by libcurl); nil when the response carried none.
-  def retry_after;  URL::Libcurl.easy_getinfo(@handle, :retry_after);  end
-
-  # WebSocket framing primitives — thin pass-throughs to the C glue. ws_recv
-  # returns [bytes, flags, bytesleft] or nil on CURLE_AGAIN; ws_send returns
-  # [byte count sent, flags used] or nil on CURLE_AGAIN (flags == 0 lets the C
-  # side classify the payload as TEXT or BINARY by UTF-8 validity). All
-  # message-level logic (reassembly, frame dispatch, the send loop) lives in
-  # URL::WebSocket.
-  def ws_recv(buflen);                    URL::Libcurl.easy_ws_recv(@handle, buflen);                 end
-  def ws_send(data, flags, fragsize = 0); URL::Libcurl.easy_ws_send(@handle, data, flags, fragsize); end
-
-  # Blocking single-transfer drive (curl_easy_perform). Returns the CURLcode as
-  # a value (0 == success). Used by the WebSocket connect path: with
-  # :connect_only => 2 it runs the upgrade handshake and leaves the live socket
-  # on the handle for ws_recv / ws_send.
-  def perform; URL::Libcurl.easy_perform(@handle); end
 
   # Callback setters. The block is stashed as an ivar on the Easy handle so the
   # C trampoline can pick it up; the write/header callbacks yield a String of
