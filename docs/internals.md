@@ -55,10 +55,17 @@ Ruby. To drive transfers on a platform loop (glib, libuv, …) instead, subclass
 class URL::EventLoop
   def watch(io, readiness, &block)   # readiness: :in / :out / :inout — start watching io
   def unwatch(handle)                # handle is whatever watch returned
-  def arm_timer(ms, &block)          # call block.() once, ms from now
-  def cancel_timer(handle)
+  def arm_timer(seconds, &block)     # call block.() once, `seconds` from now —
+  def cancel_timer(handle)           #   a chrono duration (Float seconds)
 end
 ```
+
+Timeouts are chrono durations (seconds-denominated Numerics) everywhere in
+Ruby — libcurl's milliseconds are converted to a duration at the C boundary
+(`mrb_chrono_from`) before `arm_timer` ever sees them, and durations you pass
+in (`timeout:`, `URL#poll`) are converted back the same way
+(`mrb_chrono_convert`). A loop adapter only converts at *its* platform's
+boundary, in whatever unit that platform speaks.
 
 Your loop's only job is to invoke the block at the right moment: call the
 `watch` block when the fd becomes ready, and the `arm_timer` block when the

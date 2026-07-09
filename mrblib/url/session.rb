@@ -31,17 +31,20 @@ class URL
     @by_easy         = {}
     @event_loop      = nil
     @_timer_handle   = nil
-    @pending_timeout = nil
+    @pending_timeout = :unset
 
     # libcurl's socket/timer callbacks call straight back into these blocks (run
     # under mrb_protect_error in C). on_socket replays each fd change to the
     # event loop; on_timer records the timeout that socket_action's drain loop
-    # and the timer re-arm at the end of socket_action consume — no C-side buffering.
+    # and the timer re-arm at the end of socket_action consume — no C-side
+    # buffering. The timeout arrives as a chrono duration (Float seconds,
+    # converted from libcurl's ms at the C boundary), or nil for libcurl's
+    # "delete the timer".
     @multi.on_socket = lambda do |fd, what|
       _socket_ready(fd, what) if @event_loop
     end
-    @multi.on_timer = lambda do |ms|
-      @pending_timeout = ms
+    @multi.on_timer = lambda do |timeout|
+      @pending_timeout = timeout
     end
 
     # The procs an event loop invokes on fd readiness / timer expiry: drive
@@ -100,28 +103,30 @@ class URL
     fd = fd.fileno if fd.respond_to?(:fileno)
 
     # on_socket fires _socket_ready during the call; on_timer records the
-    # new timeout into @pending_timeout. libcurl can ask to be re-driven
-    # immediately by reporting a 0ms timeout — drained below before arming.
-    @pending_timeout = nil
+    # new timeout (a chrono duration in seconds, or nil for "delete the
+    # timer") into @pending_timeout. libcurl can ask to be re-driven
+    # immediately by reporting a zero timeout — drained below before arming.
+    @pending_timeout = :unset
     running = URL::Libcurl.multi_socket_action(@multi, fd, ev)
     timeout = @pending_timeout
 
     drain_limit = 64
     while timeout == 0 && drain_limit > 0
       drain_limit -= 1
-      @pending_timeout = nil
+      @pending_timeout = :unset
       running = URL::Libcurl.multi_socket_action(@multi, URL::Libcurl::SOCKET_TIMEOUT, nil)
       timeout = @pending_timeout
     end
 
-    # Arm/cancel the event loop's timer from the timeout libcurl reported:
-    # nil leaves any existing timer alone, <= 0 cancels, > 0 re-arms.
-    if !timeout.nil? && @event_loop
+    # Arm/cancel the event loop's timer from what libcurl reported:
+    # :unset (callback never fired) leaves any existing timer alone,
+    # nil / zero cancels, a positive duration re-arms.
+    if timeout != :unset && @event_loop
       if @_timer_handle
         @event_loop.cancel_timer(@_timer_handle)
         @_timer_handle = nil
       end
-      @_timer_handle = @event_loop.arm_timer(timeout, &@_timer_block) if timeout > 0
+      @_timer_handle = @event_loop.arm_timer(timeout, &@_timer_block) if timeout && timeout > 0
     end
 
     running
@@ -136,11 +141,13 @@ class URL
     URL::Libcurl.multi_perform(@multi)
   end
 
-  # Wait up to `ms` for activity on any of libcurl's own fds (or just sleep
-  # the full timeout when nothing is attached) — curl_multi_poll, libcurl's
-  # portable wait. Caps at libcurl's next internal timeout automatically.
-  def poll(ms)
-    URL::Libcurl.multi_poll(@multi, ms)
+  # Wait up to `timeout` (a chrono duration — 500.ms, 2.s, any Numeric
+  # seconds) for activity on any of libcurl's own fds, or just sleep the full
+  # timeout when nothing is attached — curl_multi_poll, libcurl's portable
+  # wait. Caps at libcurl's next internal timeout automatically. The
+  # seconds→ms conversion happens in C via mruby-chrono, never here.
+  def poll(timeout)
+    URL::Libcurl.multi_poll(@multi, timeout)
   end
 
   # Yield one [request, result_code] pair per completed transfer. The C

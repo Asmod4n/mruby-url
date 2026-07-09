@@ -249,7 +249,9 @@ class URL::Response
                elsif size < 1024 * 1024 then "#{(size / 1024.0).round(1)}KB"
                else                          "#{(size / 1024.0 / 1024.0).round(1)}MB"
                end
-    time_str = @total_time && @total_time > 0 ? " in #{(@total_time * 1000).round}ms" : ""
+    # @total_time is a chrono duration (seconds); print it as-is — timeouts
+    # only change units inside mruby-chrono's converters, never by hand.
+    time_str = @total_time && @total_time > 0 ? " in #{@total_time.round(3)}s" : ""
     ct_str   = @content_type ? " #{@content_type}" : ""
     "#<#{self.class} #{@code}#{ct_str} #{size_str}#{time_str} #{@effective_url.inspect}>"
   end

@@ -43,11 +43,12 @@ class URL::WebSocket
   # several chunks (meta.bytesleft > 0); #receive stitches them back together.
   RECV_CHUNK = 65_536
 
-  # Slice for the blocking waits when the caller gave no timeout. multi_poll
-  # returns the moment the socket is ready, so this only bounds how long a
-  # completely idle connection sleeps before looping — big on purpose, so an
-  # idle #receive doesn't wake Ruby needlessly.
-  IDLE_SLICE_MS = 3_600_000
+  # Slice for the blocking waits when the caller gave no timeout — one hour,
+  # as a chrono duration (Integer seconds). multi_poll returns the moment the
+  # socket is ready, so this only bounds how long a completely idle
+  # connection sleeps before looping — big on purpose, so an idle #receive
+  # doesn't wake Ruby needlessly.
+  IDLE_SLICE = 3600
 
   # One inbound message handed back by #receive. `type` is :text, :binary or
   # :close; `data` is the (reassembled) payload bytes.
@@ -325,17 +326,19 @@ class URL::WebSocket
   # (ws_recv => nil). Returns the [data, flags, bytesleft] triple, or :timeout.
   # Readiness comes from curl_multi_poll with the ws socket as an extra fd —
   # libcurl's own portable wait; it returns the moment the fd is ready, so a
-  # nil timeout just sleeps in big idle slices.
+  # nil timeout just sleeps in big idle slices. `timeout` is a chrono duration
+  # handed to the C primitive untouched — mruby-chrono does the ms conversion
+  # and the type check there.
   def _recv_chunk(timeout)
     loop do
       frame = URL::Libcurl.easy_ws_recv(@handle, RECV_CHUNK)
       return frame if frame
 
       if timeout
-        ready = URL::Libcurl.multi_poll(@wait_multi, URL._duration_ms(timeout), @fd, :in)
+        ready = URL::Libcurl.multi_poll(@wait_multi, timeout, @fd, :in)
         return :timeout if ready == 0
       else
-        URL::Libcurl.multi_poll(@wait_multi, IDLE_SLICE_MS, @fd, :in)
+        URL::Libcurl.multi_poll(@wait_multi, IDLE_SLICE, @fd, :in)
       end
     end
   end
@@ -377,7 +380,7 @@ class URL::WebSocket
       r = URL::Libcurl.easy_ws_send(@handle, data, flags, 0)
       return r if r
 
-      URL::Libcurl.multi_poll(@wait_multi, IDLE_SLICE_MS, @fd, :out)
+      URL::Libcurl.multi_poll(@wait_multi, IDLE_SLICE, @fd, :out)
     end
   end
 

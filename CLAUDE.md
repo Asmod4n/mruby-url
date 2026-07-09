@@ -32,3 +32,12 @@ logic a fuzzer could reach sits in memory-safe Ruby.
   set are made in Ruby.
 - Prefer mruby's arg/type helpers (they type-check and reject bad input, e.g.
   embedded NULs) over hand-rolled pointer/length handling.
+- **Timeouts cross the boundary through mruby-chrono — in and out, no
+  exceptions.** Ruby speaks chrono durations (seconds-denominated Numerics:
+  `30.s`, `500.ms`) and passes them around untouched; the only place a
+  duration changes unit is the C boundary, via `mrb_chrono_convert` (Ruby →
+  libcurl, e.g. `setopt(:timeout)`, `multi_poll`) and `mrb_chrono_from`
+  (libcurl → Ruby, e.g. the timer callback's ms, `retry_after`,
+  `total_time`). Never hand-roll `* 1000` / `/ 1e6` unit math in .rb files
+  or in C — chrono's converters carry the type check (TypeError), range
+  check and explicit rounding that hand math silently loses.

@@ -13,10 +13,11 @@
 # to provide, no more.
 
 class URL::SyncDriver
-  # Cap for one poll. curl_multi_poll returns earlier on socket activity or
-  # when libcurl's own next timeout is nearer, so this is a ceiling, not a
-  # latency — it only bounds how long a spurious idle wait could last.
-  POLL_MS = 1000
+  # Cap for one poll (a chrono duration, in seconds). curl_multi_poll returns
+  # earlier on socket activity or when libcurl's own next timeout is nearer,
+  # so this is a ceiling, not a latency — it only bounds how long a spurious
+  # idle wait could last.
+  POLL = 1
 
   def initialize(session)
     @session = session
@@ -52,7 +53,7 @@ class URL::SyncDriver
       @session.info_read { |req, code| on_complete&.call(req, code) }
       break if stop.call
       break if running == 0   # nothing in flight can complete the stop condition
-      @session.poll(POLL_MS)
+      @session.poll(POLL)
     end
   end
 end
@@ -65,7 +66,7 @@ end
 class URL::IOSelectLoop < URL::EventLoop
   def initialize
     @watching   = {}   # fd => { io:, readiness:, block: }
-    @timers     = {}   # handle => { ms:, block: } — one per arm_timer caller
+    @timers     = {}   # handle => { seconds:, block: } — one per arm_timer caller
     @next_timer = 0    # monotonically increasing timer handle
   end
 
@@ -79,9 +80,12 @@ class URL::IOSelectLoop < URL::EventLoop
     @watching.delete(handle)
   end
 
-  def arm_timer(ms, &block)
+  # `seconds` is a chrono duration (Float seconds) — the session converts
+  # libcurl's milliseconds at the C boundary, so no unit math happens here:
+  # it is already what IO.select wants.
+  def arm_timer(seconds, &block)
     handle = (@next_timer += 1)
-    @timers[handle] = { ms: ms, block: block }
+    @timers[handle] = { seconds: seconds, block: block }
     handle
   end
 
@@ -106,11 +110,11 @@ class URL::IOSelectLoop < URL::EventLoop
         writes << w[:io] if w[:readiness] == :out || w[:readiness] == :inout
       end
 
-      soonest = nil
+      sel_timeout = nil
       @timers.each_value do |t|
-        soonest = t[:ms] if t[:ms] >= 0 && (soonest.nil? || t[:ms] < soonest)
+        s = t[:seconds]
+        sel_timeout = s if s >= 0 && (sel_timeout.nil? || s < sel_timeout)
       end
-      sel_timeout = soonest ? soonest / 1000.0 : nil
       break if reads.empty? && writes.empty? && sel_timeout.nil?
 
       if reads.empty? && writes.empty?

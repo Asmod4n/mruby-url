@@ -424,30 +424,18 @@ class URL
       )
     end
 
-    # Seconds → milliseconds for the Ruby-side waits, the same contract
-    # mrb_chrono_convert enforces for setopt(:timeout) in C: a duration is a
-    # seconds-denominated Numeric (mruby-chrono's 30.s / 500.ms literals are
-    # exactly that), so anything else is rejected up front instead of being
-    # silently to_f'd.
-    def _duration_ms(value)
-      unless value.is_a?(Numeric)
-        raise TypeError, "expected a duration/seconds (Numeric), got #{value.class}"
-      end
-      (value.to_f * 1000).round
-    end
-
-    # Block for `seconds` using libcurl's own wait (curl_multi_poll on an
-    # idle session — it sleeps the full timeout even with nothing attached,
-    # portably, Windows included; IO.select can't do that there). Used
-    # between retry rounds on the blocking paths only; event-loop
-    # integrations never reach this. A nil/zero wait is a no-op.
+    # Block for `seconds` (a chrono duration) using libcurl's own wait
+    # (curl_multi_poll on an idle session — it sleeps the full timeout even
+    # with nothing attached, portably, Windows included; IO.select can't do
+    # that there). No unit math here: the duration goes to the C primitive
+    # untouched and mruby-chrono converts it at the boundary. Used between
+    # retry rounds on the blocking paths and by IOSelectLoop's fd-less
+    # iterations. A nil/zero wait is a no-op.
     def _wait(seconds)
-      return nil if seconds.nil?
-      ms = _duration_ms(seconds)
-      return nil if ms <= 0
+      return nil if seconds.nil? || seconds == 0
       session = shared
       session = open if session._busy?
-      session.poll(ms)
+      session.poll(seconds)
       nil
     end
 

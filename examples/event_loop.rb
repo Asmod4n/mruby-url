@@ -122,7 +122,10 @@ section "4. What a real integration implements"
 #       # return a handle you can undo later
 #     end
 #     def unwatch(handle)                # g_source_remove(handle)
-#     def arm_timer(ms, &block)          # g_timeout_add(ms) { block.(); false }
+#     def arm_timer(seconds, &block)     # `seconds` is a chrono duration —
+#       # convert to the platform's unit at the platform's boundary, e.g.
+#       # g_timeout_add((seconds * 1000).ceil) { block.(); false }
+#     end
 #     def cancel_timer(handle)           # g_source_remove(handle)
 #   end
 #
