@@ -113,6 +113,19 @@ class URL::IOSelectLoop < URL::EventLoop
       sel_timeout = soonest ? soonest / 1000.0 : nil
       break if reads.empty? && writes.empty? && sel_timeout.nil?
 
+      if reads.empty? && writes.empty?
+        # Timer-only iteration (e.g. libcurl's threaded resolver mid-lookup,
+        # or a just-finished transfer whose last timer is still armed). Can't
+        # IO.select here: WinSock's select() rejects three empty fd sets.
+        # Sleep out the nearest timeout with libcurl's own portable wait,
+        # then fire the timers.
+        URL._wait(sel_timeout)
+        due = @timers
+        @timers = {}
+        due.each_value { |t| t[:block].call }
+        next
+      end
+
       r, w, _e = IO.select(reads, writes, nil, sel_timeout)
 
       if r.nil? && w.nil?
