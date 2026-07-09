@@ -177,7 +177,7 @@ class URL::Response
     unless times.is_a?(Integer) && times >= 1
       raise ArgumentError, "retry times must be an Integer >= 1, got #{times.inspect}"
     end
-    unless wait.nil? || (wait.respond_to?(:to_f) && wait.to_f >= 0)
+    unless wait.nil? || (wait.is_a?(Numeric) && wait.to_f >= 0)
       raise ArgumentError, "retry wait must be a duration/seconds >= 0, got #{wait.inspect}"
     end
     if error.nil?
@@ -363,9 +363,11 @@ class URL
       PROTOS.include?(proto.to_s.downcase)
     end
     # Set once at startup with a platform-driven EventLoop instance; the
-    # verbs then attach new sessions to it and return immediately.
+    # verbs then attach new sessions to it and return immediately. nil
+    # restores the default blocking mode (transfers already attached to the
+    # old loop finish on it).
     def default_loop=(loop)
-      unless loop.is_a?(EventLoop)
+      unless loop.nil? || loop.is_a?(EventLoop)
         raise TypeError, "expected a URL::EventLoop, got #{loop.class}"
       end
       @default_loop = loop

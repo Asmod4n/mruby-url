@@ -76,4 +76,30 @@ class URL::Request
     @handle.on_read = block
     self
   end
+
+  # Completion callback for event-loop driving: the session's reap path calls
+  # it once, with the transfer's CURLcode, when this request finishes. Cleared
+  # after firing so a reused handle can't replay a stale callback.
+  #
+  # `detach: false` keeps the finished easy attached to its multi instead of
+  # the reap's default remove. A CONNECT_ONLY transfer needs this: removing
+  # the easy from the multi severs the established connection
+  # (CURLINFO_ACTIVESOCKET goes away), and the evented WebSocket keeps using
+  # it — it detaches itself later, at teardown.
+  def on_complete(detach: true, &block)
+    @on_complete        = block
+    @detach_on_complete = detach
+    self
+  end
+
+  def _detach_on_complete?
+    @detach_on_complete.nil? ? true : @detach_on_complete
+  end
+
+  def _complete(code)
+    cb = @on_complete
+    @on_complete = nil
+    cb.call(code) if cb
+    nil
+  end
 end

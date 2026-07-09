@@ -49,13 +49,13 @@ class URL
     # action/timer cfuncs.
     @_action_block = lambda do |io, cond|
       socket_action(io, cond)
-      info_read { |req, _code| remove(req) rescue nil }
+      _reap
       true
     end
 
     @_timer_block = lambda do
       socket_action
-      info_read { |req, _code| remove(req) rescue nil }
+      _reap
       false
     end
 
@@ -152,6 +152,22 @@ class URL
       yield req, pair[1] if req
     end
     self
+  end
+
+  # Event-loop reap: detach each finished transfer, then fire its Request's
+  # completion callback (Request#on_complete) with the CURLcode. This is how
+  # evented callers learn a transfer finished — e.g. the WebSocket upgrade
+  # handshake. The blocking SyncDriver paths deliver completions through
+  # their own run_until/run_n blocks and never come through here.
+  #
+  # A request registered with on_complete(detach: false) stays attached: a
+  # completed CONNECT_ONLY easy loses its established connection the moment
+  # it leaves the multi, so the WebSocket detaches itself at teardown instead.
+  def _reap
+    info_read do |req, code|
+      (remove(req) rescue nil) if req._detach_on_complete?
+      req._complete(code)
+    end
   end
 
 end

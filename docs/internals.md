@@ -73,7 +73,23 @@ URL.default_loop = MyGlibLoop.new
 URL("https://example.com/ping").get   # attaches to the loop, returns nil
 ```
 
-or set it per session via `session.event_loop = my_loop`.
+or set it per session via `session.event_loop = my_loop`. Setting
+`URL.default_loop = nil` restores the blocking mode (transfers already
+attached to the old loop finish on it).
+
+WebSockets ride the same loop: with a default loop installed,
+`URL("wss://…").connect` returns a `connecting?` socket immediately, the
+handshake is driven as a loop-attached transfer, and messages flow through
+`on_message` — see the [usage guide](usage.md#evented-websocket). Internally
+the handshake request stays attached to its session's multi for the socket's
+whole life (`Request#on_complete(detach: false)`) because removing a
+CONNECT_ONLY easy from its multi severs the established connection; the
+socket detaches it at teardown.
+
+Completion notification is per-request: `Request#on_complete` fires once with
+the transfer's CURLcode when the session's event-loop reap sees it finish —
+that's the hook the evented WebSocket (and anything else that needs to know a
+loop-driven transfer ended) builds on.
 
 ### Driving a session by hand
 
@@ -101,7 +117,12 @@ loop.run                # pumps IO.select, firing the session's blocks,
 
 A real platform loop has no `run` of its own to call — its host application's
 loop plays that role; it only implements `watch`/`unwatch`/`arm_timer`/
-`cancel_timer` exactly as `IOSelectLoop` does.
+`cancel_timer` exactly as `IOSelectLoop` does. Note that several sessions can
+share one loop (every fire-and-forget verb opens its own), so `arm_timer` must
+track one timer per call, not a single slot.
+
+Runnable tour of all three shapes — fire-and-forget verbs, evented WebSocket,
+hand-driven session: [`examples/event_loop.rb`](../examples/event_loop.rb).
 
 ## Threads and processes
 

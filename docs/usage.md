@@ -434,3 +434,32 @@ Without a block, `connect` returns the socket and you close it yourself
 message arrives in time; `#send_*` / `#receive` on a closed socket are
 no-ops returning `nil`. Only genuine usage errors raise: a non-ws scheme, or a
 libcurl built without WebSocket support (needs 7.86+).
+
+### Evented WebSocket
+
+Everything above is the blocking mode. With an event loop installed
+(`URL.default_loop=`, see [internals](internals.md#event-loop-integration)),
+`connect` never blocks: it returns immediately with the socket in the
+`connecting?` state, the upgrade handshake rides the loop, and the connect
+block becomes the **on_open** callback (no auto-close). Messages arrive
+through `on_message`, `send` queues without blocking (even while still
+connecting), and `on_close` fires exactly once — with the peer's close
+Message, or `nil` for a local `close`/failure:
+
+```ruby
+URL.default_loop = my_loop   # once, at startup
+
+ws = URL("wss://stream.example/live").connect do |w|
+  w.send("subscribe")                # on_open — the socket just came up
+end
+
+ws.on_message { |msg| handle(msg) }  # each complete message, reassembled
+ws.on_close   { |m|  reconnect if m }  # peer closed (m is their close frame)
+```
+
+A failed handshake stays a value: `ws.error` carries the failure and
+`on_close` fires with `nil`. The two modes don't mix — `receive`/`each` on an
+evented socket raise (they would stall the loop), as does setting
+`on_message`/`on_open`/`on_close` on a blocking one. Callbacks whose moment
+already passed fire immediately on registration, so there is no race between
+connecting fast and registering late.

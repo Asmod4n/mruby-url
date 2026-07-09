@@ -39,11 +39,13 @@ URL("wss://echo.websocket.org").connect { |ws| ws.send("hi"); puts ws.receive.da
 - **Parallel fan-out** — register any number of transfers (any scheme, any
   verb) and drive them concurrently on one session, with per-response `retry`.
 - **WebSockets** — `connect`, `send`, `receive`; fragmentation, PING/PONG and
-  TEXT-vs-BINARY framing handled for you.
+  TEXT-vs-BINARY framing handled for you. Evented too: on a loop, messages
+  arrive via `on_message` and nothing ever blocks.
 - **Fast repeat requests** — one shared session reuses connections, TLS
   sessions and HTTP/2 streams across calls.
-- **Event-loop friendly** — verbs block by default, or plug the transfers into
-  your own loop (glib, libuv, …) with a four-method adapter.
+- **Event-loop friendly** — verbs block by default, or plug everything
+  (including WebSockets) into your own loop (glib, libuv, …) with a
+  four-method adapter.
 
 ## Installation
 
@@ -85,7 +87,8 @@ The high-level API is settling toward a first tagged release.
   sharing, event-loop integration, thread and fork rules.
 
 Runnable examples live in [`examples/`](examples/) — an API tour, an
-error-handling walkthrough, and a WebSocket demo.
+error-handling walkthrough, a WebSocket demo, and an event-loop
+integration tour.
 
 ## License
 

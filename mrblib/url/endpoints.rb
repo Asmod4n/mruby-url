@@ -364,9 +364,16 @@ class URL
 
       def initialize(uri, exec = URL::SyncExec); @uri = uri.to_s; @exec = exec; URL._require_protocol!(@uri); end
 
+      # Blocking mode: the block receives the live socket and the socket is
+      # closed when the block returns. Evented mode (URL.default_loop set):
+      # connect returns a :connecting socket immediately and the block becomes
+      # its on_open callback — no auto-close; the socket lives until #close or
+      # the peer closes (delivered via on_close).
       def connect(**opts, &block)
         ws = @exec.websocket(@uri, _ck(opts))
-        if block && ws.open?
+        if ws.connecting?
+          ws.on_open(&block) if block
+        elsif block && ws.open?
           begin
             block.call(ws)
           ensure

@@ -795,6 +795,15 @@ proto_assert('URL.websocket block form yields a live socket then closes it', 'ws
   assert_true ws.closed?
 end
 
+proto_assert('URL.websocket receive timeout: durations in, non-numerics out', 'ws', $ws_port) do
+  ws = URL("ws://127.0.0.1:#{$ws_port}/").connect
+  ws.send('dur')
+  msg = ws.receive(timeout: 5.s)               # chrono duration (a seconds-Float)
+  assert_equal 'dur', msg.data
+  assert_raise(TypeError) { ws.receive(timeout: "5") }   # same contract as setopt(:timeout)
+  ws.close
+end
+
 proto_assert('URL.websocket failed upgrade is a value, not a raise', 'ws', $ws_port) do
   # Point ws:// at the plain HTTP server: it answers with a normal response,
   # never a 101, so the handshake fails. That is a value on #error.
@@ -803,6 +812,102 @@ proto_assert('URL.websocket failed upgrade is a value, not a raise', 'ws', $ws_p
   assert_true  ws.error.is_a?(URL::TransferError)
   assert_nil   ws.send('x')             # no-op on a closed socket, never raises
   assert_nil   ws.receive(timeout: 0)
+end
+
+# ---- WebSocket, evented ----------------------------------------------------
+# With URL.default_loop installed, connect returns a :connecting socket
+# immediately; the handshake, reads and writes all ride the loop and messages
+# arrive through on_message. URL::IOSelectLoop is the reference loop.
+
+proto_assert('URL.websocket evented: echo round-trip via on_message', 'ws', $ws_port) do
+  sel = URL::IOSelectLoop.new
+  URL.default_loop = sel
+  begin
+    opened = false
+    got    = nil
+    closed = false
+
+    # In evented mode the connect block is the on_open callback (no auto-close).
+    ws = URL("ws://127.0.0.1:#{$ws_port}/").connect do |w|
+      opened = true
+      w.send('evented hello')          # echoed back by the fixture
+    end
+    assert_true  ws.connecting?        # returned before the handshake finished
+    assert_false ws.open?
+    assert_nil   ws.send('early')      # queued (never blocks), flushed on open
+
+    ws.on_message do |m|
+      got = m
+      ws.close
+    end
+    ws.on_close { closed = true }
+
+    sel.run                            # drives handshake, echo and close to completion
+
+    assert_true  opened
+    assert_false got.nil?
+    assert_true  got.text?
+    assert_equal 'early', got.data     # the pre-open queue flushed first, in order
+    assert_true  closed
+    assert_true  ws.closed?
+    assert_nil   ws.error
+  ensure
+    URL.default_loop = nil
+  end
+end
+
+proto_assert('URL.websocket evented: failed upgrade lands on on_close + #error', 'ws', $ws_port) do
+  sel = URL::IOSelectLoop.new
+  URL.default_loop = sel
+  begin
+    close_arg = :unset
+    ws = URL("ws://127.0.0.1:#{$server_port}/echo").connect   # plain HTTP: no 101
+    ws.on_close { |m| close_arg = m }
+    sel.run
+    assert_true  ws.closed?
+    assert_false ws.open?
+    assert_nil   close_arg                            # nil close arg for a failure…
+    assert_true  ws.error.is_a?(URL::TransferError)   # …the failure itself is on #error
+  ensure
+    URL.default_loop = nil
+  end
+end
+
+proto_assert('URL.websocket evented/blocking APIs reject each other', 'ws', $ws_port) do
+  sel = URL::IOSelectLoop.new
+  URL.default_loop = sel
+  begin
+    ws = URL("ws://127.0.0.1:#{$ws_port}/").connect
+    assert_raise(URL::Error) { ws.receive }       # would block the loop
+    assert_raise(URL::Error) { ws.each { } }
+    ws.close                                      # mid-handshake close is fine
+    sel.run                                       # drains the abandoned handshake
+    assert_true ws.closed?
+  ensure
+    URL.default_loop = nil
+  end
+
+  ws = URL("ws://127.0.0.1:#{$ws_port}/").connect  # blocking socket
+  assert_raise(URL::Error) { ws.on_message { } }   # callbacks are evented-only
+  assert_raise(URL::Error) { ws.on_open { } }
+  assert_raise(URL::Error) { ws.on_close { } }
+  ws.close
+end
+
+proto_assert('URL evented verbs: fire-and-forget on URL.default_loop', 'http', $server_port) do
+  # With a default loop the plain verbs attach to it and return nil; body
+  # bytes arrive through the streaming block once the loop runs.
+  sel = URL::IOSelectLoop.new
+  URL.default_loop = sel
+  begin
+    body = ""
+    ret  = URL("http://127.0.0.1:#{$server_port}/echo").get { |chunk| body << chunk }
+    assert_nil ret
+    sel.run
+    assert_equal 'GET', JSON.parse(body)['method']
+  ensure
+    URL.default_loop = nil
+  end
 end
 
 # ---- non-HTTP protocols ---------------------------------------------------

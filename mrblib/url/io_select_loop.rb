@@ -64,8 +64,9 @@ end
 # and timer callbacks.
 class URL::IOSelectLoop < URL::EventLoop
   def initialize
-    @watching = {}    # fd => { io:, readiness:, block: }
-    @timer    = nil   # { ms:, block: }
+    @watching   = {}   # fd => { io:, readiness:, block: }
+    @timers     = {}   # handle => { ms:, block: } — one per arm_timer caller
+    @next_timer = 0    # monotonically increasing timer handle
   end
 
   def watch(io, readiness, &block)
@@ -79,18 +80,25 @@ class URL::IOSelectLoop < URL::EventLoop
   end
 
   def arm_timer(ms, &block)
-    @timer = { ms: ms, block: block }
-    :timer
+    handle = (@next_timer += 1)
+    @timers[handle] = { ms: ms, block: block }
+    handle
   end
 
-  def cancel_timer(_handle)
-    @timer = nil
+  def cancel_timer(handle)
+    @timers.delete(handle)
   end
 
   # Pump until nothing is watched and no timer is armed. A real platform loop
   # wouldn't have this method — its own run loop plays this role.
+  #
+  # Timer precision is deliberately crude (this is the reference loop, not a
+  # scheduler): the nearest timeout bounds the select, and when select expires
+  # with no fd activity every armed timer fires. Firing a curl timer early is
+  # harmless — its block just drives socket_action, which consults libcurl's
+  # real timing state and re-arms as needed.
   def run
-    until @watching.empty? && @timer.nil?
+    until @watching.empty? && @timers.empty?
       reads  = []
       writes = []
       @watching.each_value do |w|
@@ -98,15 +106,19 @@ class URL::IOSelectLoop < URL::EventLoop
         writes << w[:io] if w[:readiness] == :out || w[:readiness] == :inout
       end
 
-      sel_timeout = @timer && @timer[:ms] >= 0 ? @timer[:ms] / 1000.0 : nil
+      soonest = nil
+      @timers.each_value do |t|
+        soonest = t[:ms] if t[:ms] >= 0 && (soonest.nil? || t[:ms] < soonest)
+      end
+      sel_timeout = soonest ? soonest / 1000.0 : nil
       break if reads.empty? && writes.empty? && sel_timeout.nil?
 
       r, w, _e = IO.select(reads, writes, nil, sel_timeout)
 
       if r.nil? && w.nil?
-        t = @timer
-        @timer = nil
-        t[:block].call if t
+        due = @timers
+        @timers = {}
+        due.each_value { |t| t[:block].call }
       else
         r&.each { |io| _fire(io, :in)  }
         w&.each { |io| _fire(io, :out) }
