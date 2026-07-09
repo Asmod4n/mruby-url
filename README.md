@@ -1,23 +1,16 @@
 # mruby-url
 
-A URL client for mruby backed by an embedded libcurl. **Every scheme libcurl
-can be built with is reachable** — `http(s)`, `ftp(s)`, `sftp`, `scp`,
-`file`, `dict`, `gopher(s)`, `pop3(s)`, `imap(s)`, `smtp(s)`, `ldap(s)`,
-`mqtt(s)`, `rtsp`, `telnet`, `tftp`, `ws(s)` — exposed through one small
-surface where each scheme has the verbs that fit it. Errors are values, the
-connection / TLS-session cache is shared across requests, and dependencies
-land where you'd expect them on Linux/macOS/Windows.
+A URL client for mruby, backed by an embedded libcurl.
+
+One small API covers every protocol your libcurl was built with — `http(s)`,
+`ftp(s)`, `sftp`, `scp`, `file`, `dict`, `gopher(s)`, `pop3(s)`, `imap(s)`,
+`smtp(s)`, `ldap(s)`, `mqtt(s)`, `rtsp`, `telnet`, `tftp`, `ws(s)` — with each
+scheme exposing just the verbs that fit it.
 
 ```ruby
 URL("https://example.com").get.body
 URL("https://api.example.com/users").get(params: { limit: 10 }).json
 URL("https://api.example.com/users").post(json: { name: "Alice" }).raise_for_status!.json
-
-# multipart/form-data (curl_mime): String = field, Hash = file part (streamed from disk)
-URL("https://api.example.com/upload").post(multipart: {
-  "title"  => "vacation",
-  "avatar" => { file: "pic.png", type: "image/png" },
-})
 
 # Streaming a big response
 URL("https://huge.example.com/file").get { |chunk| sink << chunk }
@@ -29,633 +22,71 @@ URL("imaps://user:pw@mail/INBOX").fetch(uid: 42).body
 URL("wss://echo.websocket.org").connect { |ws| ws.send("hi"); puts ws.receive.data }
 ```
 
-> **Heads-up — history rewrite (2026-07-05):** `main` was force-pushed to
-> scrub tool-generated session URLs from old commit messages; every commit
-> SHA from mid-history onward changed. A plain `git pull` on an existing
-> clone will fail or produce a bogus merge. Re-sync with:
->
-> ```sh
-> git fetch origin
-> git checkout main
-> git reset --hard origin/main
-> ```
->
-> Local branches made before the rewrite need
-> `git rebase --onto origin/main 4a245f622f82b4ce22f69303bab8122a0b8d4ba2 <your-branch>`
-> (`4a245f622f82b4ce22f69303bab8122a0b8d4ba2` was main's pre-rewrite head; substitute the older
-> commit your branch actually forked from if it predates it — or just
-> re-clone). CI now rejects any push that reintroduces such URLs.
+## What you get
 
-> **Status:** every scheme is implemented and covered by fixture-server
-> integration tests. The high-level API is settling toward a tagged release.
-> Which protocols are actually available at runtime depends on the libcurl
-> this gem was built against — check with `URL.supports?("scheme")`.
+- **Sensible defaults** — 30 s timeout, redirects followed, everything
+  overridable per call.
+- **Errors are values** — timeouts, DNS failures, TLS rejections and HTTP
+  4xx/5xx land on the response (`resp.error`), never raised behind your back.
+  Prefer exceptions? Chain `.raise_for_status!`.
+- **JSON in and out** — `json:` request bodies; `resp.json`, lazy parsing, and
+  typed deserialization straight into your own classes.
+- **Uploads and downloads that stream** — pass a block to receive a response
+  chunk by chunk; hand `upload` a String, IO, Enumerable, Proc or Fiber and it
+  streams without buffering.
+- **Multipart form posts** — `multipart:` builds `multipart/form-data`, with
+  file parts streamed from disk.
+- **Parallel fan-out** — register any number of transfers (any scheme, any
+  verb) and drive them concurrently on one session, with per-response `retry`.
+- **WebSockets** — `connect`, `send`, `receive`; fragmentation, PING/PONG and
+  TEXT-vs-BINARY framing handled for you.
+- **Fast repeat requests** — one shared session reuses connections, TLS
+  sessions and HTTP/2 streams across calls.
+- **Event-loop friendly** — verbs block by default, or plug the transfers into
+  your own loop (glib, libuv, …) with a four-method adapter.
 
-## Calling URL
+## Installation
 
-`URL(uri)` dispatches on the scheme and returns a **per-protocol class** — one
-per scheme: `URL::HTTP`/`URL::HTTPS`, `URL::FTP`/`URL::FTPS`, `URL::SFTP`,
-`URL::SCP`, `URL::FILE`, `URL::TFTP`, `URL::TELNET`, `URL::GOPHER`/`URL::GOPHERS`,
-`URL::DICT`, `URL::IMAP`/`URL::IMAPS`, `URL::POP3`/`URL::POP3S`,
-`URL::SMTP`/`URL::SMTPS`, `URL::LDAP`/`URL::LDAPS`, `URL::MQTT`/`URL::MQTTS`,
-`URL::RTSP`, `URL::WS`/`URL::WSS`. Protocols that share an operation shape share
-a parent they subclass: the whole ftp/ssh/file family subclasses
-`URL::Transfer` (`download`/`upload`/`list`), and each TLS variant subclasses
-its plaintext base (`URL::HTTPS < URL::HTTP`, `URL::FTPS < URL::Transfer`, …).
-Each class carries only the verbs that fit the protocol.
-
-A per-protocol class exists **only when this libcurl was built with that
-protocol** — mirroring libcurl, where an unbuilt scheme has no handler at all.
-So on a build without an SSH backend `URL::SFTP` simply doesn't exist
-(referencing it is a `NameError`), and `URL("sftp://…")` raises
-`URL::ProtocolNotAvailable` from `URL(uri)` itself — no wrapper is constructed
-for a protocol the build can't use, so the failure surfaces immediately, not
-later at a verb. A scheme the gem doesn't know at all raises
-`URL::UnsupportedScheme`. Both descend from `URL::SchemeError` (itself a
-`URL::Error`) and carry the offending `.scheme` plus the `.supported` protocol
-list, so a handler can branch on data instead of scraping the message. Check
-ahead of time with `URL.supports?("scheme")` or against `URL::PROTOS`.
+Add the gem to your mruby `build_config.rb`:
 
 ```ruby
-# Build once, call repeatedly:
-api = URL("https://api.example.com/users")
-api.get(params: { limit: 10 })
-api.post(json: payload)
-
-# One-shot class method when you know the scheme up front, no factory:
-URL::HTTPS.get("https://x", json: {...})
-URL::SFTP.upload("sftp://h/path", io)         # ftp(s) / sftp / scp / file / tftp / telnet share URL::Transfer's verbs
-URL::IMAPS.fetch("imaps://h/INBOX", uid: 7)
-URL::WSS.connect("wss://h/sock") { |ws| ws.send("hi") }
-```
-
-## Defaults
-
-Every HTTP call gets these unless you override them:
-
-- `timeout: 30.s` — prevents indefinite hangs (any chrono duration: `500.ms`, `2.min`, …)
-- `follow_location: true` — HTTP redirects followed
-- `user_agent: "mruby-url"`
-
-Compression is **opt-in**, not a default: pass `accept_encoding: ""` to
-advertise gzip/deflate/br/zstd and have libcurl transparently decompress the
-response, or a specific token list (e.g. `"gzip"`) to narrow it.
-
-## Convenience kwargs
-
-These high-level kwargs are **owned per scheme** — each wrapper defines its own
-set, nothing is shared. The table below is the **HTTP** set. Other schemes own a
-subset: the `Transfer`/`GOPHER`/`DICT`/`POP3`/`LDAP`/`MQTT`/`RTSP`/`WS` wrappers
-take `params`/`headers`; `IMAP` and `SMTP` take none (their inputs are explicit
-verb arguments). Passing a high-level kwarg a scheme doesn't own raises
-`ArgumentError` up front — no silent no-op, no cryptic libcurl error. Raw
-`curl_easy` options are *not* high-level kwargs: they always pass through to
-`setopt`, which validates them against libcurl regardless of scheme — either as
-top-level keys or, explicitly, via the `setopt:` escape hatch (see below).
-
-| kwarg | what it does |
-| --- | --- |
-| `params: { ... }` | Appended to the URL as a query string (`URI.encode`, WHATWG-strict). Array values expand to repeated keys. |
-| `json: <obj>` | Body is `JSON.dump(obj)`; auto `Content-Type` and `Accept` of `application/json`. |
-| `form: { ... }` | Body is `application/x-www-form-urlencoded`; `Content-Type` set accordingly. |
-| `multipart: { ... }` | `multipart/form-data` via `curl_mime`. A String value is a plain field; a Hash is a file/blob part — `file:` streams from disk (never buffered in Ruby), `data:` is an in-memory blob, `filename:`/`type:` set the part headers. |
-| `auth: "user:pass"` or `["user", "pass"]` | Basic auth via `CURLOPT_USERPWD` (libcurl builds the header). |
-| `bearer: "<token>"` | Adds `Authorization: Bearer <token>` (user headers override). |
-| `netrc: true / :optional / :required` | Read credentials from `~/.netrc`. `true`/`:optional` falls back to the request's own creds; `:required` uses `.netrc` only. |
-| `netrc_file: "<path>"` | Use a `.netrc` at a non-default path. |
-| `headers: { ... }` | Extra headers. Wins over anything we auto-set. |
-| `timeout: 30.s` / `connect_timeout: 5.s` | Durations (mruby-chrono). Any unit — `500.ms`, `2.min` — handed to libcurl as milliseconds losslessly. |
-| any `curl_easy` opt | `proxy`, `cookiefile`, `cookiejar`, `verbose`, `ssl_verify_peer`, `userpwd`, … (see [Options reference](#options-reference)). |
-| `setopt: { ... }` | Explicit escape hatch for the long tail of `curl_easy` options not surfaced by name. Each pair goes straight to `URL::Request#setopt`, merged **last** so an explicit `setopt:` value wins over the same option set as a top-level key. |
-
-## Response
-
-```ruby
-r = URL("https://example.com/api").get
-
-r.code              # => 200
-r.body              # => "..."
-r.headers           # => { "content-type" => ..., "set-cookie" => [...], ... }
-r["Content-Type"]   # => "application/json"
-r.content_length    # => 1234
-r.success? / .client_error? / .server_error? / .redirect? / .error?
-r.error_message     # decorated when there was a transport failure
-r.raise_for_status! # raises resp.error (e.g. URL::HttpReturnedError) on 4xx/5xx or transport failure
-
-r.json              # JSON.parse(body), cached
-r.json_lazy         # JSON.parse_lazy(body) -> JSON::Document, cached
-r.into(target)      # mruby-fast-json native_ext_type deserialization
-```
-
-`r.into(target)` is shorthand for `r.json_lazy.into(target)`. Because
-`mrb_iv_set` doesn't care what shape the receiver has, the target can be an
-instance, a class, or a module:
-
-```ruby
-class Config
-  attr_accessor :api_key, :region
-  native_ext_type :@api_key, String
-  native_ext_type :@region,  String
-end
-
-URL(".../config").get.into(Config.new)   # fill an instance
-URL(".../config").get.into(Config)       # populate class-level @api_key / @region
-```
-
-For array responses, drop down to mruby-fast-json directly so you control
-how each instance is constructed:
-
-```ruby
-URL(".../users").get.json_lazy.array_each do |doc|
-  u = User.new
-  doc.into(u)
-  process(u)
+MRuby::Build.new do |conf|
+  # ...
+  conf.gem github: 'Asmod4n/mruby-url'
 end
 ```
 
-## Error handling
+- **Linux / macOS** — needs the libcurl development files, found via
+  `pkg-config` (`apt install libcurl4-openssl-dev`, `dnf install
+  libcurl-devel`, or `brew install curl`). Everything else is an mrbgem and
+  resolves automatically.
+- **Windows** — no system libcurl required: the gem builds its vendored curl
+  (the `deps/curl` submodule) with CMake and links it statically against
+  Schannel, so clone with `--recursive` and have CMake on the PATH.
 
-There are two kinds of failure, and they behave differently:
+Which protocols are actually available at runtime depends on the libcurl the
+gem was built against — check with `URL.supports?("sftp")` or `URL::PROTOS`.
 
-- **Usage mistakes** — an unbuilt/unknown scheme, a kwarg the scheme doesn't
-  own — **raise** immediately (a `URL::Error` subclass). They're bugs in your
-  calling code.
-- **Transfer failures** — anything that goes wrong once libcurl is running:
-  timeout, DNS, refused connection, TLS rejection, *and* an HTTP status `>= 400`
-  — are returned as **values**. Nothing is raised for you.
+## Status
 
-So every response you get back must be checked: `resp.error` is `nil` on a clean
-success, or an exception object describing what failed. Check it (or `resp.error?`,
-or a status predicate) before trusting the body.
+Every scheme is implemented and covered by fixture-server integration tests.
+The high-level API is settling toward a first tagged release.
 
-```ruby
-resp = URL("https://api.example.com/data").get
+> Cloned this repo before 2026-07-05? `main` was force-pushed around then —
+> see [docs/history-rewrite.md](docs/history-rewrite.md) for how to re-sync.
 
-if resp.error
-  warn "request failed: #{resp.error.class} — #{resp.error.message}"
-else
-  use(resp.json)
-end
-```
+## Documentation
 
-`resp.error` is a real exception object you can inspect or raise yourself — it
-just isn't raised *for* you:
+- **[Usage guide](docs/usage.md)** — requests, responses, error handling,
+  streaming, parallel transfers, the non-HTTP protocols, WebSockets.
+- **[Options reference](docs/options.md)** — every `setopt` symbol and the
+  `CURLOPT_`/`CURLMOPT_` it maps to, plus session tuning.
+- **[Internals](docs/internals.md)** — design philosophy, connection/TLS
+  sharing, event-loop integration, thread and fork rules.
 
-- Transport failures map to one class per libcurl error, all under
-  `URL::TransferError` (e.g. `URL::OperationTimedout`, `URL::CouldntConnect`,
-  `URL::PeerFailedVerification`); each carries `#curl_code`, `#curl_message` and
-  `#response`. Where mruby already ships the right class it's reused — a DNS
-  failure comes back as `SocketError`, so `rescue SocketError` just works.
-- An HTTP status `>= 400` is a value too: `resp.error` is a
-  `URL::HttpReturnedError` (with `#response`), and `resp.client_error?` /
-  `resp.server_error?` tell you which band.
+Runnable examples live in [`examples/`](examples/) — an API tour, an
+error-handling walkthrough, and a WebSocket demo.
 
-Dispatch on it with `case`/`when`:
+## License
 
-```ruby
-case resp.error
-when nil                    then use(resp.json)
-when URL::HttpReturnedError then retry_or_log(resp.code)
-when URL::OperationTimedout then back_off
-when SocketError            then mark_host_down
-when URL::TransferError     then warn "curl #{resp.error.curl_code}"
-end
-```
-
-Prefer exceptions? `raise_for_status!` opts in — it raises whatever `resp.error`
-holds (HTTP *or* transport) and otherwise returns `self`, so it chains:
-
-```ruby
-data = URL("https://api.example.com/data").get.raise_for_status!.json
-```
-
-This is uniform across the whole gem: the same `resp.error` value model applies
-to every verb, every protocol, and each `URL::Response` a parallel handler receives
-— one failing request never derails the others. (Runnable tour:
-`examples/error_handling.rb`.)
-
-## Streaming
-
-Pass a block to a one-shot to receive body chunks as they arrive instead of
-buffering. Useful for big downloads, video, LLM token streams.
-
-```ruby
-URL("https://huge.example/file").get do |chunk|
-  File.open("out", "ab") { |f| f.write(chunk) }
-end
-```
-
-`response.body` is empty in that case — you handled it.
-
-## Calling URL from inside a callback
-
-The high-level verbs reuse one shared session (`URL.shared`), so the connection
-pool, TLS sessions and HTTP/2 streams persist across calls. That session drives
-one transfer at a time, so a call made from *inside* a streaming/callback (where
-it's mid-flight) would be re-entrant — mruby-url detects that and transparently
-runs the nested call on a throwaway session that **shares the same connection and
-TLS-session cache**, so a nested call to a host you already opened resumes TLS
-(and often reuses the live connection) instead of doing a full handshake.
-Transparent in both directions:
-
-```ruby
-URL("https://a.example/stream").get do |chunk|
-  enrich(chunk, URL("https://b.example/lookup").get.json)
-  log(URL("https://a.example/meta").get.json)   # warm — same host as the outer call
-end
-```
-
-## Parallel fan-out
-
-Register transfers with `parallel(:verb, ...)` — any scheme, any verb the
-scheme's wrapper has, with the verb's normal arguments — then drive them all
-concurrently on one session with `URL.parallel_perform` (connection pool, TLS
-sessions and HTTP/2 multiplexing all carry over). Registration runs no I/O;
-each transfer's resolved `URL::Response` is passed to the block it was
-registered with, as it completes:
-
-```ruby
-URL("https://a.example/feed").parallel(:get)                 { |r| feed  = r.json }
-URL("https://b.example/login").parallel(:post, json: creds)  { |r| token = r }
-URL("ftp://h/manifest.txt").parallel(:download)              { |r| manifest = r.body }
-URL("imaps://h/INBOX").parallel(:fetch, uid: 1)              { |r| mail  = r.body }
-
-URL.parallel_perform   # pure driver, returns nothing — the handler blocks are
-                       # where the Responses arrive, as each transfer lands
-```
-
-The class-level form mirrors it: `URL::HTTPS.parallel("https://x", :get) { |r| ... }`.
-
-Usage errors raise at registration, before any I/O — a verb the scheme
-doesn't have, an unknown scheme, a protocol this libcurl wasn't built with.
-WebSocket `connect` can't be registered (it returns a live socket, not a
-`Response`) and raises `ArgumentError`. Runtime failures stay values
-(`resp.error` on the delivered Response), exactly like the blocking verbs; a
-verb called from inside a handler runs immediately on a throwaway session,
-the same re-entrancy rule as everywhere else.
-
-Every **failed** `URL::Response` can redo its request with `retry` — same
-URL, verb and arguments. A blocking verb's Response re-runs right there and
-returns the fresh Response; a parallel Response resubmits its transfer (with
-the same handler) for the *next* perform — and can do so **only inside its
-handler block**, the one place a parallel Response exists:
-
-```ruby
-r = URL("https://x").get
-r = r.retry(3) if r.error                 # blocking: up to 3 immediate re-runs,
-                                          # stops on success, returns the last Response
-
-URL("https://x").parallel(:get) do |r|
-  r.retry(3) if r.error                   # parallel: budget rides with the transfer
-end
-URL.parallel_perform                      # one call — retries run as extra rounds;
-                                          # after 3 resubmissions retry returns false
-                                          # and the perform drains
-```
-
-`times` defaults to 1. `wait:` sets the pause before each re-run (any chrono
-duration or seconds — `500.ms`, `2.s`). When omitted, the server decides:
-429/503 responses often carry a `Retry-After` header, libcurl parses it
-(exposed as `resp.retry_after`, in seconds, `nil` when absent), and the retry
-waits exactly that long — no header, no wait. `retry` is for failures only —
-on a Response whose `error` is nil it raises `URL::Error`, and so does
-retrying a parallel Response after its handler has returned.
-
-## Other protocols
-
-Every scheme `URL::PROTOS` lists is reachable, and transfer failures are values
-(`resp.error`), exactly like the HTTP verbs. A scheme this libcurl wasn't built
-with raises `URL::ProtocolNotAvailable`, and one the gem doesn't know raises
-`URL::UnsupportedScheme` (both `URL::SchemeError`/`URL::Error`), straight from
-`URL(uri)` before any wrapper exists; only failures *during* a transfer come
-back as values.
-
-```ruby
-URL("ftp://host/pub/file.txt").download.body          # ftp(s), sftp, scp,
-URL("file:///etc/hostname").download.body             #   file, dict, gopher,
-URL("sftp://user@host/path").download(                #   pop3, tftp, ldap, telnet…
-  ssh_private_keyfile: "id_ed25519",
-  ssh_knownhosts:      "known_hosts",
-).body
-
-URL("ftp://host/incoming/x.txt").upload(data)         # ftp(s), sftp, scp, tftp
-URL("ftp://host/pub/").list.lines                     # directory / message list
-URL("dict://dict.org").define("ruby").body            # DICT define
-URL("ldap://host/dc=ex,dc=com?cn?sub?(cn=*)").search  # LDAP search → LDIF body
-URL("mqtt://host/topic").publish("payload")           # MQTT publish
-URL("mqtt://host/topic").subscribe(timeout: 5.s)      # MQTT subscribe → #body
-
-URL("rtsp://host/stream").describe                    # RTSP OPTIONS/DESCRIBE/PLAY/…
-URL("rtsp://host/stream").options
-URL("rtsp://host/stream").play
-```
-
-`download`/`upload` and the wrappers take the same `**opts` as the HTTP
-verbs plus protocol options as needed: `:quote` (FTP/SFTP commands),
-`:dirlistonly`, `:range`, `:use_ssl`, the `:ssh_*` keys. The `s` schemes
-(ftps, pop3s, gophers, ldaps, mqtts, …) are the same calls over TLS — pass
-`ssl_verify_peer:`/`ssl_verify_host:` as usual. As with everything here,
-the dispatch, option mapping and parsing live in Ruby; the C layer only
-gained a handful of flat `setopt` pass-throughs and a blocking `easy_perform`.
-
-### Supported schemes
-
-```ruby
-URL::PROTOS            # => ["dict","file","ftp","ftps","gopher","gophers",
-                       #     "http","https","imap","imaps","ldap","ldaps",
-                       #     "mqtt","mqtts","pop3","pop3s","rtsp","scp",
-                       #     "sftp","smtp","smtps","telnet","tftp","ws","wss"]
-URL.supports?("smtps") # => true / false
-```
-
-### SMTP(S)
-
-`URL("smtps://…").deliver(body, from:, to:, **opts)` submits a message.
-`body` is the full RFC822 message (or any IO / Enumerable / Fiber / Proc
-that yields the bytes — see [Upload sources](#upload-sources)); `to:` is
-a String or an Array. Returns a `URL::Response` whose `code` is the final
-SMTP reply (e.g. `250`).
-
-```ruby
-URL("smtps://mail.example.com:465").deliver(
-  "Subject: hi\r\n\r\nhello body\r\n",
-  from: "me@example.com",
-  to:   ["a@example.com", "b@example.com"],
-  netrc: true,                      # or auth: "user:pass"
-)
-```
-
-> The verb is called `deliver` (not `send`) so we never shadow
-> `Object#send`.
-
-### IMAP(S) — `fetch` / `move` / `store` / `expunge`
-
-The mailbox is the URL path (`imaps://user:pw@host/INBOX`); UIDs go into
-the command. Each returns a `URL::Response`; a `NO`/`BAD` tagged reply
-shows up as `resp.error` (a `URL::TransferError`), not a raise.
-
-```ruby
-mbox = URL("imaps://user:pw@imap.example.com/INBOX")
-
-mbox.fetch(uid: 7).body                       # UID FETCH 7 BODY[]
-mbox.fetch(uid: 7) { |chunk| sink(chunk) }    # ...or stream
-
-mbox.store(uid: 7, flags: "\\Deleted")        # UID STORE 7 +FLAGS (\Deleted)
-mbox.store(uid: 7, flags: "\\Seen", op: "-")  # remove a flag (op: "+"/"-"/"")
-mbox.expunge                                  # delete = store(\Deleted) then expunge
-mbox.move(uid: 7, to: "Archive")              # UID MOVE 7 Archive
-```
-
-### Upload sources
-
-`upload` duck-types whatever you hand it — no need to slurp a file into
-memory first:
-
-```ruby
-URL("ftp://h/x").upload("the body bytes")                      # String
-
-File.open("big.bin", "rb") do |f|                              # IO/File:
-  URL("sftp://h/path/big.bin").upload(f)                       #   streams via #read(max)
-end                                                            #   sets CURLOPT_INFILESIZE
-
-URL("ftp://h/feed.csv").upload(rows.lazy.map(&:to_csv))        # any Enumerable
-
-URL("ftp://h/log").upload(->(max) { source.read(max) })        # Proc / Lambda
-
-fib = Fiber.new { Fiber.yield "a"; Fiber.yield "b"; "done\n" } # Fiber yielding chunks
-URL("ftp://h/x").upload(fib)
-```
-
-We never close a `File`, exhaust a `Socket`, rewind, or clean up after a
-`Fiber` — open/close stays your responsibility. The same streaming reader
-is used by SMTP `deliver`, so a mail body can be any of those too.
-
-## WebSocket
-
-`URL("ws://…").connect` (or `URL("wss://…").connect`) opens the
-connection and returns a `URL::WebSocket` once the upgrade handshake
-completes. Messages are sent and received whole — fragmentation and
-oversized frames are reassembled for you, and inbound PINGs are answered
-automatically. `send` picks the frame type from the payload itself:
-valid UTF-8 goes out as a TEXT frame, anything else as BINARY — which is
-exactly the distinction the wire format draws (RFC 6455 §5.6), so there
-is nothing to choose.
-
-```ruby
-URL("wss://echo.websocket.org").connect do |ws|
-  ws.send("hello")
-  msg = ws.receive            # => URL::WebSocket::Message (text? / binary? / close?)
-  puts msg.data
-  ws.each { |m| handle(m) }   # iterate until the peer closes
-end
-```
-
-A failed handshake is a **value, not a raise** — same two-tier model as
-the HTTP verbs. `connect` always returns a `URL::WebSocket`; check
-`ws.open?` and read `ws.error` (a `URL::TransferError`, e.g.
-`URL::WebSocketError` naming the HTTP status when the server answered
-with a page instead of a 101 upgrade). The block is only entered for a
-live socket:
-
-```ruby
-ws = URL("wss://example.com/socket").connect
-ws.open?   # => false
-ws.error   # => #<URL::WebSocketError: websocket upgrade refused: server
-           #    replied HTTP 200 (expected 101 Switching Protocols) ...>
-```
-
-Without a block, `connect` returns the socket and you close it yourself
-(`ws.close(status: 1000)`). `#receive(timeout: 5.s)` returns `nil` if no
-message arrives in time; `#send_*` / `#receive` on a closed socket are
-no-ops returning `nil`. Only genuine usage errors raise: a non-ws scheme, or a
-libcurl built without WebSocket support (needs 7.86+).
-
-## Tuning the shared session
-
-`URL.shared` is the session every blocking verb reuses. Tune its pool once at
-startup:
-
-```ruby
-URL.shared.setopt(:pipelining,             2)    # CURLPIPE_MULTIPLEX (HTTP/2)
-URL.shared.setopt(:max_concurrent_streams, 100)
-URL.shared.setopt(:max_total_connections,  256)
-```
-
-## Integrating a real event loop
-
-By default the verbs block on a built-in driver that rides libcurl's own
-event-less multi API (`curl_multi_perform` + `curl_multi_poll`) — libcurl
-tracks every fd and timeout internally, so nothing platform-specific runs in
-Ruby. To drive
-transfers on a platform loop (glib, libuv, …) instead, subclass
-`URL::EventLoop` and implement four primitives:
-
-```ruby
-class URL::EventLoop
-  def watch(io, readiness, &block)   # readiness: :in / :out / :inout — start watching io
-  def unwatch(handle)                # handle is whatever watch returned
-  def arm_timer(ms, &block)          # call block.() once, ms from now
-  def cancel_timer(handle)
-end
-```
-
-Your loop's only job is to invoke the block at the right moment: call the
-`watch` block when the fd becomes ready, and the `arm_timer` block when the
-timer fires. Each block drives `socket_action` + completion reaping + removal
-internally — you never touch the session from your loop directly.
-
-Install one instance process-wide and the verbs become fire-and-forget
-(returning `nil` instead of a `URL::Response`):
-
-```ruby
-URL.default_loop = MyGlibLoop.new
-URL("https://example.com/ping").get   # attaches to the loop, returns nil
-```
-
-or set it per session via `session.event_loop = my_loop`.
-
-### Driving a session by hand
-
-`URL::IOSelectLoop` is the reference `EventLoop` implementation — the
-blocking verbs don't use it (they ride libcurl's `curl_multi_perform`/`poll`
-directly), it exists as the example of what an integration must provide:
-store the fds and timer the session asks for, and fire the blocks it handed
-you when they're ready. Nothing else; `socket_action`, completion reaping and
-timeout bookkeeping all live in the session, so every integration gets them
-for free.
-
-```ruby
-session = URL.open
-loop    = URL::IOSelectLoop.new
-session.event_loop = loop
-
-req = URL::Request.new(session, "https://example.com")
-req.on_data { |chunk| sink(chunk) }
-session.add(req)
-session.socket_action   # kick off: registers fds/timers with the loop
-
-loop.run                # pumps IO.select, firing the session's blocks,
-                        # until nothing is watched and no timer is armed
-```
-
-A real platform loop has no `run` of its own to call — its host application's
-loop plays that role; it only implements `watch`/`unwatch`/`arm_timer`/
-`cancel_timer` exactly as `IOSelectLoop` does.
-
-## Options reference
-
-### `URL#setopt` (1:1 with `curl_multi_setopt`)
-
-| Symbol | `CURLMOPT_` | Notes |
-| --- | --- | --- |
-| `:pipelining` | PIPELINING | bitmask; `2` (CURLPIPE_MULTIPLEX) for HTTP/2 |
-| `:maxconnects` | MAXCONNECTS | connection-cache size |
-| `:max_host_connections` | MAX_HOST_CONNECTIONS | per-origin cap (HTTP/1.1) |
-| `:max_total_connections` | MAX_TOTAL_CONNECTIONS | global cap |
-| `:max_concurrent_streams` | MAX_CONCURRENT_STREAMS | HTTP/2 client-side |
-
-### `URL::Request#setopt` (1:1 with `curl_easy_setopt`)
-
-| Symbol | `CURLOPT_` |
-| --- | --- |
-| `:url` | URL |
-| `:custom_request` | CUSTOMREQUEST |
-| `:user_agent` | USERAGENT |
-| `:cainfo` | CAINFO |
-| `:accept_encoding` | ACCEPT_ENCODING |
-| `:userpwd` | USERPWD |
-| `:netrc` | NETRC (`0`/`1`/`2`) |
-| `:netrc_file` | NETRC_FILE |
-| `:proxy` | PROXY |
-| `:cookiefile` | COOKIEFILE |
-| `:cookiejar` | COOKIEJAR |
-| `:follow_location` | FOLLOWLOCATION |
-| `:max_redirs` | MAXREDIRS |
-| `:verbose` | VERBOSE |
-| `:timeout` | TIMEOUT_MS (chrono duration → ms) |
-| `:connect_timeout` | CONNECTTIMEOUT_MS (chrono duration → ms) |
-| `:ssl_verify_peer` | SSL_VERIFYPEER |
-| `:ssl_verify_host` | SSL_VERIFYHOST |
-| `:nobody` | NOBODY |
-| `:connect_only` | CONNECT_ONLY |
-| `:upload` | UPLOAD |
-| `:mail_from` | MAIL_FROM |
-| `:mail_rcpt` | MAIL_RCPT (Array) |
-| `:post_fields` | COPYPOSTFIELDS (size from POSTFIELDSIZE_LARGE) |
-| `:mimepost` | MIMEPOST (a `URL::Libcurl::Mime`; built for you by `multipart:`) |
-| `:range` | RANGE |
-| `:infilesize` | INFILESIZE_LARGE |
-| `:dirlistonly` | DIRLISTONLY |
-| `:ftp_create_dirs` | FTP_CREATE_MISSING_DIRS |
-| `:use_ssl` | USE_SSL (`0`–`3`) |
-| `:ssh_knownhosts` / `:ssh_private_keyfile` / `:ssh_public_keyfile` | SSH_KNOWNHOSTS / SSH_PRIVATE_KEYFILE / SSH_PUBLIC_KEYFILE |
-| `:rtsp_request` / `:rtsp_stream_uri` / `:rtsp_transport` | RTSP_REQUEST / RTSP_STREAM_URI / RTSP_TRANSPORT |
-
-Client TLS:
-
-| Symbol | `CURLOPT_` |
-| --- | --- |
-| `:sslcert` / `:sslkey` / `:keypasswd` | SSLCERT / SSLKEY / KEYPASSWD |
-| `:capath` | CAPATH |
-| `:pinnedpublickey` | PINNEDPUBLICKEY |
-| `:ssl_cipher_list` | SSL_CIPHER_LIST |
-| `:sslversion` | SSLVERSION (curl integer enum) |
-
-HTTP / proxy / network:
-
-| Symbol | `CURLOPT_` |
-| --- | --- |
-| `:http_version` | HTTP_VERSION (curl integer enum: `2`=1.1, `3`=2, `30`=3) |
-| `:cookie` | COOKIE (inline `"a=1; b=2"`) |
-| `:unrestricted_auth` | UNRESTRICTED_AUTH |
-| `:postredir` | POSTREDIR |
-| `:proxyuserpwd` | PROXYUSERPWD |
-| `:proxytype` | PROXYTYPE (curl integer enum) |
-| `:httpproxytunnel` | HTTPPROXYTUNNEL |
-| `:noproxy` | NOPROXY |
-| `:interface` | INTERFACE |
-| `:dns_servers` | DNS_SERVERS |
-| `:doh_url` | DOH_URL |
-| `:max_send_speed` / `:max_recv_speed` | MAX_SEND_SPEED_LARGE / MAX_RECV_SPEED_LARGE (bytes/s) |
-| `:tcp_keepalive` / `:tcp_keepidle` / `:tcp_keepintvl` | TCP_KEEPALIVE / TCP_KEEPIDLE / TCP_KEEPINTVL |
-| `:unix_socket_path` | UNIX_SOCKET_PATH |
-
-Auth note: `auth:`/`bearer:`/`userpwd:` (Basic, Bearer) and `netrc:` are the
-supported auth paths. NTLM and Digest are intentionally **not** exposed —
-curl is removing NTLM (Sep 2026) and the local-crypto Digest fallback (Oct
-2026); Basic + Bearer + TLS client certs are the durable options.
-
-Headers: pass `headers: { ... }` to a one-shot, or `Request#headers=`.
-
-## Dependencies
-
-- `mruby-io` — `IO.select`, `IO.for_fd`
-- `mruby-error` — `mrb_protect_error`
-- `mruby-uri-parser` — ada-url-based URL handling (WHATWG-compliant)
-- `mruby-fast-json` — simdjson-backed JSON, with `native_ext_type` schemas
-- `mruby-c-ext-helpers`
-- `mruby-socket`
-- `mruby-string-ext` — `String#byteslice` for Ruby-side upload chunking
-
-On Linux/macOS the gem finds libcurl via `pkg-config`. On Windows it builds
-the vendored `deps/curl` with CMake and links it statically against Schannel
-(no OpenSSL); `mrbgem.rake` handles this.
-
-## Threads and processes
-
-Connections and TLS sessions are reused automatically across calls — including
-across several VMs running on the same OS thread — so repeat requests to a host
-skip the handshake. Two rules to stay safe:
-
-- **Keep each `mrb_state` and its requests on one OS thread.** Don't drive a VM
-  from a different thread than the one it was created on (the same single-owning
-  -thread rule mruby itself imposes on an `mrb_state`).
-- **Don't `fork()` after a request and then use the gem in the child** — libcurl
-  isn't fork-safe; the child inherits the parent's live sockets.
-
-## Roadmap
-
-Every scheme libcurl is built with is exposed; further work is
-protocol-specific conveniences as they come up (richer RTSP transport
-negotiation, MQTT-over-WebSockets glue, FTP active-mode helpers, …),
-plus whatever falls out of CI feedback on the less-exercised TLS variants.
+MIT
