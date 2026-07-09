@@ -20,9 +20,9 @@ concurrency:
 # squash merges, this guard stops matching and the duplicate run returns.
 jobs:
   # Fail fast if a tool-generated session URL sneaks into the tree or into a
-  # commit message — those identifiers must never be published (see the
-  # history-rewrite note in the README). The tree grep excludes this workflow
-  # (it must name the patterns) and the README (it documents the rewrite).
+  # commit message — those identifiers must never be published (see
+  # docs/history-rewrite.md). The tree grep excludes this workflow (it must
+  # name the patterns) and the rewrite doc (it documents the rewrite).
   hygiene:
     name: no session URLs
     if: github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'Merge pull request')
@@ -35,7 +35,7 @@ jobs:
         run: |
           set -e
           pattern='claude\.ai/code|session_01|Claude-Session:'
-          if git grep -nE "$pattern" -- . ':!.github/workflows/ci.yml' ':!README.md'; then
+          if git grep -nE "$pattern" -- . ':!.github/workflows/ci.yml' ':!docs/history-rewrite.md'; then
             echo '::error::session URL found in the tree'; exit 1
           fi
           if git log -50 --format=%B | grep -nE "$pattern"; then
