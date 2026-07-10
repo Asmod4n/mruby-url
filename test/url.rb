@@ -271,6 +271,16 @@ assert('timeout accepts any chrono duration unit') do
   assert_true URL("#{$base}/slow/2000").get(timeout: 100.ms).error?
 end
 
+assert('time-valued options only accept chrono durations') do
+  # Every time value crosses into C through mruby-chrono's converter, which
+  # type-checks: anything non-numeric raises TypeError at the call, before any
+  # I/O. This covers the _MS options (timeout) and the seconds options
+  # (tcp_keepidle) alike.
+  assert_raise(TypeError) { URL("#{$base}/echo").get(timeout: "5") }
+  assert_raise(TypeError) { URL("#{$base}/echo").get(connect_timeout: :soon) }
+  assert_raise(TypeError) { URL("#{$base}/echo").get(tcp_keepidle: "30") }
+end
+
 assert('newly wired curl options are accepted (not an unsupported option)') do
   # A representative spread across the new flat setopt pass-throughs (HTTP
   # version, inline cookie, proxy, rate limiting, keepalive). The values are
@@ -571,7 +581,8 @@ end
 assert('Response#retry_after surfaces the server\'s Retry-After header') do
   r = URL("#{$base}/retry-after/2").get
   assert_equal 503, r.code
-  assert_equal 2, r.retry_after            # libcurl parsed the header
+  assert_equal 2.s, r.retry_after          # libcurl parsed the header; a chrono duration
+  assert_true r.retry_after.is_a?(Float)   # Float seconds, like every other duration
   assert_nil URL("#{$base}/echo").get.retry_after   # absent header -> nil
 end
 

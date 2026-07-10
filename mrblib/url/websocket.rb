@@ -117,13 +117,16 @@ class URL::WebSocket
   # Block for the next complete message and return a URL::WebSocket::Message,
   # reassembling a fragmented or oversized message across frames. Control PINGs
   # are answered and skipped; PONGs are skipped. Returns a :close Message when
-  # the peer closes, or nil if `timeout:` (seconds) elapses first.
+  # the peer closes, or nil if `timeout:` (a chrono duration: 5.s, 500.ms, …)
+  # elapses first. The deadline covers the whole message: it is computed once,
+  # up front, so trickling fragments can't restart the clock.
   def receive(timeout: nil)
     return nil if @closed
+    deadline = timeout && Chrono::Steady.now + timeout
     buf  = String.new
     type = nil
     loop do
-      chunk = _recv_chunk(timeout)
+      chunk = _recv_chunk(deadline)
       return nil if chunk == :timeout
 
       data, flags, bytesleft = chunk
@@ -215,19 +218,21 @@ class URL::WebSocket
   end
 
   # One ws_recv, blocking on readability while libcurl reports CURLE_AGAIN
-  # (ws_recv => nil). Returns the [data, flags, bytesleft] triple, or :timeout.
-  # Readiness comes from curl_multi_poll with the ws socket as an extra fd —
-  # libcurl's own portable wait; a nil timeout blocks in 1s slices.
-  def _recv_chunk(timeout)
+  # (ws_recv => nil). Returns the [data, flags, bytesleft] triple, or :timeout
+  # once the monotonic `deadline` (Chrono::Steady seconds) passes. Readiness
+  # comes from curl_multi_poll with the ws socket as an extra fd — libcurl's
+  # own portable wait; a nil deadline blocks in 1s slices.
+  def _recv_chunk(deadline)
     loop do
       frame = URL::Libcurl.easy_ws_recv(@handle, RECV_CHUNK)
       return frame if frame
 
-      if timeout
-        ready = URL::Libcurl.multi_poll(@wait_multi, (timeout.to_f * 1000).to_i, @fd, :in)
-        return :timeout if ready == 0
+      if deadline
+        remaining = deadline - Chrono::Steady.now
+        return :timeout if remaining <= 0
+        URL::Libcurl.multi_poll(@wait_multi, remaining, @fd, :in)
       else
-        URL::Libcurl.multi_poll(@wait_multi, 1000, @fd, :in)
+        URL::Libcurl.multi_poll(@wait_multi, 1.s, @fd, :in)
       end
     end
   end
@@ -257,7 +262,7 @@ class URL::WebSocket
       r = URL::Libcurl.easy_ws_send(@handle, data, flags, 0)
       return r if r
 
-      URL::Libcurl.multi_poll(@wait_multi, 1000, @fd, :out)
+      URL::Libcurl.multi_poll(@wait_multi, 1.s, @fd, :out)
     end
   end
 end
