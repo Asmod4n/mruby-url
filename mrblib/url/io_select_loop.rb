@@ -1,61 +1,13 @@
 # mrblib/url/io_select_loop.rb
 #
-# URL::SyncDriver — the built-in blocking driver behind the synchronous verbs
-# and URL.parallel_perform. It is NOT an EventLoop: it rides libcurl's
-# event-less multi API (curl_multi_perform + curl_multi_poll), where libcurl
-# tracks every fd and timeout internally. Nothing here watches sockets or
-# arms timers — curl already knows how; Ruby only decides when to stop.
-#
 # URL::IOSelectLoop — a reference EventLoop implementation kept as the
 # example for platform-loop integrators. It implements ONLY the four
 # EventLoop primitives, using nothing but the blocks the session hands it —
 # exactly what any real integration (libuv, EventMachine, a game loop) has
 # to provide, no more.
-
-class URL::SyncDriver
-  # Cap for one poll. curl_multi_poll returns earlier on socket activity or
-  # when libcurl's own next timeout is nearer, so this is a ceiling, not a
-  # latency — it only bounds how long a spurious idle wait could last.
-  POLL_INTERVAL = 1.s
-
-  def initialize(session)
-    @session = session
-  end
-
-  # Drive until `target` completes (or nothing is left running). Yields
-  # [request, code] per completion, each the moment it is reaped.
-  def run_until(target, &on_complete)
-    finished = false
-    _pump(-> { finished }) do |req, code|
-      finished = true if req.equal?(target)
-      on_complete&.call(req, code)
-    end
-  end
-
-  # Drive until `count` transfers have completed — the basis for
-  # URL.parallel_perform's "answers as they arrive".
-  def run_n(count, &on_complete)
-    remaining = count
-    _pump(-> { remaining <= 0 }) do |req, code|
-      remaining -= 1
-      on_complete&.call(req, code)
-    end
-  end
-
-  private
-
-  # perform -> reap -> poll, until `stop` says done or curl runs dry. All
-  # readiness/timeout knowledge stays inside libcurl.
-  def _pump(stop, &on_complete)
-    loop do
-      running = @session.perform
-      @session.info_read { |req, code| on_complete&.call(req, code) }
-      break if stop.call
-      break if running == 0   # nothing in flight can complete the stop condition
-      @session.poll(POLL_INTERVAL)
-    end
-  end
-end
+#
+# The gem's own blocking drive does not live here: every synchronous call
+# pumps the one internal URL::Reactor (mrblib/url/reactor.rb).
 
 # Example EventLoop: pumps IO.select over the fds the session asks it to
 # watch and fires the session-provided blocks — the same two things any

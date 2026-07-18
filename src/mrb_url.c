@@ -462,12 +462,26 @@ murl_thread_share(void)
 
 /* =========================================================================
  * Error checks (single libcurl strerror call on failure)
+ *
+ * On the fast (success) path, a callback-stashed exception (mrb->exc) is
+ * deliberately NOT checked: mruby's own cfunc epilogue raises it the instant
+ * the enclosing cfunc returns to Ruby, before any further Ruby code runs —
+ * see vm.c's "cfunc epilogue" (OP_SEND) and mrb_funcall_with_block's
+ * direct-cfunc path, both of which do `if (mrb->exc) ... raise`
+ * unconditionally after any cfunc call.
+ *
+ * murl_multi_check's failure path still prefers an already-pending
+ * mrb->exc over its own generic error text: if libcurl reports a
+ * multi-level failure while a more specific exception from a Ruby callback
+ * is stashed, that exception — not the generic strerror — is what the
+ * caller should see. (The socket/timer trampolines themselves always
+ * return 0 to libcurl; returning -1 there marks the whole multi dead —
+ * see the trampoline block below.)
  * ========================================================================= */
 
 static void
 murl_easy_check(mrb_state* mrb, CURLcode rc)
 {
-  if (unlikely(mrb->exc != NULL)) mrb_exc_raise(mrb, mrb_obj_value(mrb->exc));
   if (likely(rc == CURLE_OK)) return;
   mrb_raisef(mrb, E_RUNTIME_ERROR, "curl_easy error: %s", curl_easy_strerror(rc));
 }
@@ -475,9 +489,48 @@ murl_easy_check(mrb_state* mrb, CURLcode rc)
 static void
 murl_multi_check(mrb_state* mrb, CURLMcode rc)
 {
-  if (unlikely(mrb->exc != NULL)) mrb_exc_raise(mrb, mrb_obj_value(mrb->exc));
   if (likely(rc == CURLM_OK)) return;
+  if (unlikely(mrb->exc != NULL)) mrb_exc_raise(mrb, mrb_obj_value(mrb->exc));
   mrb_raisef(mrb, E_RUNTIME_ERROR, "curl_multi error: %s", curl_multi_strerror(rc));
+}
+
+/* =========================================================================
+ * murl_protect: mrb_protect_error, but safe to call more than once while an
+ * earlier callback's exception is already stashed in mrb->exc.
+ *
+ * A single curl_multi_perform/socket_action pass can invoke several of our
+ * trampolines in sequence (e.g. the write callback aborts a transfer, and
+ * libcurl's own connection teardown immediately fires the socket callback
+ * with CURL_POLL_REMOVE). Every trampoline stashes its callback's raise into
+ * mrb->exc so it can be delivered once we're back in a pure-Ruby frame — but
+ * invoking ANY Ruby-defined proc (mrb_yield -> mrb_run -> mrb_vm_exec, for
+ * anything that isn't a cfunc) unconditionally resets mrb->exc at its own
+ * entry. A later, perfectly innocent, non-raising callback would otherwise
+ * silently erase an earlier callback's already-stashed exception this way.
+ * Snapshotting mrb->exc before the call and restoring it after (unless
+ * nothing was pending) keeps "the first exception in this drive wins" true
+ * regardless of what else libcurl invokes afterward. Same signature and
+ * return value as mrb_protect_error — `*err` is whether mrb->exc holds
+ * anything once this returns (this callback's own raise, or an earlier
+ * callback's restored one), and the return value is the body's result on
+ * success or the (possibly earlier, first-wins) exception on failure.
+ * Callers no longer need their own "if (mrb->exc == NULL) mrb->exc = ..."
+ * — mrb->exc is already exactly what it should be when this returns. */
+static mrb_value
+murl_protect(mrb_state* mrb, mrb_protect_error_func* body, void* data, mrb_bool* err)
+{
+  struct RObject* pending = mrb->exc;
+  mrb_bool raised = FALSE;
+  mrb_value ret = mrb_protect_error(mrb, body, data, &raised);
+  if (pending) {
+    mrb->exc = pending;             /* first exception in this drive wins */
+    ret = mrb_obj_value(pending);
+    raised = TRUE;
+  } else if (raised) {
+    mrb->exc = mrb_obj_ptr(ret);
+  }
+  *err = raised;
+  return ret;
 }
 
 /* =========================================================================
@@ -508,15 +561,10 @@ murl_dispatch_str_cb(murl_easy_t* e, mrb_sym ivsym, const char* ptr, size_t tota
   int ai = mrb_gc_arena_save(mrb);
   cb_str_args a = { cb, ptr, total };
   mrb_bool err = FALSE;
-  mrb_value ret = mrb_protect_error(mrb, call_with_str_body, &a, &err);
+  murl_protect(mrb, call_with_str_body, &a, &err);
   mrb_gc_arena_restore(mrb, ai);
 
-  if (unlikely(err)) {
-    if (mrb->exc == NULL) {
-      mrb->exc = mrb_obj_ptr(ret);
-    }
-    return 0;
-  }
+  if (unlikely(err)) return 0;
   return total;
 }
 
@@ -567,13 +615,10 @@ murl_read_cb(char* buffer, size_t size, size_t nitems, void* userdata)
   int ai = mrb_gc_arena_save(mrb);
   cb_read_args a = { cb, max };
   mrb_bool err = FALSE;
-  mrb_value ret = mrb_protect_error(mrb, call_read_body, &a, &err);
+  mrb_value ret = murl_protect(mrb, call_read_body, &a, &err);
 
   if (unlikely(err)) {
     mrb_gc_arena_restore(mrb, ai);
-    if (mrb->exc == NULL) {
-      mrb->exc = mrb_obj_ptr(ret);
-    }
     return CURL_READFUNC_ABORT;
   }
 
@@ -588,10 +633,22 @@ murl_read_cb(char* buffer, size_t size, size_t nitems, void* userdata)
 }
 
 /* =========================================================================
- * socket / timer callbacks (run inside curl_multi_socket_action): thin
- * trampolines to the Multi's @on_socket / @on_timer Ruby blocks, invoked under
- * mrb_protect_error. A raise is stashed and turned into a -1 return
- * (CURLM_ABORTED_BY_CALLBACK), so nothing longjmps through libcurl.
+ * socket / timer callbacks: thin trampolines to the Multi's @on_socket /
+ * @on_timer Ruby blocks, invoked under mrb_protect_error so nothing ever
+ * longjmps through libcurl. A raise is stashed (murl_protect, first
+ * exception wins) and surfaces from the cfunc epilogue the moment the
+ * enclosing perform/socket_action returns to Ruby.
+ *
+ * These MUST return 0 even when an exception is stashed. Returning -1 from
+ * a multi-level callback makes libcurl set multi->dead = TRUE — the WHOLE
+ * multi is permanently poisoned, not just one transfer. A dead multi stops
+ * all internal timer processing, which wedges every protocol whose state
+ * machine advances on libcurl's own timers (FTP/SMTP/IMAP/...) while plain
+ * HTTP happens to keep working on socket readiness alone — a nearly
+ * invisible way to break only *some* later transfers (observed as every
+ * non-HTTP transfer on the session timing out after a streaming block
+ * raised mid-transfer; teardown fires these callbacks while the exception
+ * is still pending).
  * ========================================================================= */
 
 typedef struct cb_socket_args {
@@ -630,15 +687,10 @@ murl_socket_cb(CURL* easy, curl_socket_t fd, int what, void* userp, void* socket
   int ai = mrb_gc_arena_save(mrb);
   cb_socket_args a = { cb, fd, wsym };
   mrb_bool err = FALSE;
-  mrb_value ret = mrb_protect_error(mrb, call_socket_body, &a, &err);
+  murl_protect(mrb, call_socket_body, &a, &err);
   mrb_gc_arena_restore(mrb, ai);
 
-  if (unlikely(err)) {
-    if (mrb->exc == NULL) {
-      mrb->exc = mrb_obj_ptr(ret);
-    }
-    return -1;
-  }
+  (void)err;   /* stashed; raises at the perform epilogue — never -1 here */
   return 0;
 }
 
@@ -672,15 +724,10 @@ murl_timer_cb(CURLM* multi, long timeout_ms, void* userp)
   int ai = mrb_gc_arena_save(mrb);
   cb_timer_args a = { cb, timeout_ms };
   mrb_bool err = FALSE;
-  mrb_value ret = mrb_protect_error(mrb, call_timer_body, &a, &err);
+  murl_protect(mrb, call_timer_body, &a, &err);
   mrb_gc_arena_restore(mrb, ai);
 
-  if (unlikely(err)) {
-    if (mrb->exc == NULL) {
-      mrb->exc = mrb_obj_ptr(ret);
-    }
-    return -1;
-  }
+  (void)err;   /* stashed; raises at the perform epilogue — never -1 here */
   return 0;
 }
 
@@ -1097,7 +1144,9 @@ murl_lc_easy_strerror(mrb_state* mrb, mrb_value mod)
  * leaving the connection (and its active socket) on the easy handle so the ws
  * framing primitives below can use it. Returns the CURLcode as a value (0 ==
  * CURLE_OK) so Ruby decides what a failure means — never raises on a transfer
- * error; a callback-stashed exception still propagates.
+ * error. A callback-stashed exception (mrb->exc, set by the write/header/read
+ * trampolines) is left for mruby's own cfunc epilogue to raise the instant
+ * this function returns to its Ruby caller — no explicit check needed here.
  * ========================================================================= */
 
 static mrb_value
@@ -1109,7 +1158,6 @@ murl_lc_easy_perform(mrb_state* mrb, mrb_value mod)
   murl_easy_t* e = murl_easy_get(mrb, easy_obj);
 
   CURLcode rc = curl_easy_perform(e->curl);
-  if (unlikely(mrb->exc != NULL)) mrb_exc_raise(mrb, mrb_obj_value(mrb->exc));
   return mrb_convert_int(mrb, rc);
 }
 
@@ -1274,7 +1322,10 @@ murl_lc_multi_setopt(mrb_state* mrb, mrb_value mod)
  * libcurl owns all fd and timeout tracking internally. Paired with
  * multi_poll it is everything a blocking driver needs; the socket_action
  * interface remains for external event loops. A callback-stashed exception
- * propagates via murl_multi_check, same as socket_action.
+ * either propagates once this function returns to Ruby (via mruby's own
+ * cfunc epilogue), or — if it made our socket/timer trampolines report
+ * CURLM_ABORTED_BY_CALLBACK — is raised directly by murl_multi_check below,
+ * in preference to that generic error. Same as socket_action.
  * ========================================================================= */
 
 static mrb_value
@@ -1297,18 +1348,59 @@ murl_lc_multi_perform(mrb_state* mrb, mrb_value mod)
 }
 
 /* =========================================================================
- * multi_poll(multi, timeout)            -> int
- * multi_poll(multi, timeout, fd, ev)    -> int   (ev: :in / :out / :inout)
+ * Shared marshalling for the two poll primitives below.
+ * ========================================================================= */
+
+/* Duration (chrono Float seconds, e.g. 500.ms / 1.s) -> int milliseconds for
+ * curl_multi_poll. mruby-chrono does the unit math and type/range checks;
+ * clamp instead of truncating on LP64, and floor negatives at 0. */
+static int
+murl_poll_timeout_ms(mrb_state* mrb, mrb_value timeout)
+{
+  long ms;
+  mrb_chrono_convert(mrb, timeout, MRB_CHRONO_OUT_LONG, MRB_CHRONO_DUR_MILLISECONDS,
+                     MRB_CHRONO_NEAREST, &ms, sizeof ms);
+  if (ms > INT_MAX) ms = INT_MAX;
+  if (ms < 0)       ms = 0;
+  return (int)ms;
+}
+
+/* :in / :out / :inout -> CURL_WAIT_POLL* bits (curl_waitfd events). */
+static short
+murl_wait_events(mrb_state* mrb, mrb_sym ev)
+{
+  if (ev == MRB_SYM(in))    return CURL_WAIT_POLLIN;
+  if (ev == MRB_SYM(out))   return CURL_WAIT_POLLOUT;
+  if (ev == MRB_SYM(inout)) return CURL_WAIT_POLLIN | CURL_WAIT_POLLOUT;
+  mrb_raisef(mrb, E_ARGUMENT_ERROR, "unknown event: :%n", ev);
+  return 0; /* unreachable */
+}
+
+/* The one curl_multi_poll call (version-gated once): waits on the multi's
+ * own fds plus `wfds`, returns the number of fd events (0 = plain timeout).
+ * Pre-7.66.0 libcurl has no curl_multi_poll; return 0 without sleeping. */
+static mrb_value
+murl_do_multi_poll(mrb_state* mrb, murl_multi_t* m, struct curl_waitfd* wfds,
+                   unsigned int nfds, int timeout_ms)
+{
+#if LIBCURL_VERSION_NUM >= 0x074200 /* curl_multi_poll: 7.66.0 */
+  int numfds = 0;
+  murl_multi_check(mrb, curl_multi_poll(m->multi, wfds, nfds, timeout_ms, &numfds));
+  return mrb_int_value(mrb, (mrb_int)numfds);
+#else
+  (void)mrb; (void)m; (void)wfds; (void)nfds; (void)timeout_ms;
+  return mrb_int_value(mrb, 0);
+#endif
+}
+
+/* =========================================================================
+ * multi_poll(multi, timeout) -> int
  *
- * Flat pass-through of curl_multi_poll. `timeout` is a duration (chrono
- * Float seconds, e.g. 500.ms / 1.s); mruby-chrono converts it to the
- * milliseconds curl_multi_poll takes — the type/range checks come with it.
- * Without an fd it sleeps up to the timeout even when nothing is attached
- * (the documented difference from curl_multi_wait); with one, the fd rides
- * along as a curl_waitfd extra so libcurl also wakes on its readiness — the
- * portable way to wait on the CONNECT_ONLY WebSocket socket. Returns the
- * number of fd events (0 on a plain timeout). This is the gem's only "wait"
- * primitive — libcurl owns the platform details, and it is invisible to
+ * Flat pass-through of curl_multi_poll with no extra fds: waits on the
+ * multi's own fds, capping at libcurl's next internal timeout, and sleeps
+ * the full `timeout` (a chrono duration) even when nothing is attached —
+ * the documented difference from curl_multi_wait, and the gem's portable
+ * sleep. For extra fds use multi_poll_fds. Invisible to
  * bring-your-own-EventLoop users.
  * ========================================================================= */
 
@@ -1317,45 +1409,53 @@ murl_lc_multi_poll(mrb_state* mrb, mrb_value mod)
 {
   (void)mod;
   mrb_value multi_obj, timeout;
-  mrb_int   fd     = -1;
-  mrb_value ev_obj = mrb_nil_value();
-  mrb_get_args(mrb, "oo|io", &multi_obj, &timeout, &fd, &ev_obj);
+  mrb_get_args(mrb, "oo", &multi_obj, &timeout);
 
-  long timeout_ms;
-  mrb_chrono_convert(mrb, timeout, MRB_CHRONO_OUT_LONG, MRB_CHRONO_DUR_MILLISECONDS,
-                     MRB_CHRONO_NEAREST, &timeout_ms, sizeof timeout_ms);
-  /* curl_multi_poll takes int ms; clamp instead of truncating on LP64. */
-  if (timeout_ms > INT_MAX) timeout_ms = INT_MAX;
-  if (timeout_ms < 0)       timeout_ms = 0;
+  int timeout_ms  = murl_poll_timeout_ms(mrb, timeout);
+  murl_multi_t* m = murl_multi_get(mrb, multi_obj);
+  return murl_do_multi_poll(mrb, m, NULL, 0, timeout_ms);
+}
 
+/* =========================================================================
+ * multi_poll_fds(multi, timeout, waitfds) -> int
+ *   waitfds: Array of [fd, ev] pairs (ev: :in / :out / :inout).
+ *
+ * Same flat curl_multi_poll pass-through as multi_poll, but with any number
+ * of extra fds (up to a fixed cap) riding along as curl_waitfd entries —
+ * how the internal reactor waits on every open WebSocket socket in the same
+ * wait that serves the in-flight transfers. Pure marshalling: the array is
+ * walked once into a stack buffer, libcurl does the waiting.
+ * ========================================================================= */
+
+#define MURL_WAITFDS_MAX 64
+
+static mrb_value
+murl_lc_multi_poll_fds(mrb_state* mrb, mrb_value mod)
+{
+  (void)mod;
+  mrb_value multi_obj, timeout, arr_obj;
+  mrb_get_args(mrb, "ooA", &multi_obj, &timeout, &arr_obj);
+
+  int timeout_ms  = murl_poll_timeout_ms(mrb, timeout);
   murl_multi_t* m = murl_multi_get(mrb, multi_obj);
 
-#if LIBCURL_VERSION_NUM >= 0x074200 /* curl_multi_poll: 7.66.0 */
-  struct curl_waitfd wfd;
-  struct curl_waitfd* wfds = NULL;
-  unsigned int nfds = 0;
+  mrb_int n = RARRAY_LEN(arr_obj);
+  if (unlikely(n > MURL_WAITFDS_MAX))
+    mrb_raisef(mrb, E_ARGUMENT_ERROR, "too many waitfds (%i > %i)",
+               n, (mrb_int)MURL_WAITFDS_MAX);
 
-  if (!mrb_nil_p(ev_obj)) {
-    mrb_sym ev = mrb_obj_to_sym(mrb, ev_obj);
-    short events;
-    if      (ev == MRB_SYM(in))    events = CURL_WAIT_POLLIN;
-    else if (ev == MRB_SYM(out))   events = CURL_WAIT_POLLOUT;
-    else if (ev == MRB_SYM(inout)) events = CURL_WAIT_POLLIN | CURL_WAIT_POLLOUT;
-    else { mrb_raisef(mrb, E_ARGUMENT_ERROR, "unknown event: :%n", ev); return mrb_nil_value(); }
-    wfd.fd      = (curl_socket_t)fd;
-    wfd.events  = events;
-    wfd.revents = 0;
-    wfds = &wfd;
-    nfds = 1;
+  struct curl_waitfd wfds[MURL_WAITFDS_MAX];
+  for (mrb_int i = 0; i < n; i++) {
+    mrb_value pair = mrb_ary_ref(mrb, arr_obj, i);
+    if (unlikely(!mrb_array_p(pair) || RARRAY_LEN(pair) < 2))
+      mrb_raise(mrb, E_ARGUMENT_ERROR, "waitfds entries must be [fd, ev] pairs");
+
+    wfds[i].fd      = (curl_socket_t)mrb_as_int(mrb, mrb_ary_ref(mrb, pair, 0));
+    wfds[i].events  = murl_wait_events(mrb, mrb_obj_to_sym(mrb, mrb_ary_ref(mrb, pair, 1)));
+    wfds[i].revents = 0;
   }
 
-  int numfds = 0;
-  murl_multi_check(mrb, curl_multi_poll(m->multi, wfds, nfds, (int)timeout_ms, &numfds));
-  return mrb_int_value(mrb, (mrb_int)numfds);
-#else
-  (void)m; (void)fd; (void)ev_obj; (void)timeout_ms;
-  return mrb_int_value(mrb, 0);
-#endif
+  return murl_do_multi_poll(mrb, m, n ? wfds : NULL, (unsigned int)n, timeout_ms);
 }
 
 /* =========================================================================
@@ -1554,7 +1654,8 @@ mrb_mruby_url_gem_init(mrb_state* mrb)
   mrb_define_module_function_id(mrb, lc, MRB_SYM(multi_init),          murl_lc_multi_init,          MRB_ARGS_NONE());
   mrb_define_module_function_id(mrb, lc, MRB_SYM(multi_setopt),        murl_lc_multi_setopt,        MRB_ARGS_REQ(3));
   mrb_define_module_function_id(mrb, lc, MRB_SYM(multi_add),           murl_lc_multi_add,           MRB_ARGS_REQ(2));
-  mrb_define_module_function_id(mrb, lc, MRB_SYM(multi_poll),          murl_lc_multi_poll,          MRB_ARGS_ARG(2, 2));
+  mrb_define_module_function_id(mrb, lc, MRB_SYM(multi_poll),          murl_lc_multi_poll,          MRB_ARGS_REQ(2));
+  mrb_define_module_function_id(mrb, lc, MRB_SYM(multi_poll_fds),      murl_lc_multi_poll_fds,      MRB_ARGS_REQ(3));
   mrb_define_module_function_id(mrb, lc, MRB_SYM(multi_perform),       murl_lc_multi_perform,       MRB_ARGS_REQ(1));
   mrb_define_module_function_id(mrb, lc, MRB_SYM(multi_remove),        murl_lc_multi_remove,        MRB_ARGS_REQ(2));
   mrb_define_module_function_id(mrb, lc, MRB_SYM(multi_socket_action), murl_lc_multi_socket_action, MRB_ARGS_ARG(1, 2));

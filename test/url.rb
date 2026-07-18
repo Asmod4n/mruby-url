@@ -1,9 +1,8 @@
-# test/url_test.rb — runs under mruby, parent of test/server.rb.
-#
-# IO.popen with "r+" gives us a duplex IO: parent's write end is child's
-# STDIN, parent's read end is child's STDOUT. We never write — we just
-# hold the pipe open. When this process exits, the write end closes,
-# the child's STDIN.read returns, and the child exits. No cleanup.
+# test/url.rb — runs under mrbtest, launched (like mrbtest itself) by the
+# project Rakefile's `rake test` task, which also spawns test/server.ruby as
+# a sibling process before invoking us. We never talk to the fixture process
+# directly — we only read the port/state files it writes to $state_dir; the
+# Rakefile owns starting and killing it (see Rakefile's `ensure` block).
 
 # mrbtest's environ reads empty (ENV is dead here) and we don't spawn it, so it
 # can't be handed the run-state path via ENV or ARGV. Instead the gem's
@@ -404,6 +403,50 @@ assert('streaming block bypasses response body') do
   assert_equal 65536, total
 end
 
+assert('an exception raised inside a streaming block propagates as itself') do
+  # A raise inside on_data aborts the transfer (libcurl sees a short write and
+  # fails it with CURLE_WRITE_ERROR), but the ORIGINAL exception must reach
+  # the caller — not get silently swallowed and reported as a WriteError
+  # value instead. A big-enough body forces several write-callback
+  # invocations per transfer, so this also exercises libcurl's connection
+  # teardown (which fires the socket callback) happening *after* the
+  # exception is already stashed, in the same drive pass.
+  class URLTestStreamRaise < StandardError
+    def initialize(tag); super("stream:#{tag}"); @tag = tag; end
+    attr_reader :tag
+  end
+
+  calls = 0
+  raised = assert_raise(URLTestStreamRaise) do
+    URL("#{$base}/big/65536").get do |_c|
+      calls += 1
+      raise URLTestStreamRaise, 'boom' if calls == 1
+    end
+  end
+  assert_equal 'stream:boom', raised.message
+  assert_equal 'boom', raised.tag
+
+  # The gem must still be fully usable afterward -- no leaked reactor/session
+  # state from the aborted transfer.
+  r = URL("#{$base}/echo").get
+  assert_true r.success?
+end
+
+assert('a raising parallel handler does not corrupt the batch driver') do
+  # A DIFFERENT failure point than the streaming-block test above: the raise
+  # comes from the completion handler itself (pure Ruby, called once the
+  # transfer has already finished), not from a libcurl callback. It must
+  # still surface from parallel_perform, and the reactor/session must be
+  # left clean enough that a fresh call afterward works normally.
+  seen = []
+  assert_raise(RuntimeError) do
+    URL("#{$base}/echo").parallel(:get) { |r| seen << r; raise 'boom-parallel-handler' }
+    URL.parallel_perform
+  end
+  r = URL("#{$base}/echo").get
+  assert_true r.success?
+end
+
 assert('multi-valued header merges into array') do
   r = URL("#{$base}/multi-cookie").get
   cookies = r.set_cookies
@@ -490,6 +533,22 @@ end
 
 assert('URL.parallel_perform with nothing registered is a no-op') do
   assert_nil URL.parallel_perform
+end
+
+assert('a blocking verb inside a parallel handler rides the same loop') do
+  # Handlers run in pure-Ruby loop frames, so a nested blocking call pumps
+  # the same internal loop (and reuses the same session/connection pool)
+  # instead of needing a throwaway session.
+  inner = nil
+  outer = nil
+  URL("#{$base}/echo").parallel(:get, params: { outer: '1' }) do |r|
+    outer = r
+    inner = URL("#{$base}/echo").get(params: { nested: '1' })
+  end
+  URL.parallel_perform
+  assert_equal 200, outer.code
+  assert_equal 200, inner.code
+  assert_include inner.effective_url, 'nested=1'
 end
 
 assert('parallel registration keeps usage errors as raises, before any I/O') do
@@ -804,6 +863,43 @@ proto_assert('URL.websocket block form yields a live socket then closes it', 'ws
   end
   assert_equal 'blocky', got.data
   assert_true ws.closed?
+end
+
+proto_assert('URL.websocket coexists with a parallel batch on the one loop', 'ws', $ws_port) do
+  # An open socket no longer starves — or is starved by — the parallel driver:
+  # both ride the same internal loop. The echo sent before the batch is
+  # serviced (and buffered) while parallel_perform drives its transfers, so
+  # the receive afterwards finds it waiting.
+  ws = URL("ws://127.0.0.1:#{$ws_port}/").connect
+  ws.send('during-batch')
+  codes = []
+  URL("#{$base}/echo").parallel(:get)     { |r| codes << r.code }
+  URL("#{$base}/slow/300").parallel(:get) { |r| codes << r.code }
+  URL.parallel_perform
+  msg = ws.receive(timeout: 5.s)
+  assert_equal 2, codes.size
+  assert_equal 'during-batch', msg.data
+  ws.close
+end
+
+proto_assert('ws.receive inside a parallel handler keeps the batch moving', 'ws', $ws_port) do
+  # Waiting on a websocket from within a handler pumps the same loop that
+  # drives the remaining transfers — nothing deadlocks, nothing stalls.
+  ws = URL("ws://127.0.0.1:#{$ws_port}/").connect
+  order = []
+  URL("#{$base}/slow/300").parallel(:get) { |_r| order << :slow }
+  URL("#{$base}/echo").parallel(:get) do |_r|
+    order << :fast
+    ws.send('from-handler')
+    msg = ws.receive(timeout: 5.s)
+    order << ((msg && msg.data == 'from-handler') ? :ws : :ws_failed)
+  end
+  URL.parallel_perform
+  assert_equal :fast, order.first        # completion order still holds
+  assert_true  order.include?(:ws)       # the in-handler receive got its echo
+  assert_true  order.include?(:slow)     # and the slow transfer still landed
+  assert_false order.include?(:ws_failed)
+  ws.close
 end
 
 proto_assert('URL.websocket failed upgrade is a value, not a raise', 'ws', $ws_port) do

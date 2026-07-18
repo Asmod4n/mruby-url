@@ -25,6 +25,22 @@ Ruby. Concretely:
   can only be reached from C (e.g. a required callback function pointer), and
   then only the minimum glue.
 
+## The one internal loop
+
+Everything that waits in this gem waits in one place: an internal reactor
+(`mrblib/url/reactor.rb`). A blocking-looking call — a verb, a
+`URL.parallel_perform`, a `WebSocket#receive`, a retry pause — registers a
+completion block and pumps that loop until its own block has fired. While any
+one call waits, every other in-flight transfer keeps transferring and every
+open websocket keeps being serviced (frames drained, PINGs answered). Async
+under the hood, synchronous to the caller; there is no public loop object, no
+run method, nothing to drive.
+
+The reactor rides libcurl's own event-less multi API (`curl_multi_perform` +
+`curl_multi_poll`, with every websocket socket riding each wait as an extra
+poll fd) — libcurl tracks every transfer fd and timeout internally, so
+nothing platform-specific runs in Ruby.
+
 ## Sessions and re-entrancy
 
 The high-level verbs reuse one shared session (`URL.shared`), so the
@@ -32,24 +48,23 @@ connection pool, TLS sessions and HTTP/2 streams persist across calls — repeat
 requests to a host skip the handshake. See the
 [options reference](options.md#tuning-the-shared-session) for tuning its pool.
 
-That session drives one transfer at a time, so a call made from *inside* a
-streaming block or parallel handler (where the session is mid-flight) would be
-re-entrant. mruby-url detects that and transparently runs the nested call on a
-throwaway session that **shares the same connection and TLS-session cache** —
-a nested call to a host you already opened resumes TLS (and often reuses the
-live connection) instead of doing a full handshake. This is transparent in
-both directions; no API changes, no flags.
+A call made from *inside* a parallel handler (or any other completion block)
+just pumps the same loop — same session, same warm connection pool. The one
+place that can't is a call made from inside a **streaming block**: those run
+inside a libcurl C callback, and a multi must never be re-entered from its
+own callbacks. mruby-url detects that and transparently runs the nested call
+on a throwaway session that **shares the same connection and TLS-session
+cache** — a nested call to a host you already opened resumes TLS (and often
+reuses the live connection) instead of doing a full handshake. This is
+transparent in both directions; no API changes, no flags.
 
 The cache sharing goes further: connections and TLS sessions are reused across
 several mruby VMs running on the same OS thread.
 
 ## Event-loop integration
 
-By default the verbs block on a built-in driver that rides libcurl's own
-event-less multi API (`curl_multi_perform` + `curl_multi_poll`) — libcurl
-tracks every fd and timeout internally, so nothing platform-specific runs in
-Ruby. To drive transfers on a platform loop (glib, libuv, …) instead, subclass
-`URL::EventLoop` and implement four primitives:
+To drive transfers on a platform loop (glib, libuv, …) instead of the
+built-in reactor, subclass `URL::EventLoop` and implement four primitives:
 
 ```ruby
 class URL::EventLoop
@@ -78,8 +93,9 @@ or set it per session via `session.event_loop = my_loop`.
 ### Driving a session by hand
 
 `URL::IOSelectLoop` is the reference `EventLoop` implementation — the
-blocking verbs don't use it (they ride libcurl's `curl_multi_perform`/`poll`
-directly), it exists as the example of what an integration must provide:
+blocking verbs don't use it (they pump the internal reactor, which rides
+libcurl's `curl_multi_perform`/`poll` directly), it exists as the example of
+what an integration must provide:
 store the fds and timer the session asks for, and fire the blocks it handed
 you when they're ready. Nothing else; `socket_action`, completion reaping and
 timeout bookkeeping all live in the session, so every integration gets them

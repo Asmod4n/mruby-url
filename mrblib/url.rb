@@ -16,7 +16,7 @@
 #                         family (Response#error) descends from it — see
 #                         mrblib/url/errors.rb
 #
-# The internal plumbing (request dispatch, the built-in blocking driver,
+# The internal plumbing (request dispatch, the one internal event loop,
 # transfer buffering, the Request callback setters) lives under mrblib/url/.
 # Dir.glob sorts "url.rb" before "url/...", so this file loads first and the
 # user-facing classes here — including URL::EventLoop, which the internal
@@ -338,8 +338,10 @@ end
 #
 #  Blocking by default: each verb drives URL.shared (a session reused across
 #  calls so libcurl's connection pool, TLS sessions and HTTP/2 streams
-#  persist) and returns a URL::Response. A verb called from inside a callback
-#  can't reuse the busy session, so it transparently runs on a throwaway one.
+#  persist) and returns a URL::Response — pumping the one internal loop, so
+#  everything else in flight keeps progressing while it waits. A verb called
+#  from inside a handler pumps that same loop; only a verb called from inside
+#  a streaming C callback transparently runs on a throwaway session.
 #
 #  Set URL.default_loop= with a URL::EventLoop subclass to drive transfers on
 #  a native loop instead; the verbs then fire-and-forget and return nil.
@@ -415,11 +417,13 @@ class URL
     # URL::Response#retry). Once its handler returns, a Response can no
     # longer be retried.
     #
-    # Runs on URL.shared by default — so the connection pool, TLS sessions and
-    # HTTP/2 multiplexing carry over — falling back to a throwaway session
-    # when called re-entrantly from inside a callback. Runtime failures are
-    # values like everywhere else: each Response's #error is set, nothing is
-    # raised; usage errors raise at registration time, before any I/O.
+    # Runs on URL.shared — so the connection pool, TLS sessions and HTTP/2
+    # multiplexing carry over — pumped through the one internal loop (which
+    # also keeps any open websockets serviced); only a call from inside a
+    # streaming C callback falls back to a throwaway session. Runtime
+    # failures are values like everywhere else: each Response's #error is
+    # set, nothing is raised; usage errors raise at registration time,
+    # before any I/O.
     def parallel_perform
       while (entries = @_pending)
         @_pending = nil

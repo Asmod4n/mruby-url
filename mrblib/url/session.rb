@@ -136,7 +136,7 @@ class URL
 
   # Event-less drive: one curl_multi_perform pass. libcurl checks all its own
   # fds and timers internally — no socket/timer callbacks, no event loop.
-  # Returns the number of still-running transfers. The blocking SyncDriver is
+  # Returns the number of still-running transfers. The internal reactor is
   # built on perform + poll; the EventLoop interface is only for external
   # loop integrations.
   def perform
@@ -149,6 +149,14 @@ class URL
   # next internal timeout automatically.
   def poll(timeout)
     URL::Libcurl.multi_poll(@multi, timeout)
+  end
+
+  # Same wait, with extra fds riding along: `waitfds` is an Array of
+  # [fd, :in/:out/:inout] pairs (curl_waitfd extras). The reactor uses this
+  # to watch every open WebSocket socket in the same wait that serves the
+  # in-flight transfers.
+  def poll_fds(timeout, waitfds)
+    URL::Libcurl.multi_poll_fds(@multi, timeout, waitfds)
   end
 
   # Yield one [request, result_code] pair per completed transfer. The C
