@@ -18,7 +18,7 @@ begin
   # Frame type comes from the payload: valid UTF-8 → TEXT, else BINARY.
   ws.send("hello from mruby-url")
 
-  msg = ws.receive(timeout: 5)
+  msg = ws.receive(timeout: 5.s)
   if msg.nil?
     puts "timed out waiting for a reply"
   elsif msg.close?
@@ -29,7 +29,7 @@ begin
 
   # Non-UTF-8 bytes go out as a binary frame; read the echo back.
   ws.send("\x00\x01\x02\x03")
-  reply = ws.receive(timeout: 5)
+  reply = ws.receive(timeout: 5.s)
   puts "echoed #{reply.data.bytesize} bytes" if reply && !reply.close?
 ensure
   ws.close(status: 1000)

@@ -16,7 +16,7 @@ class URL::SyncDriver
   # Cap for one poll. curl_multi_poll returns earlier on socket activity or
   # when libcurl's own next timeout is nearer, so this is a ceiling, not a
   # latency — it only bounds how long a spurious idle wait could last.
-  POLL_MS = 1000
+  POLL_INTERVAL = 1.s
 
   def initialize(session)
     @session = session
@@ -52,7 +52,7 @@ class URL::SyncDriver
       @session.info_read { |req, code| on_complete&.call(req, code) }
       break if stop.call
       break if running == 0   # nothing in flight can complete the stop condition
-      @session.poll(POLL_MS)
+      @session.poll(POLL_INTERVAL)
     end
   end
 end
@@ -65,7 +65,7 @@ end
 class URL::IOSelectLoop < URL::EventLoop
   def initialize
     @watching = {}    # fd => { io:, readiness:, block: }
-    @timer    = nil   # { ms:, block: }
+    @timer    = nil   # { deadline:, block: }
   end
 
   def watch(io, readiness, &block)
@@ -78,8 +78,10 @@ class URL::IOSelectLoop < URL::EventLoop
     @watching.delete(handle)
   end
 
-  def arm_timer(ms, &block)
-    @timer = { ms: ms, block: block }
+  # `delay` is a chrono duration (500.ms, 2.s, …). Stored as a monotonic
+  # deadline so a slow select round can't stretch the timer.
+  def arm_timer(delay, &block)
+    @timer = { deadline: Chrono::Steady.now + delay, block: block }
     :timer
   end
 
@@ -98,7 +100,7 @@ class URL::IOSelectLoop < URL::EventLoop
         writes << w[:io] if w[:readiness] == :out || w[:readiness] == :inout
       end
 
-      sel_timeout = @timer && @timer[:ms] >= 0 ? @timer[:ms] / 1000.0 : nil
+      sel_timeout = @timer ? [@timer[:deadline] - Chrono::Steady.now, 0].max : nil
       break if reads.empty? && writes.empty? && sel_timeout.nil?
 
       r, w, _e = IO.select(reads, writes, nil, sel_timeout)

@@ -38,8 +38,8 @@ class URL; end
 #
 #    def watch(io, readiness, &block)   # called when fd readiness changes
 #    def unwatch(handle)
-#    def arm_timer(ms, &block)          # block.() when timer fires
-#    def cancel_timer(handle)
+#    def arm_timer(delay, &block)       # block.() once `delay` (a chrono
+#    def cancel_timer(handle)           # duration: 500.ms, 2.s, …) elapses
 #
 #  The block passed to watch.(io, cond) drives socket_action + info_read +
 #  remove. The block passed to arm_timer.() does the same for timeouts.
@@ -55,7 +55,7 @@ class URL::EventLoop
     raise NotImplementedError, "#{self.class}#unwatch"
   end
 
-  def arm_timer(ms, &block)
+  def arm_timer(delay, &block)
     raise NotImplementedError, "#{self.class}#arm_timer"
   end
 
@@ -349,7 +349,7 @@ end
 
 class URL
   DEFAULT_USER_AGENT      = "mruby-url".freeze
-  DEFAULT_TIMEOUT         = 30.0   # seconds; a chrono duration, same as 30.s
+  DEFAULT_TIMEOUT         = 30.s   # a chrono duration (Float seconds)
   DEFAULT_FOLLOW_LOCATION = true
 
   # The protocol schemes compiled into the embedded libcurl (lowercased), e.g.

@@ -44,6 +44,7 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 #include <threads.h>
 
 /* libcurl grew the WebSocket framing API (curl_ws_send / curl_ws_recv) and the
@@ -650,7 +651,13 @@ static mrb_value
 call_timer_body(mrb_state* mrb, void* data)
 {
   cb_timer_args* a = (cb_timer_args*)data;
-  return mrb_yield(mrb, a->cb, mrb_convert_long(mrb, a->ms));
+  /* libcurl's -1 means "delete the timer" — marshal it as nil so no magic
+   * integer crosses the boundary; anything else is a duration, handed over
+   * through mruby-chrono (Float seconds; 0 becomes 0.0 = "fire now"). */
+  mrb_value arg = a->ms < 0
+    ? mrb_nil_value()
+    : mrb_chrono_from(mrb, mrb_convert_long(mrb, a->ms), MRB_CHRONO_DUR_MILLISECONDS);
+  return mrb_yield(mrb, a->cb, arg);
 }
 
 static int
@@ -921,8 +928,16 @@ murl_lc_easy_setopt(mrb_state* mrb, mrb_value mod)
   else if (opt == MRB_SYM(max_recv_speed))     rc = curl_easy_setopt(h, CURLOPT_MAX_RECV_SPEED_LARGE, (curl_off_t)mrb_as_int(mrb, val));
   /* --- TCP keepalive ---------------------------------------------------- */
   else if (opt == MRB_SYM(tcp_keepalive))      rc = curl_easy_setopt(h, CURLOPT_TCP_KEEPALIVE, (long)mrb_bool(val));
-  else if (opt == MRB_SYM(tcp_keepidle))       rc = curl_easy_setopt(h, CURLOPT_TCP_KEEPIDLE, (long)mrb_as_int(mrb, val));
-  else if (opt == MRB_SYM(tcp_keepintvl))      rc = curl_easy_setopt(h, CURLOPT_TCP_KEEPINTVL, (long)mrb_as_int(mrb, val));
+  else if (opt == MRB_SYM(tcp_keepidle) || opt == MRB_SYM(tcp_keepintvl)) {
+    /* Durations, same one-timeout API as :timeout above — but these two
+     * CURLOPTs take whole seconds, so convert with DUR_SECONDS. mruby-chrono
+     * owns the unit math and the type/range checks. */
+    long secs;
+    mrb_chrono_convert(mrb, val, MRB_CHRONO_OUT_LONG, MRB_CHRONO_DUR_SECONDS,
+                       MRB_CHRONO_NEAREST, &secs, sizeof secs);
+    rc = curl_easy_setopt(h, opt == MRB_SYM(tcp_keepidle) ? CURLOPT_TCP_KEEPIDLE
+                                                          : CURLOPT_TCP_KEEPINTVL, secs);
+  }
   /* --- unix domain socket (Docker / HTTP-over-unix) --------------------- */
   else if (opt == MRB_SYM(unix_socket_path))   rc = curl_easy_setopt(h, CURLOPT_UNIX_SOCKET_PATH, mrb_string_cstr(mrb, val));
   /* --- multipart/form-data: val is a URL::Libcurl::Mime built in Ruby --- */
@@ -1021,9 +1036,12 @@ murl_lc_easy_getinfo(mrb_state* mrb, mrb_value mod)
     return url ? mrb_str_new_cstr(mrb, url) : mrb_nil_value();
   }
   else if (info == MRB_SYM(total_time)) {
+    /* curl reports microseconds; mruby-chrono turns them into the duration
+     * (Float seconds) every other time value in the gem speaks. */
     curl_off_t us = 0;
     murl_easy_check(mrb, curl_easy_getinfo(h, CURLINFO_TOTAL_TIME_T, &us));
-    return mrb_float_value(mrb, (mrb_float)us / 1e6);
+    return mrb_chrono_from(mrb, mrb_convert_int64(mrb, (int64_t)us),
+                           MRB_CHRONO_DUR_MICROSECONDS);
   }
   else if (info == MRB_SYM(content_type)) {
     const char* ct = NULL;
@@ -1038,15 +1056,16 @@ murl_lc_easy_getinfo(mrb_state* mrb, mrb_value mod)
   }
   else if (info == MRB_SYM(retry_after)) {
     /* CURLINFO_RETRY_AFTER is an enum member (not a macro), so gate on the
-     * version it appeared in: 7.66.0. Seconds from the response's
-     * Retry-After header (curl parses both the delta and HTTP-date forms);
-     * curl reports 0 when the header was absent, which we surface as nil.
-     * Pure marshalling, no policy. */
+     * version it appeared in: 7.66.0. A duration built from the response's
+     * Retry-After header (curl parses both the delta and HTTP-date forms,
+     * reporting whole seconds); curl reports 0 when the header was absent,
+     * which we surface as nil. Pure marshalling, no policy. */
 #if LIBCURL_VERSION_NUM >= 0x074200
     curl_off_t secs = 0;
     murl_easy_check(mrb, curl_easy_getinfo(h, CURLINFO_RETRY_AFTER, &secs));
     if (secs <= 0) return mrb_nil_value();
-    return mrb_convert_int(mrb, secs);
+    return mrb_chrono_from(mrb, mrb_convert_int64(mrb, (int64_t)secs),
+                           MRB_CHRONO_DUR_SECONDS);
 #else
     return mrb_nil_value();
 #endif
@@ -1278,27 +1297,36 @@ murl_lc_multi_perform(mrb_state* mrb, mrb_value mod)
 }
 
 /* =========================================================================
- * multi_poll(multi, timeout_ms)            -> int
- * multi_poll(multi, timeout_ms, fd, ev)    -> int   (ev: :in / :out / :inout)
+ * multi_poll(multi, timeout)            -> int
+ * multi_poll(multi, timeout, fd, ev)    -> int   (ev: :in / :out / :inout)
  *
- * Flat pass-through of curl_multi_poll. Without an fd it sleeps up to
- * timeout_ms even when nothing is attached (the documented difference from
- * curl_multi_wait); with one, the fd rides along as a curl_waitfd extra so
- * libcurl also wakes on its readiness — the portable way to wait on the
- * CONNECT_ONLY WebSocket socket. Returns the number of fd events (0 on a
- * plain timeout). This is the gem's only "wait" primitive — libcurl owns the
- * platform details, and it is invisible to bring-your-own-EventLoop users.
+ * Flat pass-through of curl_multi_poll. `timeout` is a duration (chrono
+ * Float seconds, e.g. 500.ms / 1.s); mruby-chrono converts it to the
+ * milliseconds curl_multi_poll takes — the type/range checks come with it.
+ * Without an fd it sleeps up to the timeout even when nothing is attached
+ * (the documented difference from curl_multi_wait); with one, the fd rides
+ * along as a curl_waitfd extra so libcurl also wakes on its readiness — the
+ * portable way to wait on the CONNECT_ONLY WebSocket socket. Returns the
+ * number of fd events (0 on a plain timeout). This is the gem's only "wait"
+ * primitive — libcurl owns the platform details, and it is invisible to
+ * bring-your-own-EventLoop users.
  * ========================================================================= */
 
 static mrb_value
 murl_lc_multi_poll(mrb_state* mrb, mrb_value mod)
 {
   (void)mod;
-  mrb_value multi_obj;
-  mrb_int   timeout_ms;
+  mrb_value multi_obj, timeout;
   mrb_int   fd     = -1;
   mrb_value ev_obj = mrb_nil_value();
-  mrb_get_args(mrb, "oi|io", &multi_obj, &timeout_ms, &fd, &ev_obj);
+  mrb_get_args(mrb, "oo|io", &multi_obj, &timeout, &fd, &ev_obj);
+
+  long timeout_ms;
+  mrb_chrono_convert(mrb, timeout, MRB_CHRONO_OUT_LONG, MRB_CHRONO_DUR_MILLISECONDS,
+                     MRB_CHRONO_NEAREST, &timeout_ms, sizeof timeout_ms);
+  /* curl_multi_poll takes int ms; clamp instead of truncating on LP64. */
+  if (timeout_ms > INT_MAX) timeout_ms = INT_MAX;
+  if (timeout_ms < 0)       timeout_ms = 0;
 
   murl_multi_t* m = murl_multi_get(mrb, multi_obj);
 
@@ -1325,7 +1353,7 @@ murl_lc_multi_poll(mrb_state* mrb, mrb_value mod)
   murl_multi_check(mrb, curl_multi_poll(m->multi, wfds, nfds, (int)timeout_ms, &numfds));
   return mrb_int_value(mrb, (mrb_int)numfds);
 #else
-  (void)m; (void)fd; (void)ev_obj;
+  (void)m; (void)fd; (void)ev_obj; (void)timeout_ms;
   return mrb_int_value(mrb, 0);
 #endif
 }

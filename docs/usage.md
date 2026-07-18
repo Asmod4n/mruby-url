@@ -280,10 +280,10 @@ URL.parallel_perform                      # one call — retries run as extra ro
                                           # and the perform drains
 ```
 
-`times` defaults to 1. `wait:` sets the pause before each re-run (any chrono
-duration or seconds — `500.ms`, `2.s`). When omitted, the server decides:
-429/503 responses often carry a `Retry-After` header, libcurl parses it
-(exposed as `resp.retry_after`, in seconds, `nil` when absent), and the retry
+`times` defaults to 1. `wait:` sets the pause before each re-run (a chrono
+duration — `500.ms`, `2.s`). When omitted, the server decides: 429/503
+responses often carry a `Retry-After` header, libcurl parses it (exposed as
+`resp.retry_after`, a chrono duration, `nil` when absent), and the retry
 waits exactly that long — no header, no wait. `retry` is for failures only —
 on a Response whose `error` is nil it raises `URL::Error`, and so does
 retrying a parallel Response after its handler has returned.

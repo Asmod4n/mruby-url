@@ -405,17 +405,17 @@ class URL
       )
     end
 
-    # Block for `seconds` using libcurl's own wait (curl_multi_poll on an
-    # idle session — it sleeps the full timeout even with nothing attached,
-    # portably, Windows included; IO.select can't do that there). Used
-    # between retry rounds on the blocking paths only; event-loop
-    # integrations never reach this. A nil/zero wait is a no-op.
-    def _wait(seconds)
-      ms = (seconds.to_f * 1000).to_i
-      return nil if ms <= 0
+    # Block for `duration` (chrono seconds: 500.ms, 2.s, …) using libcurl's
+    # own wait (curl_multi_poll on an idle session — it sleeps the full
+    # timeout even with nothing attached, portably, Windows included;
+    # IO.select can't do that there). Used between retry rounds on the
+    # blocking paths only; event-loop integrations never reach this. A
+    # nil/zero wait is a no-op.
+    def _wait(duration)
+      return nil if duration.nil? || duration.to_f <= 0
       session = shared
       session = open if session._busy?
-      session.poll(ms)
+      session.poll(duration)
       nil
     end
 

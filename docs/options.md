@@ -89,7 +89,8 @@ HTTP / proxy / network:
 | `:dns_servers` | DNS_SERVERS |
 | `:doh_url` | DOH_URL |
 | `:max_send_speed` / `:max_recv_speed` | MAX_SEND_SPEED_LARGE / MAX_RECV_SPEED_LARGE (bytes/s) |
-| `:tcp_keepalive` / `:tcp_keepidle` / `:tcp_keepintvl` | TCP_KEEPALIVE / TCP_KEEPIDLE / TCP_KEEPINTVL |
+| `:tcp_keepalive` | TCP_KEEPALIVE |
+| `:tcp_keepidle` / `:tcp_keepintvl` | TCP_KEEPIDLE / TCP_KEEPINTVL (chrono duration → s) |
 | `:unix_socket_path` | UNIX_SOCKET_PATH |
 
 ## Auth

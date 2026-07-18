@@ -55,7 +55,7 @@ Ruby. To drive transfers on a platform loop (glib, libuv, …) instead, subclass
 class URL::EventLoop
   def watch(io, readiness, &block)   # readiness: :in / :out / :inout — start watching io
   def unwatch(handle)                # handle is whatever watch returned
-  def arm_timer(ms, &block)          # call block.() once, ms from now
+  def arm_timer(delay, &block)       # call block.() once, after `delay` (a chrono duration)
   def cancel_timer(handle)
 end
 ```

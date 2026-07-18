@@ -32,16 +32,20 @@ class URL
     @event_loop      = nil
     @_timer_handle   = nil
     @pending_timeout = nil
+    @timer_fired     = false
 
     # libcurl's socket/timer callbacks call straight back into these blocks (run
     # under mrb_protect_error in C). on_socket replays each fd change to the
-    # event loop; on_timer records the timeout that socket_action's drain loop
-    # and the timer re-arm at the end of socket_action consume — no C-side buffering.
+    # event loop; on_timer records the timeout — a chrono duration (0.0 = drive
+    # again now) or nil (cancel the timer) — that socket_action's drain loop and
+    # the timer re-arm at the end of socket_action consume; @timer_fired tells
+    # "the callback asked for nil" apart from "the callback never ran".
     @multi.on_socket = lambda do |fd, what|
       _socket_ready(fd, what) if @event_loop
     end
-    @multi.on_timer = lambda do |ms|
-      @pending_timeout = ms
+    @multi.on_timer = lambda do |timeout|
+      @pending_timeout = timeout
+      @timer_fired     = true
     end
 
     # The procs an event loop invokes on fd readiness / timer expiry: drive
@@ -91,17 +95,19 @@ class URL
   # Drive libcurl on a socket event (or a timeout when called with no args),
   # then replay the resulting socket/timer changes to the event loop.
   #
-  # libcurl can ask to be called again immediately by reporting a 0ms timeout;
-  # we drain that here (loop while the taken timeout is 0) before flushing.
-  # Any exception a write/header/read callback stashed surfaces out of
-  # multi_socket_action, so the flush below is skipped while one is pending and
-  # the buffered events carry over to the next call — exactly as before.
+  # libcurl can ask to be called again immediately by reporting a zero
+  # timeout; we drain that here (loop while the taken timeout is 0) before
+  # flushing. Any exception a write/header/read callback stashed surfaces out
+  # of multi_socket_action, so the flush below is skipped while one is pending
+  # and the buffered events carry over to the next call — exactly as before.
   def socket_action(fd = URL::Libcurl::SOCKET_TIMEOUT, ev = nil)
     fd = fd.fileno if fd.respond_to?(:fileno)
 
-    # on_socket fires _socket_ready during the call; on_timer records the
-    # new timeout into @pending_timeout. libcurl can ask to be re-driven
-    # immediately by reporting a 0ms timeout — drained below before arming.
+    # on_socket fires _socket_ready during the call; on_timer records the new
+    # timeout — a duration, or nil for "cancel" — into @pending_timeout.
+    # libcurl can ask to be re-driven immediately by reporting a zero timeout
+    # — drained below before arming.
+    @timer_fired     = false
     @pending_timeout = nil
     running = URL::Libcurl.multi_socket_action(@multi, fd, ev)
     timeout = @pending_timeout
@@ -114,14 +120,15 @@ class URL
       timeout = @pending_timeout
     end
 
-    # Arm/cancel the event loop's timer from the timeout libcurl reported:
-    # nil leaves any existing timer alone, <= 0 cancels, > 0 re-arms.
-    if !timeout.nil? && @event_loop
+    # Arm/cancel the event loop's timer from what libcurl reported: no
+    # callback leaves any existing timer alone, nil cancels, a positive
+    # duration re-arms.
+    if @timer_fired && @event_loop
       if @_timer_handle
         @event_loop.cancel_timer(@_timer_handle)
         @_timer_handle = nil
       end
-      @_timer_handle = @event_loop.arm_timer(timeout, &@_timer_block) if timeout > 0
+      @_timer_handle = @event_loop.arm_timer(timeout, &@_timer_block) if timeout && timeout > 0
     end
 
     running
@@ -136,11 +143,12 @@ class URL
     URL::Libcurl.multi_perform(@multi)
   end
 
-  # Wait up to `ms` for activity on any of libcurl's own fds (or just sleep
-  # the full timeout when nothing is attached) — curl_multi_poll, libcurl's
-  # portable wait. Caps at libcurl's next internal timeout automatically.
-  def poll(ms)
-    URL::Libcurl.multi_poll(@multi, ms)
+  # Wait up to `timeout` (a chrono duration: 500.ms, 1.s, …) for activity on
+  # any of libcurl's own fds (or just sleep the full timeout when nothing is
+  # attached) — curl_multi_poll, libcurl's portable wait. Caps at libcurl's
+  # next internal timeout automatically.
+  def poll(timeout)
+    URL::Libcurl.multi_poll(@multi, timeout)
   end
 
   # Yield one [request, result_code] pair per completed transfer. The C
