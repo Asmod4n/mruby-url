@@ -12,8 +12,12 @@ MRuby::Gem::Specification.new('mruby-url') do |spec|
   spec.add_dependency 'mruby-socket'
   spec.add_dependency 'mruby-string-ext'   # String#byteslice for Ruby-side upload chunking
   spec.add_dependency 'mruby-string-is-utf8' # String#is_utf8? — WebSocket#send picks TEXT vs BINARY frames
+  spec.add_dependency 'mruby-sleep'        # portable sleep(seconds) — see io_select_loop.rb's
+                                            # nothing-to-watch-but-a-timer case (an all-empty
+                                            # IO.select, the POSIX idiom for that, fails outright
+                                            # on Windows; sleep() is the one primitive that's
+                                            # actually portable there)
   spec.add_test_dependency 'mruby-env'
-  spec.add_test_dependency 'mruby-sleep'
 
   # The test fixture's run-state dir is created and exported by the project
   # Rakefile (MURL_TEST_STATE_DIR). mrbtest's own environ reads empty, so the

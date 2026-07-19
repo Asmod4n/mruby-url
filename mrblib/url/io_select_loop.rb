@@ -68,11 +68,19 @@ class URL::IOSelectLoop < URL::EventLoop
     wait    = _wait_for(timeout, nearest)
     return false if reads.empty? && writes.empty? && wait.nil?
 
-    r, w, _e = IO.select(reads, writes, nil, wait)
-
     fired = false
-    r&.each { |io| fired |= _fire_io(io, :in) }
-    w&.each { |io| fired |= _fire_io(io, :out) }
+    if reads.empty? && writes.empty?
+      # Nothing to watch, just a timer/explicit timeout to honor. An
+      # all-empty IO.select is the portable POSIX idiom for "sleep" — but
+      # not on Windows, where Winsock's select() rejects a call with no
+      # sockets in it outright. sleep() is the one primitive that's
+      # actually portable here.
+      sleep(wait)
+    else
+      r, w, _e = IO.select(reads, writes, nil, wait)
+      r&.each { |io| fired |= _fire_io(io, :in) }
+      w&.each { |io| fired |= _fire_io(io, :out) }
+    end
     fired |= _fire_expired_timers
     fired
   end
