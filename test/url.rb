@@ -195,6 +195,99 @@ assert('handles with no duplicable libcurl resource refuse dup/clone') do
   assert_raise(NotImplementedError) { URL::Libcurl.mime_addpart(m).dup }  # Part CDATA
 end
 
+# ---- URL::EventLoop — the one thing everything drives through -------------
+
+assert('URL::IOSelectLoop#run_once services more than one concurrent timer') do
+  # A single @timer slot (the pre-fix bug) would make the second arm_timer
+  # silently replace the first, so :a would never fire.
+  loop  = URL::IOSelectLoop.new
+  fired = []
+  loop.arm_timer(30.ms)  { fired << :a }
+  loop.arm_timer(120.ms) { fired << :b }
+  loop.run_once until fired.size >= 2
+  assert_equal [:a, :b], fired
+end
+
+assert('URL::IOSelectLoop#cancel_timer only cancels its own handle') do
+  loop  = URL::IOSelectLoop.new
+  fired = []
+  a = loop.arm_timer(20.ms) { fired << :a }
+  loop.arm_timer(60.ms) { fired << :b }
+  loop.cancel_timer(a)
+  loop.run_once until fired.include?(:b)
+  assert_equal [:b], fired
+end
+
+assert('URL::IOSelectLoop#watch supports two independent registrations on the same fd') do
+  # A websocket watches :in for the connection's whole life and, only while a
+  # send is draining, briefly adds a second :out registration on that same
+  # fd — the second registration must not clobber the first, and unwatching
+  # one must leave the other alone. A connected TCP loopback pair gives one
+  # fd that's both readable and writable, unlike a pipe's two separate ends
+  # (and mruby-socket, unlike IO.pipe, is a hard dependency of this gem, so
+  # it's available on every platform the gem itself runs on).
+  srv    = TCPServer.new('127.0.0.1', 0)
+  client = TCPSocket.new('127.0.0.1', srv.addr[1])
+  peer   = srv.accept
+  begin
+    loop = URL::IOSelectLoop.new
+    in_fired  = 0
+    out_fired = 0
+    in_handle  = loop.watch(client, :in)  { in_fired  += 1 }
+    out_handle = loop.watch(client, :out) { out_fired += 1 }
+
+    loop.run_once until out_fired > 0   # a fresh socket is immediately writable
+    assert_equal 0, in_fired            # nothing sent to client yet
+
+    loop.unwatch(out_handle)
+    peer.write("x")
+    loop.run_once until in_fired > 0
+    assert_equal 1, in_fired
+
+    loop.unwatch(in_handle)
+  ensure
+    client.close
+    peer.close
+    srv.close
+  end
+end
+
+assert('a minimal URL::EventLoop subclass, as default_loop, still drives a blocking verb') do
+  # The whole "one loop, swappable, five primitives" architecture rests on
+  # run_once being sufficient on its own — a loop offering nothing more
+  # must still drive a plain blocking verb exactly like the built-in
+  # IOSelectLoop does. This wraps IOSelectLoop's own run_once (proving nothing
+  # is special-cased for the built-in class) but counts how often it's asked.
+  probe = Class.new(URL::EventLoop) do
+    def initialize
+      @inner  = URL::IOSelectLoop.new
+      @rounds = 0
+    end
+    attr_reader :rounds
+    def watch(io, readiness, &block); @inner.watch(io, readiness, &block); end
+    def unwatch(handle);              @inner.unwatch(handle);             end
+    def arm_timer(delay, &block);     @inner.arm_timer(delay, &block);    end
+    def cancel_timer(handle);         @inner.cancel_timer(handle);        end
+    def run_once(timeout = nil)
+      @rounds += 1
+      @inner.run_once(timeout)
+    end
+  end.new
+
+  prior = URL.default_loop
+  begin
+    URL.default_loop = probe
+    fresh = URL.open   # never touched — resolves default_loop right now
+    req, state = URL.__send__(:_build_request, fresh, :GET, "#{$base}/echo", nil, {}, nil)
+    resp = URL.__send__(:_drive_sync, fresh, "#{$base}/echo", req, state)
+    assert_true resp.success?
+    assert_equal probe, fresh.event_loop
+    assert_true probe.rounds > 0
+  ensure
+    URL.default_loop = prior
+  end
+end
+
 assert('URL.get echo') do
   r = URL("#{$base}/echo").get(params: { a: '1', b: 'x y' })
   assert_true r.success?
@@ -426,7 +519,7 @@ assert('an exception raised inside a streaming block propagates as itself') do
   assert_equal 'stream:boom', raised.message
   assert_equal 'boom', raised.tag
 
-  # The gem must still be fully usable afterward -- no leaked reactor/session
+  # The gem must still be fully usable afterward -- no leaked loop/session
   # state from the aborted transfer.
   r = URL("#{$base}/echo").get
   assert_true r.success?
@@ -436,7 +529,7 @@ assert('a raising parallel handler does not corrupt the batch driver') do
   # A DIFFERENT failure point than the streaming-block test above: the raise
   # comes from the completion handler itself (pure Ruby, called once the
   # transfer has already finished), not from a libcurl callback. It must
-  # still surface from parallel_perform, and the reactor/session must be
+  # still surface from parallel_perform, and the loop/session must be
   # left clean enough that a fresh call afterward works normally.
   seen = []
   assert_raise(RuntimeError) do

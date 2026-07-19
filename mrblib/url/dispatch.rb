@@ -10,49 +10,80 @@ JSON.zero_copy_parsing = true
 
 class URL
   class << self
-    # With a default_loop set: attach to the platform loop and return nil
-    # immediately (the session lives until info_read sees the request
-    # complete). Otherwise block via _blocking below and return the
-    # Response.
-    def _fire(method, url, body, opts, &on_chunk)
-      if @default_loop
-        session = open
-        session.event_loop = @default_loop
-        req, _state = _build_request(session, method, url, body, opts, on_chunk)
-        session.add(req)
-        session.socket_action
-        nil
-      else
-        _blocking(url) { |s| _build_request(s, method, url, body, opts, on_chunk) }
+    # Call loop.run_once until `condition` holds — the one wait in the gem.
+    # Every blocking verb, parallel batch, websocket send/receive and retry
+    # pause boils down to this: register with a loop, then drive it. While
+    # this call waits, every other transfer and open websocket registered on
+    # the SAME loop keeps progressing too, since a shared loop's run_once
+    # services all of them together, not just the caller's own registration.
+    def _drive_until(loop)
+      loop.run_once until yield
+      nil
+    end
+
+    # Drive `entries` (each a { url:, build:, post: } — `build` configures a
+    # [Request, TransferState] pair on the session it's given) on `session`
+    # through `loop`, yielding (entry, response) the moment each finishes.
+    # One method for every shape of drive: a single blocking verb, a
+    # `.parallel` batch on the shared session, and the in-C-callback
+    # fallback on a throwaway session all just call this with a different
+    # session/loop. A runtime failure is a Response whose resp.error is set
+    # — never a raise; only a handler itself raising unwinds out of here,
+    # which the ensure below turns into "unregister whatever hadn't finished
+    # yet" so nothing is left dangling on the session.
+    def _drive_entries(entries, session, loop)
+      remaining = entries.size
+      reqs      = []
+      begin
+        entries.each do |e|
+          req, state = e[:build].call(session)
+          reqs << req
+          session.add(req) do |code|
+            remaining -= 1
+            yield e, _finish_response(e[:url], req, state, code, e[:post])
+          end
+        end
+        _drive_until(loop) { remaining <= 0 }
+      ensure
+        reqs.each { |r| session.remove(r) }   # no-op for ones already reaped
       end
+      nil
     end
 
     # Blocking front shared by every synchronous operation: let the block
-    # configure the request, then drive it to completion on the one reactor —
-    # while this call waits, every other registered transfer, websocket and
-    # deadline keeps progressing. The single place that can't pump the
-    # reactor is a call made from inside a C-invoked libcurl callback (a
-    # user's streaming block runs under curl_multi_perform, and a multi must
-    # never be re-entered from its own callbacks): that call transparently
-    # runs on a throwaway session driven by the reactor's contained fallback
-    # loop instead — same observable behaviour as ever.
+    # configure the request, then drive it to completion on URL.default_loop
+    # — while this call waits, every other registered transfer and open
+    # websocket keeps progressing, because they're driven by the exact same
+    # loop. The one place that can't do this is a call made from inside a
+    # C-invoked libcurl callback (a user's streaming block runs under
+    # multi_socket_action, and a multi must never be re-entered from its own
+    # callback — no event loop, built-in or a real platform one, can get
+    # around that): that call transparently runs on a throwaway session and
+    # a throwaway loop of its own instead — same observable behaviour as
+    # ever, and it can never collide with whatever's mid-callback because it
+    # shares no state with it.
     def _blocking(url, &build)
-      if _reactor._in_c?
-        resp = nil
-        _drive_entries_isolated([{ url: url, build: build }]) { |_e, r| resp = r }
-        resp
-      else
-        req, state = build.call(shared)
-        _drive_sync(shared, url, req, state)
-      end
+      entry = { url: url, build: build, post: nil }
+      resp  = nil
+      session = _in_c? ? open : shared
+      session.event_loop = IOSelectLoop.new if _in_c?
+      _drive_entries([entry], session, session.event_loop) { |_e, r| resp = r }
+      resp
     end
 
-    # Verb-agnostic blocking drive shared by the HTTP verbs, SMTP delivery and
-    # the IMAP verbs: drive the configured Request to completion on the
-    # reactor and wrap the outcome in a URL::Response. The reactor owns the
-    # add/pump/remove lifecycle.
+    # Verb-agnostic single-request drive: given an already-configured
+    # [req, state] pair on `session`, run it to completion and wrap the
+    # result. _blocking builds and drives in one step via _build_*/_drive_entries;
+    # this is the same drive for a request some other caller already built.
     def _drive_sync(session, url, req, state)
-      code = _reactor.drive_one(session, req)
+      loop = session.event_loop
+      code = nil
+      session.add(req) { |c| code = c }
+      begin
+        _drive_until(loop) { !code.nil? }
+      ensure
+        session.remove(req)   # no-op once reaped normally
+      end
       _finish_response(url, req, state, code)
     end
 
@@ -65,64 +96,15 @@ class URL
       post ? post.call(resp) : resp
     end
 
-    # Drive registered entries concurrently, yielding (entry, response) the
-    # moment each transfer finishes. Runs on the shared session (so the
-    # connection pool, TLS sessions and HTTP/2 multiplexing carry over),
-    # pumped through the one reactor — which also keeps every open websocket
-    # serviced while the batch runs. Each entry's `build` proc configures a
-    # [Request, TransferState] pair on the session (any of the _build_*
-    # helpers, so every protocol rides the same drive); `post`, when set,
-    # rewraps the finished Response (MQTT subscribe). Like the verbs, a
-    # runtime failure is a Response whose resp.error is set — never a raise.
-    # A handler may itself call blocking verbs: it runs in a pure-Ruby reactor
-    # frame, so the nested call just pumps the same loop.
+    # `.parallel`/`URL.parallel_perform`: drive every registered entry on the
+    # shared session (so the connection pool, TLS sessions and HTTP/2
+    # multiplexing carry over) concurrently. A handler may itself call
+    # blocking verbs — that's a plain nested call to _drive_entries/_blocking
+    # on the same loop, one level deeper, ordinary Ruby recursion.
     def _drive_parallel(entries)
-      if _reactor._in_c?
-        return _drive_entries_isolated(entries) { |e, resp| yield e, resp }
-      end
-
-      session   = shared
-      remaining = entries.size
-      reqs      = []
-      begin
-        entries.each do |e|
-          req, state = e[:build].call(session)
-          reqs << req
-          _reactor.add_transfer(session, req) do |r, code|
-            remaining -= 1
-            yield e, _finish_response(e[:url], r, state, code, e[:post])
-          end
-        end
-        _reactor.pump_until { remaining <= 0 }
-      ensure
-        # No-op for completed transfers; unhooks the rest if a handler raised.
-        reqs.each { |r| _reactor.abandon(r) }
-      end
-      nil
-    end
-
-    # The in-C-callback fallback for every blocking drive: build the entries
-    # on a throwaway session and run the reactor's contained loop. Entries are
-    # the { url:, build:, post: } shape _drive_parallel speaks, so one method
-    # serves the single-request and batch cases alike.
-    def _drive_entries_isolated(entries)
-      session = open
-      by_req  = {}
-      entries.each do |e|
-        req, state = e[:build].call(session)
-        by_req[req.object_id] = [e, req, state]
-        session.add(req)
-      end
-      begin
-        _reactor.isolated_drive(session, entries.size) do |req, code|
-          entry, r, state = by_req[req.object_id]
-          next unless entry
-          yield entry, _finish_response(entry[:url], r, state, code, entry[:post])
-        end
-      ensure
-        by_req.each_value { |(_e, r, _s)| session.remove(r) rescue nil }
-      end
-      nil
+      session = _in_c? ? open : shared
+      session.event_loop = IOSelectLoop.new if _in_c?
+      _drive_entries(entries, session, session.event_loop) { |e, resp| yield e, resp }
     end
 
     def _build_request(session, method, url, body, opts, on_chunk)
@@ -256,44 +238,47 @@ class URL
     # Open a WebSocket: build a CONNECT_ONLY=2 request and drive the upgrade
     # handshake through the multi like any other transfer — libcurl marks a
     # connect-only transfer done the moment the upgrade completes, leaving the
-    # live socket on the easy handle for the framing primitives. Driving it on
-    # the reactor means the handshake no longer freezes the VM: everything
-    # else in flight keeps progressing while it runs. The easy is removed from
-    # the multi at completion (before the handle is used for ws framing). A
-    # failed handshake is a value on the returned socket (ws.error /
-    # ws.open?), never a raise — the HTTP verbs' two-tier model.
+    # live socket on the easy handle for the framing primitives. Driving it
+    # through URL.default_loop means the handshake no longer freezes the VM:
+    # everything else in flight keeps progressing while it runs. A failed
+    # handshake is a value on the returned socket (ws.error / ws.open?),
+    # never a raise — the HTTP verbs' two-tier model.
     def _open_websocket(url, opts)
       opts = opts.dup
       opts[:timeout] = DEFAULT_TIMEOUT unless opts.key?(:timeout)
       user_hdrs = opts.delete(:headers)
       params    = opts.delete(:params)
 
-      in_c    = _reactor._in_c?
-      session = in_c ? open : shared
+      if _in_c?
+        session = open
+        session.event_loop = IOSelectLoop.new
+      else
+        session = shared
+      end
+      loop = session.event_loop
+
       url_str = _stringify_url(url, params)
       req     = URL::Request.new(session, url_str)
       req.setopt(:connect_only, 2)   # 2 = WebSocket: curl runs the upgrade, then hands back
       _apply_opts(req, opts)
       req.headers = user_hdrs if user_hdrs && !user_hdrs.empty?
 
-      # The easy must STAY in the multi while the socket lives: removing a
+      # The easy must STAY in the multi while the socket lives — removing a
       # completed CONNECT_ONLY easy drops its connection (activesocket goes
-      # dead). It is registered as kept; the WebSocket detaches it when the
-      # socket closes, and a failed handshake detaches right here.
+      # dead) — so it's added with remove_on_done: false. URL::WebSocket
+      # detaches it itself (session.remove) when the socket closes; a failed
+      # handshake, or an exception aborting the drive itself, detaches right
+      # here.
       code = nil
-      if in_c
-        session.add(req)
-        begin
-          _reactor.isolated_drive(session, 1) { |_r, c| code = c }
-          _reactor.keep(session, req) if code == 0
-        ensure
-          (session.remove(req) rescue nil) unless code == 0
-        end
-      else
-        code = _reactor.drive_one(session, req, remove_on_done: false)
+      session.add(req, remove_on_done: false) { |c| code = c }
+      begin
+        _drive_until(loop) { !code.nil? }
+      ensure
+        session.remove(req) if code.nil?
       end
-      ws = URL::WebSocket.new(req, code)
-      _reactor.detach(req) unless ws.open?
+
+      ws = URL::WebSocket.new(req, code, session)
+      session.remove(req) unless ws.open?
       ws
     end
 
@@ -304,7 +289,7 @@ class URL
     # Run a plain transfer for any supported scheme and return a URL::Response.
     # `on_chunk` streams the body instead of buffering; `upload_data`, when set,
     # turns it into an upload driven by the read callback. Reuses the same
-    # reactor drive as the HTTP verbs, so all protocols share one code path.
+    # _blocking drive as the HTTP verbs, so all protocols share one code path.
     def _run_transfer(url, opts, on_chunk, upload_data)
       _blocking(url) { |s| _build_transfer(s, url, opts, on_chunk, upload_data) }
     end
@@ -450,14 +435,17 @@ class URL
     end
 
     # Pause for `duration` (chrono seconds: 500.ms, 2.s, …) between retry
-    # rounds — by pumping the reactor, so everything else in flight keeps
-    # progressing while this caller waits (the reactor degrades to libcurl's
-    # plain portable sleep by itself when a C callback is live). A nil/zero
-    # wait is a no-op. Event-loop integrations never reach this.
+    # rounds — by arming a timer on a loop and driving it, so every other
+    # transfer and open websocket registered on that same loop keeps
+    # progressing while this caller waits. Inside a C callback no multi may
+    # be touched, so a private throwaway loop just sleeps (nothing else can
+    # be serviced there anyway). A nil/zero wait is a no-op.
     def _wait(duration)
       return nil if duration.nil? || duration.to_f <= 0
-      _reactor.sleep(duration)
-      nil
+      loop = _in_c? ? IOSelectLoop.new : default_loop
+      done = false
+      loop.arm_timer(duration) { done = true }
+      _drive_until(loop) { done }
     end
 
     # Guard that the embedded libcurl was built with the URL's scheme. Called by
@@ -592,7 +580,8 @@ class URL
   module SyncExec
     class << self
       def fire(method, url, body, opts, &on_chunk)
-        resp = URL._fire(method, url, body, opts.dup, &on_chunk)
+        dup_opts = opts.dup
+        resp = URL._blocking(url) { |s| URL._build_request(s, method, url, body, dup_opts, on_chunk) }
         _stamp(resp) { fire(method, url, body, opts, &on_chunk) }
       end
 

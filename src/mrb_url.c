@@ -44,7 +44,6 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
-#include <limits.h>
 #include <threads.h>
 
 /* libcurl grew the WebSocket framing API (curl_ws_send / curl_ws_recv) and the
@@ -498,7 +497,7 @@ murl_multi_check(mrb_state* mrb, CURLMcode rc)
  * murl_protect: mrb_protect_error, but safe to call more than once while an
  * earlier callback's exception is already stashed in mrb->exc.
  *
- * A single curl_multi_perform/socket_action pass can invoke several of our
+ * A single curl_multi_socket_action pass can invoke several of our
  * trampolines in sequence (e.g. the write callback aborts a transfer, and
  * libcurl's own connection teardown immediately fires the socket callback
  * with CURL_POLL_REMOVE). Every trampoline stashes its callback's raise into
@@ -1315,148 +1314,6 @@ murl_lc_multi_setopt(mrb_state* mrb, mrb_value mod)
   return multi_obj;
 }
 
-/* =========================================================================
- * multi_perform(multi) -> running_count
- *
- * Flat pass-through of curl_multi_perform — the event-less drive where
- * libcurl owns all fd and timeout tracking internally. Paired with
- * multi_poll it is everything a blocking driver needs; the socket_action
- * interface remains for external event loops. A callback-stashed exception
- * either propagates once this function returns to Ruby (via mruby's own
- * cfunc epilogue), or — if it made our socket/timer trampolines report
- * CURLM_ABORTED_BY_CALLBACK — is raised directly by murl_multi_check below,
- * in preference to that generic error. Same as socket_action.
- * ========================================================================= */
-
-static mrb_value
-murl_lc_multi_perform(mrb_state* mrb, mrb_value mod)
-{
-  (void)mod;
-  mrb_value multi_obj;
-  mrb_get_args(mrb, "o", &multi_obj);
-
-  murl_multi_t* m = murl_multi_get(mrb, multi_obj);
-
-  int running = 0;
-  CURLMcode rc;
-  do {
-    rc = curl_multi_perform(m->multi, &running);
-  } while (rc == CURLM_CALL_MULTI_PERFORM);
-
-  murl_multi_check(mrb, rc);
-  return mrb_convert_int(mrb, running);
-}
-
-/* =========================================================================
- * Shared marshalling for the two poll primitives below.
- * ========================================================================= */
-
-/* Duration (chrono Float seconds, e.g. 500.ms / 1.s) -> int milliseconds for
- * curl_multi_poll. mruby-chrono does the unit math and type/range checks;
- * clamp instead of truncating on LP64, and floor negatives at 0. */
-static int
-murl_poll_timeout_ms(mrb_state* mrb, mrb_value timeout)
-{
-  long ms;
-  mrb_chrono_convert(mrb, timeout, MRB_CHRONO_OUT_LONG, MRB_CHRONO_DUR_MILLISECONDS,
-                     MRB_CHRONO_NEAREST, &ms, sizeof ms);
-  if (ms > INT_MAX) ms = INT_MAX;
-  if (ms < 0)       ms = 0;
-  return (int)ms;
-}
-
-/* :in / :out / :inout -> CURL_WAIT_POLL* bits (curl_waitfd events). */
-static short
-murl_wait_events(mrb_state* mrb, mrb_sym ev)
-{
-  if (ev == MRB_SYM(in))    return CURL_WAIT_POLLIN;
-  if (ev == MRB_SYM(out))   return CURL_WAIT_POLLOUT;
-  if (ev == MRB_SYM(inout)) return CURL_WAIT_POLLIN | CURL_WAIT_POLLOUT;
-  mrb_raisef(mrb, E_ARGUMENT_ERROR, "unknown event: :%n", ev);
-  return 0; /* unreachable */
-}
-
-/* The one curl_multi_poll call (version-gated once): waits on the multi's
- * own fds plus `wfds`, returns the number of fd events (0 = plain timeout).
- * Pre-7.66.0 libcurl has no curl_multi_poll; return 0 without sleeping. */
-static mrb_value
-murl_do_multi_poll(mrb_state* mrb, murl_multi_t* m, struct curl_waitfd* wfds,
-                   unsigned int nfds, int timeout_ms)
-{
-#if LIBCURL_VERSION_NUM >= 0x074200 /* curl_multi_poll: 7.66.0 */
-  int numfds = 0;
-  murl_multi_check(mrb, curl_multi_poll(m->multi, wfds, nfds, timeout_ms, &numfds));
-  return mrb_int_value(mrb, (mrb_int)numfds);
-#else
-  (void)mrb; (void)m; (void)wfds; (void)nfds; (void)timeout_ms;
-  return mrb_int_value(mrb, 0);
-#endif
-}
-
-/* =========================================================================
- * multi_poll(multi, timeout) -> int
- *
- * Flat pass-through of curl_multi_poll with no extra fds: waits on the
- * multi's own fds, capping at libcurl's next internal timeout, and sleeps
- * the full `timeout` (a chrono duration) even when nothing is attached —
- * the documented difference from curl_multi_wait, and the gem's portable
- * sleep. For extra fds use multi_poll_fds. Invisible to
- * bring-your-own-EventLoop users.
- * ========================================================================= */
-
-static mrb_value
-murl_lc_multi_poll(mrb_state* mrb, mrb_value mod)
-{
-  (void)mod;
-  mrb_value multi_obj, timeout;
-  mrb_get_args(mrb, "oo", &multi_obj, &timeout);
-
-  int timeout_ms  = murl_poll_timeout_ms(mrb, timeout);
-  murl_multi_t* m = murl_multi_get(mrb, multi_obj);
-  return murl_do_multi_poll(mrb, m, NULL, 0, timeout_ms);
-}
-
-/* =========================================================================
- * multi_poll_fds(multi, timeout, waitfds) -> int
- *   waitfds: Array of [fd, ev] pairs (ev: :in / :out / :inout).
- *
- * Same flat curl_multi_poll pass-through as multi_poll, but with any number
- * of extra fds (up to a fixed cap) riding along as curl_waitfd entries —
- * how the internal reactor waits on every open WebSocket socket in the same
- * wait that serves the in-flight transfers. Pure marshalling: the array is
- * walked once into a stack buffer, libcurl does the waiting.
- * ========================================================================= */
-
-#define MURL_WAITFDS_MAX 64
-
-static mrb_value
-murl_lc_multi_poll_fds(mrb_state* mrb, mrb_value mod)
-{
-  (void)mod;
-  mrb_value multi_obj, timeout, arr_obj;
-  mrb_get_args(mrb, "ooA", &multi_obj, &timeout, &arr_obj);
-
-  int timeout_ms  = murl_poll_timeout_ms(mrb, timeout);
-  murl_multi_t* m = murl_multi_get(mrb, multi_obj);
-
-  mrb_int n = RARRAY_LEN(arr_obj);
-  if (unlikely(n > MURL_WAITFDS_MAX))
-    mrb_raisef(mrb, E_ARGUMENT_ERROR, "too many waitfds (%i > %i)",
-               n, (mrb_int)MURL_WAITFDS_MAX);
-
-  struct curl_waitfd wfds[MURL_WAITFDS_MAX];
-  for (mrb_int i = 0; i < n; i++) {
-    mrb_value pair = mrb_ary_ref(mrb, arr_obj, i);
-    if (unlikely(!mrb_array_p(pair) || RARRAY_LEN(pair) < 2))
-      mrb_raise(mrb, E_ARGUMENT_ERROR, "waitfds entries must be [fd, ev] pairs");
-
-    wfds[i].fd      = (curl_socket_t)mrb_as_int(mrb, mrb_ary_ref(mrb, pair, 0));
-    wfds[i].events  = murl_wait_events(mrb, mrb_obj_to_sym(mrb, mrb_ary_ref(mrb, pair, 1)));
-    wfds[i].revents = 0;
-  }
-
-  return murl_do_multi_poll(mrb, m, n ? wfds : NULL, (unsigned int)n, timeout_ms);
-}
 
 /* =========================================================================
  * multi_add(multi, easy) / multi_remove(multi, easy)
@@ -1654,9 +1511,6 @@ mrb_mruby_url_gem_init(mrb_state* mrb)
   mrb_define_module_function_id(mrb, lc, MRB_SYM(multi_init),          murl_lc_multi_init,          MRB_ARGS_NONE());
   mrb_define_module_function_id(mrb, lc, MRB_SYM(multi_setopt),        murl_lc_multi_setopt,        MRB_ARGS_REQ(3));
   mrb_define_module_function_id(mrb, lc, MRB_SYM(multi_add),           murl_lc_multi_add,           MRB_ARGS_REQ(2));
-  mrb_define_module_function_id(mrb, lc, MRB_SYM(multi_poll),          murl_lc_multi_poll,          MRB_ARGS_REQ(2));
-  mrb_define_module_function_id(mrb, lc, MRB_SYM(multi_poll_fds),      murl_lc_multi_poll_fds,      MRB_ARGS_REQ(3));
-  mrb_define_module_function_id(mrb, lc, MRB_SYM(multi_perform),       murl_lc_multi_perform,       MRB_ARGS_REQ(1));
   mrb_define_module_function_id(mrb, lc, MRB_SYM(multi_remove),        murl_lc_multi_remove,        MRB_ARGS_REQ(2));
   mrb_define_module_function_id(mrb, lc, MRB_SYM(multi_socket_action), murl_lc_multi_socket_action, MRB_ARGS_ARG(1, 2));
   mrb_define_module_function_id(mrb, lc, MRB_SYM(multi_info_read),     murl_lc_multi_info_read,     MRB_ARGS_REQ(1));

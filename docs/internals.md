@@ -25,21 +25,30 @@ Ruby. Concretely:
   can only be reached from C (e.g. a required callback function pointer), and
   then only the minimum glue.
 
-## The one internal loop
+## The one event loop
 
-Everything that waits in this gem waits in one place: an internal reactor
-(`mrblib/url/reactor.rb`). A blocking-looking call — a verb, a
-`URL.parallel_perform`, a `WebSocket#receive`, a retry pause — registers a
-completion block and pumps that loop until its own block has fired. While any
-one call waits, every other in-flight transfer keeps transferring and every
-open websocket keeps being serviced (frames drained, PINGs answered). Async
-under the hood, synchronous to the caller; there is no public loop object, no
-run method, nothing to drive.
+There is exactly one event loop model in this gem, always: `URL.default_loop`,
+a `URL::EventLoop`. Every blocking-looking call — a verb, a
+`URL.parallel_perform`, a `WebSocket#receive`/`#send`, a retry pause —
+registers with it and calls its `run_once` repeatedly until its own
+registration completes. While any one call waits, every other in-flight
+transfer and open websocket registered on the *same* loop keeps progressing
+too, since `run_once` services all of them together, not just the caller's
+own. Async under the hood, synchronous to the caller — nothing is driven any
+other way, and there is no separate internal mechanism hidden behind it.
 
-The reactor rides libcurl's own event-less multi API (`curl_multi_perform` +
-`curl_multi_poll`, with every websocket socket riding each wait as an extra
-poll fd) — libcurl tracks every transfer fd and timeout internally, so
-nothing platform-specific runs in Ruby.
+Unless you set `URL.default_loop=`, that loop is a `URL::IOSelectLoop`
+(`mrblib/url/io_select_loop.rb`) — ordinary, public, IO.select-based, ships
+with the gem, and is the exact class you'd read to write your own (see
+[Event-loop integration](#event-loop-integration) below).
+
+The one exception, forced by libcurl itself: a call made from *inside* a
+libcurl C callback (a streaming block) cannot register more work on that
+same multi and wait — the C stack frame that invoked the callback is
+synchronously blocked on the Ruby call returning, so no event loop, built-in
+or yours, can get around it. That case transparently drives a throwaway
+session on a private, throwaway loop instead — see
+[Sessions and re-entrancy](#sessions-and-re-entrancy).
 
 ## Sessions and re-entrancy
 
@@ -63,8 +72,11 @@ several mruby VMs running on the same OS thread.
 
 ## Event-loop integration
 
-To drive transfers on a platform loop (glib, libuv, …) instead of the
-built-in reactor, subclass `URL::EventLoop` and implement four primitives:
+`URL.default_loop` is what every verb, parallel batch, websocket and retry
+pause already drives through — there's no separate "internal" mode to escape
+from. To drive transfers on a platform loop (glib, libuv, an io_uring/kqueue
+wrapper, a game engine's frame loop, …) instead of the built-in
+`URL::IOSelectLoop`, subclass `URL::EventLoop` and implement five primitives:
 
 ```ruby
 class URL::EventLoop
@@ -72,34 +84,41 @@ class URL::EventLoop
   def unwatch(handle)                # handle is whatever watch returned
   def arm_timer(delay, &block)       # call block.() once, after `delay` (a chrono duration)
   def cancel_timer(handle)
+  def run_once(timeout = nil)        # process one round of readiness/timer events,
+                                      # waiting up to `timeout` (nil: indefinitely; 0: don't block)
 end
 ```
 
-Your loop's only job is to invoke the block at the right moment: call the
-`watch` block when the fd becomes ready, and the `arm_timer` block when the
-timer fires. Each block drives `socket_action` + completion reaping + removal
-internally — you never touch the session from your loop directly.
+`watch`/`unwatch`/`arm_timer`/`cancel_timer` are exactly what any event loop
+already has: register interest, get told when it's ready. `run_once` is the
+same "process one round" step every one of those already exposes too
+(`g_main_context_iteration`, `uv_run(UV_RUN_ONCE)`, a game engine's own
+per-frame poll) — implement it in terms of whatever your loop already does to
+advance itself once. Every wait in this gem is `loop.run_once until condition`
+— there is no other driving mechanism to implement, and nothing here is
+specific to sockets-via-select: how you actually wait (select, poll, kqueue,
+epoll, io_uring, a GUI toolkit's own fd-watching) is entirely yours.
 
-Install one instance process-wide and the verbs become fire-and-forget
-(returning `nil` instead of a `URL::Response`):
+Install one instance process-wide — every verb keeps working exactly the
+same way, driven by your `run_once` instead:
 
 ```ruby
 URL.default_loop = MyGlibLoop.new
-URL("https://example.com/ping").get   # attaches to the loop, returns nil
+URL("https://example.com/ping").get   # a real URL::Response, driven by MyGlibLoop
 ```
 
-or set it per session via `session.event_loop = my_loop`.
+or set it per session via `session.event_loop = my_loop` (a session picks up
+`URL.default_loop` lazily, the first time it needs one, and stays pinned to
+whatever that was for its own lifetime — set it explicitly to override).
 
 ### Driving a session by hand
 
-`URL::IOSelectLoop` is the reference `EventLoop` implementation — the
-blocking verbs don't use it (they pump the internal reactor, which rides
-libcurl's `curl_multi_perform`/`poll` directly), it exists as the example of
-what an integration must provide:
-store the fds and timer the session asks for, and fire the blocks it handed
-you when they're ready. Nothing else; `socket_action`, completion reaping and
-timeout bookkeeping all live in the session, so every integration gets them
-for free.
+`URL::IOSelectLoop` is the reference `EventLoop` implementation *and* the
+literal default — nothing about it is special-cased anywhere else in the
+gem. `add`/`socket_action`, completion reaping, and timeout bookkeeping all
+live in the session, so every integration gets them for free; your loop only
+ever needs to store the fds/timer it's asked to watch and fire the blocks it
+was handed when they're ready.
 
 ```ruby
 session = URL.open
@@ -108,16 +127,18 @@ session.event_loop = loop
 
 req = URL::Request.new(session, "https://example.com")
 req.on_data { |chunk| sink(chunk) }
-session.add(req)
-session.socket_action   # kick off: registers fds/timers with the loop
+code = nil
+session.add(req) { |c| code = c }   # kicks off the first drive pass itself
 
-loop.run                # pumps IO.select, firing the session's blocks,
-                        # until nothing is watched and no timer is armed
+loop.run_once until code   # the "boring" blocking-helper pattern any async
+                           # loop supports: keep processing rounds until
+                           # your own condition holds
 ```
 
-A real platform loop has no `run` of its own to call — its host application's
-loop plays that role; it only implements `watch`/`unwatch`/`arm_timer`/
-`cancel_timer` exactly as `IOSelectLoop` does.
+A real platform loop's host application is usually already running its own
+loop, in which case nothing above changes — `run_once` composes the same way
+whether you're calling it yourself in a tight loop or your GUI toolkit is
+calling it as part of its own frame/dispatch cycle.
 
 ## Threads and processes
 

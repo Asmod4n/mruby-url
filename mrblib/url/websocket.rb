@@ -8,12 +8,13 @@
 # the partial-send continuation loop — lives here in memory-safe Ruby, in
 # keeping with the gem's FFI-thin-C rule.
 #
-# Every wait goes through the one internal reactor (mrblib/url/reactor.rb):
-# the socket rides each of the loop's waits as an extra poll fd and gets a
-# _service pass whenever the loop wakes, so frames are drained and PINGs
-# answered even while unrelated transfers are being driven — and a blocking
-# #receive drives those transfers in turn. A WebSocket never starves the rest
-# of the gem, and the rest of the gem never starves a WebSocket.
+# Every wait goes through the owning session's event loop, the same
+# URL::EventLoop everything else in the gem drives through: the socket fd is
+# watched for the connection's whole life and gets a _service pass whenever
+# the loop wakes it, so frames are drained and PINGs answered even while
+# unrelated transfers are being driven — and a blocking #receive just drives
+# that same loop in turn. A WebSocket never starves the rest of the gem, and
+# the rest of the gem never starves a WebSocket.
 #
 # You get one from URL("wss://h").connect; see mrblib/url/dispatch.rb for the
 # connect path that drives the upgrade handshake to completion before handing
@@ -55,33 +56,38 @@ class URL::WebSocket
     def to_s;    @data;            end
   end
 
-  # Cap on buffered inbound messages. The reactor services this socket
-  # whenever the loop wakes; once the inbox is full it stops reading and the
-  # kernel's socket buffer applies backpressure to the peer.
+  # Cap on buffered inbound messages. This socket is serviced whenever the
+  # loop wakes it; once the inbox is full it stops reading and the kernel's
+  # socket buffer applies backpressure to the peer.
   INBOX_MAX = 64
 
   # `req` is a CONNECT_ONLY=2 URL::Request whose upgrade handshake has been
-  # driven to completion. `error_code` is the libcurl CURLcode from that drive
-  # (0 on success). A non-zero code — or a missing active socket — yields a
-  # closed socket carrying the failure as a value on #error; nothing is raised.
-  def initialize(req, error_code = 0)
-    @req    = req            # keeps the easy handle (and its connection) alive
-    @handle = req.handle
-    @error  = nil
-    @inbox  = []             # complete inbound Messages, in arrival order
+  # driven to completion on `session`. `error_code` is the libcurl CURLcode
+  # from that drive (0 on success). A non-zero code — or a missing active
+  # socket — yields a closed socket carrying the failure as a value on
+  # #error; nothing is raised.
+  def initialize(req, error_code, session)
+    @req     = req            # keeps the easy handle (and its connection) alive
+    @handle  = req.handle
+    @session = session        # #close/#_detach remove the easy through it
+    @error   = nil
+    @inbox   = []             # complete inbound Messages, in arrival order
 
     fd = error_code == 0 ? URL::Libcurl.easy_getinfo(@handle, :activesocket) : nil
     if error_code == 0 && fd
-      @fd = fd                # libcurl owns this fd; we only wait on it
+      @fd  = fd                # libcurl owns this fd; we only wait on it
+      @io  = IO.for_fd(fd)
+      @io.autoclose = false
+      @loop         = session.event_loop
       @closed       = false
       @rx_buf       = String.new   # cross-frame reassembly state
       @rx_type      = nil
       @pending_pong = nil          # latest unanswered PING's payload
       @tx_busy      = false        # a message send is mid-continuation
-      # Registered with the one reactor: this fd rides every wait as an extra
-      # poll fd, and _service runs whenever the loop wakes — so frames are
-      # drained and PINGs answered even while unrelated transfers are driven.
-      URL._reactor.watch_ws(@fd, self)
+      # Watched for the connection's whole life: _service runs whenever the
+      # loop wakes this fd, so frames are drained and PINGs answered even
+      # while unrelated transfers are driven on the same loop.
+      @watch_handle = @loop.watch(@io, :in) { _service }
     else
       # Either a CURLcode failure, or curl returned OK with no upgraded socket
       # (server answered with a normal HTTP response, not 101). Both become a
@@ -132,14 +138,16 @@ class URL::WebSocket
   # ---- receiving ----------------------------------------------------------
 
   # Block for the next complete message and return a URL::WebSocket::Message —
-  # reassembly, PING answering and PONG skipping all happen in _service, which
-  # the one reactor also runs while unrelated work is being driven, so a
-  # message may already be waiting in the inbox when this is called. Returns a
-  # :close Message when the peer closes, or nil if `timeout:` (a chrono
-  # duration: 5.s, 500.ms, …) elapses first. The deadline covers the whole
-  # message: it is computed once, up front, so trickling fragments can't
-  # restart the clock. While this call waits, every other registered transfer
-  # and websocket keeps progressing — waiting here starves nothing.
+  # reassembly, PING answering and PONG skipping all happen in _service,
+  # which also runs whenever the loop wakes this socket for unrelated
+  # reasons, so a message may already be waiting in the inbox when this is
+  # called. Returns a :close Message when the peer closes, or nil if
+  # `timeout:` (a chrono duration: 5.s, 500.ms, …) elapses first. The
+  # deadline covers the whole message: it is computed once, up front, so
+  # trickling fragments can't restart the clock. Waiting here is just this
+  # socket's fd's run_once round — every other transfer and websocket on the
+  # same loop keeps progressing regardless, since run_once services all of
+  # them together, not just this one.
   def receive(timeout: nil)
     deadline = timeout && Chrono::Steady.now + timeout
     loop do
@@ -152,7 +160,7 @@ class URL::WebSocket
       end
       return nil if @closed
       return nil if deadline && Chrono::Steady.now >= deadline
-      URL._reactor.wait_fd(@fd, :in, deadline)
+      @loop.run_once(deadline && deadline - Chrono::Steady.now)
     end
   end
 
@@ -226,7 +234,7 @@ class URL::WebSocket
 
   public
 
-  # One service pass, run by the reactor whenever the loop wakes (and by
+  # One service pass, run whenever the loop wakes this socket's fd (and by
   # #receive before it waits): flush the pending PONG, then drain readable
   # frames — reassembling fragments, answering PINGs, skipping PONGs — into
   # @inbox as complete Messages, until libcurl reports CURLE_AGAIN or the
@@ -234,8 +242,8 @@ class URL::WebSocket
   # ws_send never touch a multi, so this is safe at any point in the loop. A
   # transport failure is stashed (raised by the next #receive, the same
   # surface it raised from before) so servicing can never break an unrelated
-  # caller pumping the loop. Internal — the reactor is the only intended
-  # caller.
+  # caller driving the same loop. Internal — the loop's watch block is the
+  # only intended caller.
   def _service
     return if @closed
     begin
@@ -288,13 +296,13 @@ class URL::WebSocket
 
   # Stop watching the fd and let the easy leave its multi — the CONNECT_ONLY
   # easy stayed attached for the socket's whole life (removal is what kills
-  # its connection), so this runs exactly once, when the socket is done. The
-  # reactor kept the easy→session record and defers the multi_remove if a C
-  # callback is live above us.
+  # its connection), so this runs exactly once, when the socket is done.
+  # Session#remove defers the multi_remove itself if a C callback is live
+  # above us; nothing here needs to know about that.
   def _detach
     return unless @fd
-    URL._reactor.unwatch_ws(@fd)
-    URL._reactor.detach(@req)
+    @loop.unwatch(@watch_handle)
+    @session.remove(@req)
     @fd = nil
     nil
   end
@@ -343,15 +351,22 @@ class URL::WebSocket
   end
 
   # One ws_send, waiting on writability while libcurl reports CURLE_AGAIN
-  # (ws_send => nil). The wait is a reactor pass, so everything else in
-  # flight keeps progressing while this socket drains. Returns
-  # [bytes_accepted, flags_used] for this call.
+  # (ws_send => nil). The fd is normally only watched for :in (servicing
+  # inbound frames), so a second, transient :out registration rides
+  # alongside it for just this wait — the loop's run_once services both
+  # (and everything else registered on it) together, so nothing in flight
+  # starves while this socket drains. Returns [bytes_accepted, flags_used].
   def _send_once(data, flags)
     loop do
       r = URL::Libcurl.easy_ws_send(@handle, data, flags, 0)
       return r if r
 
-      URL._reactor.wait_fd(@fd, :out)
+      out_handle = @loop.watch(@io, :out) { }
+      begin
+        @loop.run_once
+      ensure
+        @loop.unwatch(out_handle)
+      end
     end
   end
 end
