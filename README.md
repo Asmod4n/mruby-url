@@ -56,10 +56,15 @@ MRuby::Build.new do |conf|
 end
 ```
 
-- **Linux / macOS** — needs the libcurl development files, found via
-  `pkg-config` (`apt install libcurl4-openssl-dev`, `dnf install
-  libcurl-devel`, or `brew install curl`). Everything else is an mrbgem and
-  resolves automatically.
+- **Linux / macOS** — needs the libcurl **development** headers, found via
+  `pkg-config` (`apt install libcurl4-openssl-dev pkg-config`, `dnf install
+  libcurl-devel`, or `brew install curl pkg-config`) — the runtime library
+  alone isn't enough, curl.h has to be on the include path. If `pkg-config`
+  can't find libcurl, the gem falls back to building its own vendored copy
+  (the `deps/curl` submodule) with CMake — needs `cmake` on the PATH, is
+  slower on a clean build, and gets cached after. It warns when it does this,
+  with install commands for the system-libcurl path per platform. Everything
+  else is an mrbgem and resolves automatically.
 - **Windows** — no system libcurl required: the gem builds its vendored curl
   (the `deps/curl` submodule) with CMake and links it statically against
   Schannel, so clone with `--recursive` and have CMake on the PATH.
