@@ -254,10 +254,14 @@ The class-level form mirrors it: `URL::HTTPS.parallel("https://x", :get) { |r| .
 Usage errors raise at registration, before any I/O — a verb the scheme
 doesn't have, an unknown scheme, a protocol this libcurl wasn't built with.
 WebSocket `connect` can't be registered (it returns a live socket, not a
-`Response`) and raises `ArgumentError`. Runtime failures stay values
-(`resp.error` on the delivered Response), exactly like the blocking verbs; a
-verb called from inside a handler runs immediately on a throwaway session,
-the same re-entrancy rule as everywhere else.
+`Response`) — but a socket opened with `connect` coexists freely with a
+running batch: everything shares one internal loop, so the socket keeps
+being serviced (PINGs answered, messages buffered) while `parallel_perform`
+drives its transfers, and `ws.receive` inside a handler keeps the rest of
+the batch moving. Runtime failures stay values (`resp.error` on the
+delivered Response), exactly like the blocking verbs; a verb called from
+inside a handler just pumps the same loop — same session, same connection
+pool.
 
 ## Retrying failed responses
 

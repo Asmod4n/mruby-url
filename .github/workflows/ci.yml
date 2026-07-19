@@ -46,6 +46,9 @@ jobs:
     name: test (${{ matrix.os }})
     if: github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'Merge pull request')
     runs-on: ${{ matrix.os }}
+    # The full matrix normally finishes in under 5 minutes; this is a safety
+    # net against a genuine hang running to GitHub's default 6-hour cap.
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -89,6 +92,12 @@ jobs:
       - name: macOS build deps (Homebrew libcurl via pkg-config)
         if: runner.os == 'macOS'
         run: |
+          # A stale Homebrew install reproducibly caused multi-minute stalls
+          # in this gem's own transfers on a local machine; `brew upgrade`
+          # fixed it there. Update first so CI never builds against the same
+          # stale packages.
+          brew update
+          brew upgrade
           brew install curl pkg-config
           # curl is keg-only on macOS (the OS ships its own), so point pkg-config
           # at the Homebrew one for `spec.search_package 'libcurl'`.
@@ -130,4 +139,55 @@ jobs:
         run: echo "MRUBY_CONFIG=build_config_visualcpp.rb" >> $env:GITHUB_ENV
 
       - name: rake test
+        if: runner.os != 'macOS'
         run: rake test
+
+      # mrbtest normally finishes in ~4 seconds; macOS CI has intermittently
+      # stalled inside it for an unknown reason (unrelated to the stale-brew
+      # issue above — reproduces even right after brew update/upgrade). Watch
+      # for the mrbtest process specifically and, if it runs far past its
+      # normal time, capture a thread-by-thread stack sample before killing
+      # it, so the log shows what it's blocked on instead of just "job timed
+      # out".
+      - name: rake test (macOS, with mrbtest hang watchdog)
+        if: runner.os == 'macOS'
+        run: |
+          set -o pipefail
+          rake test &
+          rake_pid=$!
+
+          mrbtest_pid=""
+          stuck_for=0
+          while kill -0 "$rake_pid" 2>/dev/null; do
+            sleep 1
+            if [ -n "$mrbtest_pid" ] && ! kill -0 "$mrbtest_pid" 2>/dev/null; then
+              mrbtest_pid=""
+            fi
+            if [ -z "$mrbtest_pid" ]; then
+              mrbtest_pid=$(pgrep -n -x mrbtest || true)
+              stuck_for=0
+              continue
+            fi
+            stuck_for=$((stuck_for + 1))
+            # Backstop: healthy mrbtest finishes in ~5s on these runners; a
+            # transfer wedged past DEFAULT_TIMEOUT parks for 30s. Sample well
+            # before that so the log shows the stack of a genuine hang.
+            if [ "$stuck_for" -ge 25 ]; then
+              echo "::warning::mrbtest (pid $mrbtest_pid) has been running ${stuck_for}s — normally ~4s. Capturing a stack sample."
+              sample "$mrbtest_pid" 5 -file /tmp/mrbtest_sample.txt || true
+              echo "----- sample: mrbtest (pid $mrbtest_pid) -----"
+              cat /tmp/mrbtest_sample.txt 2>/dev/null || echo "(sample failed to produce output)"
+              echo "----- fixture state dir -----"
+              ls -la mruby/build/url-test-run 2>/dev/null || echo "(no state dir)"
+              echo "----- fixture server.log -----"
+              cat mruby/build/url-test-run/server.log 2>/dev/null || echo "(no server.log)"
+              echo "----- fixture processes -----"
+              ps ax -o pid,ppid,stat,command | grep -E 'server\.ruby|sshd|slapd|mosquitto' | grep -v grep || echo "(none)"
+              echo "-----------------------------------------------"
+              kill -9 "$mrbtest_pid" 2>/dev/null || true
+              kill -9 "$rake_pid" 2>/dev/null || true
+              break
+            fi
+          done
+
+          wait "$rake_pid"

@@ -16,11 +16,18 @@
 #                         family (Response#error) descends from it — see
 #                         mrblib/url/errors.rb
 #
-# The internal plumbing (request dispatch, the built-in blocking driver,
-# transfer buffering, the Request callback setters) lives under mrblib/url/.
-# Dir.glob sorts "url.rb" before "url/...", so this file loads first and the
-# user-facing classes here — including URL::EventLoop, which the internal
-# URL::IOSelectLoop subclasses — are defined before the plumbing loads.
+# The internal plumbing (request dispatch, transfer buffering, the Request
+# callback setters) lives under mrblib/url/. Dir.glob sorts "url.rb" before
+# "url/...", so this file loads first and the user-facing classes here —
+# including URL::EventLoop, which URL::IOSelectLoop subclasses — are defined
+# before the plumbing loads.
+#
+# There is exactly one event loop model in this gem, always: every verb,
+# `.parallel`, a WebSocket send/receive, a retry pause — everything drives
+# through URL.default_loop, an URL::EventLoop. Nothing is driven any other
+# way; there is no separate internal mechanism hidden behind it. Unless you
+# set URL.default_loop=, that loop is a URL::IOSelectLoop (IO.select-based) —
+# ordinary, swappable, and the same class you'd read to write your own.
 
 # ============================================================================
 #  Errors
@@ -34,16 +41,37 @@
 class URL; end
 
 # ============================================================================
-#  URL::EventLoop — subclass and implement four primitives
+#  URL::EventLoop — subclass and implement five primitives
 #
 #    def watch(io, readiness, &block)   # called when fd readiness changes
 #    def unwatch(handle)
 #    def arm_timer(delay, &block)       # block.() once `delay` (a chrono
 #    def cancel_timer(handle)           # duration: 500.ms, 2.s, …) elapses
+#    def run_once(timeout = nil)        # process one round of readiness/
+#                                        # timer events, waiting up to
+#                                        # `timeout` for something to happen
+#                                        # (nil: wait indefinitely; 0: don't
+#                                        # block). Returns once ANY watched
+#                                        # fd or timer has fired, or the wait
+#                                        # elapses.
 #
-#  The block passed to watch.(io, cond) drives socket_action + info_read +
-#  remove. The block passed to arm_timer.() does the same for timeouts.
-#  Your loop only needs to invoke the block at the right moment.
+#  The block passed to watch.(io, cond) and the block passed to arm_timer.()
+#  are the only things your loop ever needs to invoke — it never needs to
+#  know what they do. watch/unwatch/arm_timer/cancel_timer are exactly what
+#  any event loop already has (a GLib main context, libuv, a kqueue/epoll/
+#  io_uring wrapper, a game engine's frame loop): register interest, get told
+#  when it's ready. run_once is the same "process one round" step every one
+#  of those already exposes too (g_main_context_iteration, uv_run
+#  (UV_RUN_ONCE), a game engine's own per-frame poll) — implement it in terms
+#  of whatever your loop already does to advance itself once. Every call in
+#  this gem that needs to wait does so by calling your run_once repeatedly
+#  until its own condition holds — there is no other driving mechanism to
+#  implement.
+#
+#  Nothing here is specific to sockets-via-select: `watch` hands you an IO
+#  and a readiness direction, and how you actually wait on it (select, poll,
+#  kqueue, epoll, io_uring, a GUI toolkit's own fd-watching) is entirely
+#  yours. See mrblib/url/io_select_loop.rb for the reference implementation.
 # ============================================================================
 
 class URL::EventLoop
@@ -61,6 +89,10 @@ class URL::EventLoop
 
   def cancel_timer(handle)
     raise NotImplementedError, "#{self.class}#cancel_timer"
+  end
+
+  def run_once(timeout = nil)
+    raise NotImplementedError, "#{self.class}#run_once"
   end
 end
 
@@ -338,11 +370,18 @@ end
 #
 #  Blocking by default: each verb drives URL.shared (a session reused across
 #  calls so libcurl's connection pool, TLS sessions and HTTP/2 streams
-#  persist) and returns a URL::Response. A verb called from inside a callback
-#  can't reuse the busy session, so it transparently runs on a throwaway one.
+#  persist) and returns a URL::Response — by registering with URL.default_loop
+#  (a URL::EventLoop) and calling its run_once until the registration
+#  completes, so everything else in flight — other transfers, open
+#  websockets — keeps progressing while it waits. A verb called from inside a
+#  handler drives the same way, one level deeper; only a verb called from
+#  inside a streaming C callback transparently runs on a throwaway session
+#  (libcurl forbids re-entering a multi from its own callback — the one rule
+#  no event loop, built-in or yours, can get around).
 #
-#  Set URL.default_loop= with a URL::EventLoop subclass to drive transfers on
-#  a native loop instead; the verbs then fire-and-forget and return nil.
+#  Set URL.default_loop= with your own URL::EventLoop subclass — a GUI
+#  toolkit's loop, an io_uring/kqueue wrapper, anything — and every verb
+#  keeps working exactly the same way, driven by run_once instead.
 #
 #  The dispatch behind these verbs lives in mrblib/url/dispatch.rb.
 # ============================================================================
@@ -362,8 +401,14 @@ class URL
     def supports?(proto)
       PROTOS.include?(proto.to_s.downcase)
     end
-    # Set once at startup with a platform-driven EventLoop instance; the
-    # verbs then attach new sessions to it and return immediately.
+    # The loop every verb, parallel batch, websocket and retry pause drives
+    # through. A URL::IOSelectLoop until you set your own. A session resolves
+    # this lazily, the first time it needs a loop, and stays pinned to
+    # whatever that was for its own lifetime (see Session#event_loop) — so
+    # setting this affects sessions that haven't driven anything yet (a fresh
+    # URL.open, or URL.shared before its first call), not ones already
+    # mid-flight. Set it once, early, unless you're deliberately opening a
+    # fresh session to pick up a change.
     def default_loop=(loop)
       unless loop.is_a?(EventLoop)
         raise TypeError, "expected a URL::EventLoop, got #{loop.class}"
@@ -372,7 +417,7 @@ class URL
     end
 
     def default_loop
-      @default_loop
+      @default_loop ||= IOSelectLoop.new
     end
 
     # Per-mrb_state session reused by every blocking verb so libcurl's
@@ -415,11 +460,13 @@ class URL
     # URL::Response#retry). Once its handler returns, a Response can no
     # longer be retried.
     #
-    # Runs on URL.shared by default — so the connection pool, TLS sessions and
-    # HTTP/2 multiplexing carry over — falling back to a throwaway session
-    # when called re-entrantly from inside a callback. Runtime failures are
-    # values like everywhere else: each Response's #error is set, nothing is
-    # raised; usage errors raise at registration time, before any I/O.
+    # Runs on URL.shared — so the connection pool, TLS sessions and HTTP/2
+    # multiplexing carry over — pumped through the one internal loop (which
+    # also keeps any open websockets serviced); only a call from inside a
+    # streaming C callback falls back to a throwaway session. Runtime
+    # failures are values like everywhere else: each Response's #error is
+    # set, nothing is raised; usage errors raise at registration time,
+    # before any I/O.
     def parallel_perform
       while (entries = @_pending)
         @_pending = nil

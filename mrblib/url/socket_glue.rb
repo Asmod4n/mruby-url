@@ -14,9 +14,11 @@ class URL
   def _socket_ready(fd, what)
     sockets = (@sockets ||= {})
 
+    loop = event_loop
+
     if what == :remove
       entry = sockets.delete(fd)
-      @event_loop.unwatch(entry[:handle]) if entry && entry[:handle]
+      loop.unwatch(entry[:handle]) if entry && entry[:handle]
       return
     end
 
@@ -29,8 +31,8 @@ class URL
 
     return if entry[:readiness] == what && entry[:handle]
 
-    @event_loop.unwatch(entry[:handle]) if entry[:handle]
-    entry[:handle]    = @event_loop.watch(entry[:io], what, &@_action_block)
+    loop.unwatch(entry[:handle]) if entry[:handle]
+    entry[:handle]    = loop.watch(entry[:io], what, &@_action_block)
     entry[:readiness] = what
     nil
   end

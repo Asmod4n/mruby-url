@@ -1,11 +1,10 @@
 #!/usr/bin/env ruby
-# test/server.rb — runs under MRI, child of the mruby test process.
-#
-# Lifecycle: parent (mruby) launches us via IO.popen("...", "r+") so our
-# STDIN is the read end of a pipe whose write end the parent holds.
-# When the parent dies — clean exit, segfault, killed, doesn't matter —
-# the kernel closes the write end, our read on STDIN returns, we exit.
-# No at_exit, no signal handler, no leaked process.
+# test/server.ruby — runs under MRI, spawned by the project Rakefile as the
+# process-group leader for the whole test fixture (sshd/slapd/mosquitto join
+# this group). We inherit the Rakefile's own STDIN/STDOUT (no pipe, no
+# IO.popen) — the Rakefile's `rake test` task spawns us with `pgroup: true`
+# and, in its `ensure` block, sends the group TERM then (after a grace
+# period) KILL, which is what actually reaps us and every daemon we spawned.
 
 # All run-state (port files, captured payloads, logs) lives in the throwaway
 # directory the Rakefile created and passed to us as ARGV[0]. Failing loudly
@@ -725,6 +724,16 @@ end
 # also lacks sftp/scp/ldap in libcurl — the port file is simply absent and the
 # matching tests skip. Best-effort: a setup failure is logged and skipped, never
 # fatal to the rest of the suite.
+#
+# Every spawn/system call below is given `in: File::NULL`. Without it these
+# processes inherit our own STDIN, which — per the header comment — is
+# whatever STDIN the Rakefile's `rake test` was itself run with (a real
+# terminal in interactive use). A leftover key file from a reused proto_dir
+# (PID reuse across runs piling up in Dir.tmpdir) makes ssh-keygen prompt to
+# overwrite; with stdout/stderr already sent to File::NULL that prompt is
+# invisible, and it blocks reading the terminal's STDIN forever instead of
+# hitting EOF — a silent, unkillable-looking hang with an empty log and no
+# visible prompt to answer.
 
 def which(bin)
   ENV['PATH'].to_s.split(File::PATH_SEPARATOR).each do |d|
@@ -744,8 +753,8 @@ begin
   sshd = which('sshd')
   if sshd && which('ssh-keygen')
     sd = File.join(proto_dir, 'ssh'); FileUtils.mkdir_p(sd)
-    system('ssh-keygen', '-q', '-t', 'ed25519', '-f', "#{sd}/host", '-N', '', out: File::NULL, err: File::NULL)
-    system('ssh-keygen', '-q', '-t', 'ed25519', '-f', "#{sd}/client", '-N', '', out: File::NULL, err: File::NULL)
+    system('ssh-keygen', '-q', '-t', 'ed25519', '-f', "#{sd}/host", '-N', '', in: File::NULL, out: File::NULL, err: File::NULL)
+    system('ssh-keygen', '-q', '-t', 'ed25519', '-f', "#{sd}/client", '-N', '', in: File::NULL, out: File::NULL, err: File::NULL)
     File.binwrite("#{sd}/test.txt", "sftp-hello\nrow2\n")
     File.write("#{sd}/authorized_keys", File.read("#{sd}/client.pub"))
     File.chmod(0600, "#{sd}/authorized_keys")
@@ -766,10 +775,10 @@ begin
     FileUtils.mkdir_p('/run/sshd') rescue nil
     # -D keeps sshd in the foreground so it stays in our process group and gets
     # reaped with it; without it sshd setsid()s away and would leak.
-    ssh_pid = spawn(sshd, '-D', '-f', "#{sd}/sshd_config", '-E', "#{sd}/sshd.log")
+    ssh_pid = spawn(sshd, '-D', '-f', "#{sd}/sshd_config", '-E', "#{sd}/sshd.log", in: File::NULL)
     child_pids << ssh_pid
     sleep 0.5
-    kh = `ssh-keyscan -p #{ssh_port} -t ed25519 127.0.0.1 2>/dev/null`
+    kh = `ssh-keyscan -p #{ssh_port} -t ed25519 127.0.0.1 2>/dev/null </dev/null`
     if !kh.strip.empty?
       File.write("#{sd}/known_hosts", kh)
       write_port_atomic(File.join(STATE_DIR, 'sftp_port'), ssh_port)
@@ -815,12 +824,12 @@ begin
       mail: alice@example.com
     LDIF
     slapadd = which('slapadd') || '/usr/sbin/slapadd'
-    if system(slapadd, '-f', "#{ld}/slapd.conf", '-l', "#{ld}/data.ldif", out: File::NULL, err: File::NULL)
+    if system(slapadd, '-f', "#{ld}/slapd.conf", '-l', "#{ld}/data.ldif", in: File::NULL, out: File::NULL, err: File::NULL)
       ldap_port  = TCPServer.open('127.0.0.1', 0) { |s| s.addr[1] }
       ldaps_port = TCPServer.open('127.0.0.1', 0) { |s| s.addr[1] }
       pid = spawn(slapd, '-f', "#{ld}/slapd.conf",
                   '-h', "ldap://127.0.0.1:#{ldap_port}/ ldaps://127.0.0.1:#{ldaps_port}/",
-                  '-d', '0', out: "#{ld}/slapd.log", err: "#{ld}/slapd.log")
+                  '-d', '0', in: File::NULL, out: "#{ld}/slapd.log", err: "#{ld}/slapd.log")
       child_pids << pid
       sleep 0.7
       write_port_atomic(File.join(STATE_DIR, 'ldap_port'), ldap_port)
@@ -847,14 +856,14 @@ begin
       keyfile #{KEY_PEM}
       require_certificate false
     CFG
-    pid = spawn(mosq, '-c', "#{md}/mosq.conf", out: "#{md}/mosq.log", err: "#{md}/mosq.log")
+    pid = spawn(mosq, '-c', "#{md}/mosq.conf", in: File::NULL, out: "#{md}/mosq.log", err: "#{md}/mosq.log")
     child_pids << pid
     sleep 0.5
     # Publish a retained message (over the plaintext listener) so a one-shot
     # subscribe on either listener is deterministic.
     if (mp = which('mosquitto_pub'))
       system(mp, '-h', '127.0.0.1', '-p', mqtt_port.to_s, '-t', 'test/topic', '-m', 'mqtt-retained', '-r',
-             out: File::NULL, err: File::NULL)
+             in: File::NULL, out: File::NULL, err: File::NULL)
     end
     write_port_atomic(File.join(STATE_DIR, 'mqtt_port'), mqtt_port)
     write_port_atomic(File.join(STATE_DIR, 'mqtts_port'), mqtts_port)

@@ -5,8 +5,16 @@
 # The C layer exposes only two framing primitives (easy_ws_recv / easy_ws_send)
 # plus the CURLWS_* flag constants. Everything a WebSocket actually *means* —
 # reassembling fragmented messages, dispatching text/binary/ping/pong/close,
-# the partial-send continuation loop, and blocking on the socket between calls —
-# lives here in memory-safe Ruby, in keeping with the gem's FFI-thin-C rule.
+# the partial-send continuation loop — lives here in memory-safe Ruby, in
+# keeping with the gem's FFI-thin-C rule.
+#
+# Every wait goes through the owning session's event loop, the same
+# URL::EventLoop everything else in the gem drives through: the socket fd is
+# watched for the connection's whole life and gets a _service pass whenever
+# the loop wakes it, so frames are drained and PINGs answered even while
+# unrelated transfers are being driven — and a blocking #receive just drives
+# that same loop in turn. A WebSocket never starves the rest of the gem, and
+# the rest of the gem never starves a WebSocket.
 #
 # You get one from URL("wss://h").connect; see mrblib/url/dispatch.rb for the
 # connect path that drives the upgrade handshake to completion before handing
@@ -48,23 +56,38 @@ class URL::WebSocket
     def to_s;    @data;            end
   end
 
+  # Cap on buffered inbound messages. This socket is serviced whenever the
+  # loop wakes it; once the inbox is full it stops reading and the kernel's
+  # socket buffer applies backpressure to the peer.
+  INBOX_MAX = 64
+
   # `req` is a CONNECT_ONLY=2 URL::Request whose upgrade handshake has been
-  # driven to completion. `error_code` is the libcurl CURLcode from that drive
-  # (0 on success). A non-zero code — or a missing active socket — yields a
-  # closed socket carrying the failure as a value on #error; nothing is raised.
-  def initialize(req, error_code = 0)
-    @req    = req            # keeps the easy handle (and its connection) alive
-    @handle = req.handle
-    @error  = nil
+  # driven to completion on `session`. `error_code` is the libcurl CURLcode
+  # from that drive (0 on success). A non-zero code — or a missing active
+  # socket — yields a closed socket carrying the failure as a value on
+  # #error; nothing is raised.
+  def initialize(req, error_code, session)
+    @req     = req            # keeps the easy handle (and its connection) alive
+    @handle  = req.handle
+    @session = session        # #close/#_detach remove the easy through it
+    @error   = nil
+    @inbox   = []             # complete inbound Messages, in arrival order
 
     fd = error_code == 0 ? URL::Libcurl.easy_getinfo(@handle, :activesocket) : nil
     if error_code == 0 && fd
-      @fd = fd                # libcurl owns this fd; we only wait on it
-      # A bare multi handle used purely as libcurl's portable waiting
-      # primitive (curl_multi_poll with @fd as an extra fd) — no transfers
-      # ever attach to it.
-      @wait_multi = URL::Libcurl.multi_init
-      @closed = false
+      @fd  = fd                # libcurl owns this fd; we only wait on it
+      @io  = IO.for_fd(fd)
+      @io.autoclose = false
+      @loop         = session.event_loop
+      @closed       = false
+      @rx_buf       = String.new   # cross-frame reassembly state
+      @rx_type      = nil
+      @pending_pong = nil          # latest unanswered PING's payload
+      @tx_busy      = false        # a message send is mid-continuation
+      # Watched for the connection's whole life: _service runs whenever the
+      # loop wakes this fd, so frames are drained and PINGs answered even
+      # while unrelated transfers are driven on the same loop.
+      @watch_handle = @loop.watch(@io, :in) { _service }
     else
       # Either a CURLcode failure, or curl returned OK with no upgraded socket
       # (server answered with a normal HTTP response, not 101). Both become a
@@ -114,39 +137,30 @@ class URL::WebSocket
 
   # ---- receiving ----------------------------------------------------------
 
-  # Block for the next complete message and return a URL::WebSocket::Message,
-  # reassembling a fragmented or oversized message across frames. Control PINGs
-  # are answered and skipped; PONGs are skipped. Returns a :close Message when
-  # the peer closes, or nil if `timeout:` (a chrono duration: 5.s, 500.ms, …)
-  # elapses first. The deadline covers the whole message: it is computed once,
-  # up front, so trickling fragments can't restart the clock.
+  # Block for the next complete message and return a URL::WebSocket::Message —
+  # reassembly, PING answering and PONG skipping all happen in _service,
+  # which also runs whenever the loop wakes this socket for unrelated
+  # reasons, so a message may already be waiting in the inbox when this is
+  # called. Returns a :close Message when the peer closes, or nil if
+  # `timeout:` (a chrono duration: 5.s, 500.ms, …) elapses first. The
+  # deadline covers the whole message: it is computed once, up front, so
+  # trickling fragments can't restart the clock. Waiting here is just this
+  # socket's fd's run_once round — every other transfer and websocket on the
+  # same loop keeps progressing regardless, since run_once services all of
+  # them together, not just this one.
   def receive(timeout: nil)
-    return nil if @closed
     deadline = timeout && Chrono::Steady.now + timeout
-    buf  = String.new
-    type = nil
     loop do
-      chunk = _recv_chunk(deadline)
-      return nil if chunk == :timeout
-
-      data, flags, bytesleft = chunk
-
-      if (flags & CLOSE) != 0
-        @closed = true
-        return Message.new(:close, data)
-      elsif (flags & PING) != 0
-        pong(data)   # echo the application payload back
-        next
-      elsif (flags & PONG) != 0
-        next
+      _service                     # drain whatever is already readable
+      msg = @inbox.shift
+      return msg if msg
+      if (e = @rx_error)
+        @rx_error = nil
+        raise e                    # transport failure mid-receive, as ever
       end
-
-      type ||= (flags & BINARY) != 0 ? :binary : :text
-      buf << data
-
-      # Message is complete once this frame is fully drained (bytesleft == 0)
-      # and it was the final fragment (CONT clear).
-      return Message.new(type, buf) if bytesleft == 0 && (flags & CONT) == 0
+      return nil if @closed
+      return nil if deadline && Chrono::Steady.now >= deadline
+      @loop.run_once(deadline && deadline - Chrono::Steady.now)
     end
   end
 
@@ -181,6 +195,7 @@ class URL::WebSocket
     rescue StandardError
       # peer may already be gone; closing is best-effort
     end
+    _detach
     self
   end
 
@@ -217,24 +232,97 @@ class URL::WebSocket
     end
   end
 
-  # One ws_recv, blocking on readability while libcurl reports CURLE_AGAIN
-  # (ws_recv => nil). Returns the [data, flags, bytesleft] triple, or :timeout
-  # once the monotonic `deadline` (Chrono::Steady seconds) passes. Readiness
-  # comes from curl_multi_poll with the ws socket as an extra fd — libcurl's
-  # own portable wait; a nil deadline blocks in 1s slices.
-  def _recv_chunk(deadline)
-    loop do
-      frame = URL::Libcurl.easy_ws_recv(@handle, RECV_CHUNK)
-      return frame if frame
+  public
 
-      if deadline
-        remaining = deadline - Chrono::Steady.now
-        return :timeout if remaining <= 0
-        URL::Libcurl.multi_poll(@wait_multi, remaining, @fd, :in)
-      else
-        URL::Libcurl.multi_poll(@wait_multi, 1.s, @fd, :in)
+  # One service pass, run whenever the loop wakes this socket's fd (and by
+  # #receive before it waits): flush the pending PONG, then drain readable
+  # frames — reassembling fragments, answering PINGs, skipping PONGs — into
+  # @inbox as complete Messages, until libcurl reports CURLE_AGAIN or the
+  # inbox is full (then the kernel buffer applies backpressure). ws_recv /
+  # ws_send never touch a multi, so this is safe at any point in the loop. A
+  # transport failure is stashed (raised by the next #receive, the same
+  # surface it raised from before) so servicing can never break an unrelated
+  # caller driving the same loop. Internal — the loop's watch block is the
+  # only intended caller.
+  def _service
+    return if @closed
+    begin
+      _flush_pong
+
+      while @inbox.size < INBOX_MAX
+        frame = URL::Libcurl.easy_ws_recv(@handle, RECV_CHUNK)
+        break unless frame   # CURLE_AGAIN — nothing more readable now
+
+        data, flags, bytesleft = frame
+
+        if (flags & CLOSE) != 0
+          @inbox << Message.new(:close, data)
+          _mark_closed
+          break
+        elsif (flags & PING) != 0
+          _pong_or_queue(data)   # echo the application payload back
+          next
+        elsif (flags & PONG) != 0
+          next
+        end
+
+        @rx_type ||= (flags & BINARY) != 0 ? :binary : :text
+        @rx_buf << data
+
+        # Message is complete once this frame is fully drained (bytesleft == 0)
+        # and it was the final fragment (CONT clear).
+        if bytesleft == 0 && (flags & CONT) == 0
+          @inbox << Message.new(@rx_type, @rx_buf)
+          @rx_buf  = String.new
+          @rx_type = nil
+        end
       end
+    rescue StandardError => e
+      @rx_error = e
+      _mark_closed
     end
+    nil
+  end
+
+  private
+
+  # Peer closed (or the transport died): stop watching the fd and mark the
+  # socket unusable. Messages already in @inbox stay deliverable.
+  def _mark_closed
+    @closed = true
+    _detach
+    nil
+  end
+
+  # Stop watching the fd and let the easy leave its multi — the CONNECT_ONLY
+  # easy stayed attached for the socket's whole life (removal is what kills
+  # its connection), so this runs exactly once, when the socket is done.
+  # Session#remove defers the multi_remove itself if a C callback is live
+  # above us; nothing here needs to know about that.
+  def _detach
+    return unless @fd
+    @loop.unwatch(@watch_handle)
+    @session.remove(@req)
+    @fd = nil
+    nil
+  end
+
+  # Answer a PING now if the socket takes it, otherwise remember the payload —
+  # a single slot, latest wins (RFC 6455 §5.5.3: only the most recent
+  # unanswered PING needs a PONG), flushed on a later wake. Never blocks, and
+  # never sends while a message send is mid-continuation: injecting a frame
+  # between OFFSET fragments would corrupt libcurl's outgoing frame state.
+  def _pong_or_queue(payload)
+    if @tx_busy || URL::Libcurl.easy_ws_send(@handle, payload, PONG, 0).nil?
+      @pending_pong = payload
+    end
+    nil
+  end
+
+  def _flush_pong
+    return if @pending_pong.nil? || @tx_busy
+    @pending_pong = nil if URL::Libcurl.easy_ws_send(@handle, @pending_pong, PONG, 0)
+    nil
   end
 
   # Send a whole message, looping over partial sends. The first call carries
@@ -245,24 +333,40 @@ class URL::WebSocket
   def _send_message(data, flag)
     return nil if @closed   # no-op on a closed/failed socket; never raises
 
-    sent, flag = _send_once(data, flag)
-    total = data.bytesize
-    while sent < total
-      rest    = data.byteslice(sent, total - sent)
-      n, flag = _send_once(rest, flag | OFFSET)
-      sent   += n
+    # @tx_busy keeps _service from injecting a PONG between the OFFSET
+    # continuation fragments below — one outgoing frame at a time.
+    @tx_busy = true
+    begin
+      sent, flag = _send_once(data, flag)
+      total = data.bytesize
+      while sent < total
+        rest    = data.byteslice(sent, total - sent)
+        n, flag = _send_once(rest, flag | OFFSET)
+        sent   += n
+      end
+      sent
+    ensure
+      @tx_busy = false
     end
-    sent
   end
 
-  # One ws_send, blocking on writability while libcurl reports CURLE_AGAIN
-  # (ws_send => nil). Returns [bytes_accepted, flags_used] for this call.
+  # One ws_send, waiting on writability while libcurl reports CURLE_AGAIN
+  # (ws_send => nil). The fd is normally only watched for :in (servicing
+  # inbound frames), so a second, transient :out registration rides
+  # alongside it for just this wait — the loop's run_once services both
+  # (and everything else registered on it) together, so nothing in flight
+  # starves while this socket drains. Returns [bytes_accepted, flags_used].
   def _send_once(data, flags)
     loop do
       r = URL::Libcurl.easy_ws_send(@handle, data, flags, 0)
       return r if r
 
-      URL::Libcurl.multi_poll(@wait_multi, 1.s, @fd, :out)
+      out_handle = @loop.watch(@io, :out) { }
+      begin
+        @loop.run_once
+      ensure
+        @loop.unwatch(out_handle)
+      end
     end
   end
 end

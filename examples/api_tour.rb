@@ -272,8 +272,9 @@ URL.shared.setopt(:max_total_connections, 64)
 URL.shared.setopt(:max_concurrent_streams, 100)
 
 # URL.open makes an independent throwaway session if you want isolation; it still
-# shares the global connection/TLS cache. (You rarely need this — the verbs pick
-# the right session for you, including a fresh one when called re-entrantly.)
+# shares the global connection/TLS cache. (You rarely need this — the verbs all
+# run on the shared session, pumping one internal loop, and handle re-entrancy
+# for you.)
 sess = URL.open
 sess.setopt(:pipelining, 2)
 
