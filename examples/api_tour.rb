@@ -278,4 +278,9 @@ URL.shared.setopt(:max_concurrent_streams, 100)
 sess = URL.open
 sess.setopt(:pipelining, 2)
 
+# on_open_socket: an SSRF guard — set once, applied to every request the
+# session makes, before any connection to a resolved address is opened.
+# addr is a real Addrinfo; return truthy to allow, falsy to refuse.
+URL.shared.on_open_socket { |addr, purpose| !addr.ipv4? || addr.ip_address != "127.0.0.1" }
+
 puts "\n== end of tour =="

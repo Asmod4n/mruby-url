@@ -11,6 +11,11 @@
 **   - write / header / read callbacks on an Easy: thin trampolines that read a
 **     block off the Easy's ivars (@on_data/@on_header/@on_read), copy bytes,
 **     and invoke Ruby under mrb_protect_error.
+**   - opensocket callback on an Easy: a thin trampoline that reads
+**     @on_open_socket off the Easy, hands it the resolved sockaddr as raw
+**     bytes, and either creates the socket (truthy) or refuses it with
+**     CURL_SOCKET_BAD (falsy/unset/exception) — libcurl never opens a
+**     connection to an address this callback didn't approve.
 **   - socket / timer callbacks on a Multi: thin trampolines too — they read a
 **     block off the Multi's ivars (@on_socket / @on_timer) and invoke Ruby under
 **     mrb_protect_error, returning -1 (CURLM_ABORTED_BY_CALLBACK) on a raise so
@@ -47,6 +52,7 @@
 #include <threads.h>
 #ifndef _WIN32
 #include <dlfcn.h>
+#include <sys/socket.h>
 #endif
 
 /* libcurl grew the WebSocket framing API (curl_ws_send / curl_ws_recv, struct
@@ -803,6 +809,63 @@ murl_read_cb(char* buffer, size_t size, size_t nitems, void* userdata)
   return n;
 }
 
+/* opensocket callback: let @on_open_socket veto a resolved connect address
+ * before libcurl ever opens a socket to it (CURLOPT_OPENSOCKETFUNCTION,
+ * option 163, curl 7.17.1 — always registered below, no version guard
+ * needed anywhere this gem supports).
+ *
+ * No block set -> reproduce libcurl's own default exactly: a plain socket()
+ * on the resolved family/socktype/protocol. Verified against
+ * deps/curl/lib/cf-socket.c's socket_open(): that is the literal fallback
+ * libcurl itself uses when no opensocket callback is installed, and every
+ * other adjustment (SO_NOSIGPIPE, the CLOEXEC fallback, IPv6 scope_id) is
+ * applied by libcurl to the returned fd afterward regardless of which path
+ * produced it — nothing else for this callback to replicate.
+ *
+ * Block set -> yield the resolved sockaddr as raw bytes plus purpose, create
+ * the socket only if the block returns truthy. An exception is stashed like
+ * every other callback here and surfaces once control returns to Ruby; the
+ * candidate address is refused (CURL_SOCKET_BAD) in the meantime rather than
+ * risk connecting through a policy that half-failed. */
+typedef struct cb_opensocket_args {
+  mrb_value cb;
+  mrb_value sockaddr;
+  mrb_sym   purpose;
+} cb_opensocket_args;
+
+static mrb_value
+call_opensocket_body(mrb_state* mrb, void* data)
+{
+  cb_opensocket_args* a = (cb_opensocket_args*)data;
+  mrb_value argv[2] = { a->sockaddr, mrb_symbol_value(a->purpose) };
+  return mrb_yield_argv(mrb, a->cb, 2, argv);
+}
+
+static curl_socket_t
+murl_opensocket_cb(void* clientp, curlsocktype purpose, struct curl_sockaddr* address)
+{
+  murl_easy_t* e   = (murl_easy_t*)clientp;
+  mrb_state*   mrb = e->mrb;
+  mrb_value    cb  = mrb_iv_get(mrb, e->self, MRB_IVSYM(on_open_socket));
+  if (!mrb_proc_p(cb))
+    return socket(address->family, address->socktype, address->protocol);
+
+  mrb_sym psym = (purpose == CURLSOCKTYPE_ACCEPT) ? MRB_SYM(accept) : MRB_SYM(connect);
+
+  int ai = mrb_gc_arena_save(mrb);
+  mrb_value sockaddr = mrb_str_new(mrb, (const char*)&address->addr, address->addrlen);
+  cb_opensocket_args a = { cb, sockaddr, psym };
+  mrb_bool err = FALSE;
+  mrb_value ret = murl_protect(mrb, call_opensocket_body, &a, &err);
+
+  curl_socket_t fd = CURL_SOCKET_BAD;
+  if (!err && mrb_test(ret))
+    fd = socket(address->family, address->socktype, address->protocol);
+
+  mrb_gc_arena_restore(mrb, ai);
+  return fd;
+}
+
 /* =========================================================================
  * socket / timer callbacks: thin trampolines to the Multi's @on_socket /
  * @on_timer Ruby blocks, invoked under mrb_protect_error so nothing ever
@@ -920,6 +983,8 @@ murl_easy_wire(murl_easy_t* e)
   curl_easy_setopt(h, CURLOPT_HEADERDATA,     e);
   curl_easy_setopt(h, CURLOPT_READFUNCTION,   murl_read_cb);
   curl_easy_setopt(h, CURLOPT_READDATA,       e);
+  curl_easy_setopt(h, CURLOPT_OPENSOCKETFUNCTION, murl_opensocket_cb);
+  curl_easy_setopt(h, CURLOPT_OPENSOCKETDATA,     e);
   curl_easy_setopt(h, CURLOPT_NOSIGNAL,       1L);
 
   CURLSH* sh = murl_thread_share();
@@ -1036,9 +1101,10 @@ murl_lc_easy_init_copy(mrb_state* mrb, mrb_value self)
   /* Carry the user callback blocks so the clone behaves like the original. The
    * hidden mime root (MRB_SYM(mime)) is intentionally NOT copied — libcurl
    * duplicated the mimepost into the new handle, which owns its copy. */
-  mrb_iv_set(mrb, self, MRB_IVSYM(on_data),   mrb_iv_get(mrb, orig, MRB_IVSYM(on_data)));
-  mrb_iv_set(mrb, self, MRB_IVSYM(on_header), mrb_iv_get(mrb, orig, MRB_IVSYM(on_header)));
-  mrb_iv_set(mrb, self, MRB_IVSYM(on_read),   mrb_iv_get(mrb, orig, MRB_IVSYM(on_read)));
+  mrb_iv_set(mrb, self, MRB_IVSYM(on_data),        mrb_iv_get(mrb, orig, MRB_IVSYM(on_data)));
+  mrb_iv_set(mrb, self, MRB_IVSYM(on_header),      mrb_iv_get(mrb, orig, MRB_IVSYM(on_header)));
+  mrb_iv_set(mrb, self, MRB_IVSYM(on_read),        mrb_iv_get(mrb, orig, MRB_IVSYM(on_read)));
+  mrb_iv_set(mrb, self, MRB_IVSYM(on_open_socket), mrb_iv_get(mrb, orig, MRB_IVSYM(on_open_socket)));
 
   return self;
 }

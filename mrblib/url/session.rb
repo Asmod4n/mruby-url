@@ -113,6 +113,25 @@ class URL
     self
   end
 
+  # Session-wide default for Request#on_open_socket — the SSRF-style connect
+  # filter. Every Request built against this session (every verb funnels
+  # through Request#initialize, so this covers HTTP/mail/IMAP/... uniformly)
+  # picks this up automatically unless the request sets its own, so a policy
+  # set once here — e.g. URL.shared.on_open_socket { |addr, purpose| ... } —
+  # can't be forgotten on an individual call the way a per-call option could.
+  #
+  # Call with a block to set it; call with no block to read the current
+  # value back (Request#initialize needs exactly that to copy the default
+  # onto each new handle).
+  def on_open_socket(&block)
+    if block
+      @on_open_socket = block
+      self
+    else
+      @on_open_socket
+    end
+  end
+
   # Attach `req` and kick off its first drive pass — nothing happens to a
   # newly-added easy until the multi is driven at least once. `on_done`, when
   # given, is called with the CURLcode once this transfer completes (from
