@@ -45,18 +45,89 @@
 #include <stdlib.h>
 #include <string.h>
 #include <threads.h>
-
-/* libcurl grew the WebSocket framing API (curl_ws_send / curl_ws_recv) and the
- * CURLWS_* flags in 7.86.0. When the embedded libcurl is older the two
- * primitives below compile to a single NotImplementedError stub and the flag
- * constants publish as 0, so loading the gem never fails — only an actual ws://
- * call does, with a clear message. */
-#if defined(LIBCURL_VERSION_NUM) && LIBCURL_VERSION_NUM >= 0x075600
-#  define MURL_HAVE_WEBSOCKETS 1
-#  define MURL_WS_FLAG(name) CURLWS_##name
-#else
-#  define MURL_WS_FLAG(name) 0
+#ifndef _WIN32
+#include <dlfcn.h>
 #endif
+
+/* libcurl grew the WebSocket framing API (curl_ws_send / curl_ws_recv, struct
+ * curl_ws_frame, CURLWS_*) in 7.86.0. Whether it is actually THERE is a
+ * question about the libcurl we end up linked against at runtime, not about
+ * the curl.h we happened to compile this file against — those can differ
+ * (e.g. a build stage with newer -dev headers than a slimmer runtime image),
+ * and libcurl's own ABI policy only promises safety upgrading, not
+ * downgrading (see https://curl.se/libcurl/abi.html). So this gem never
+ * infers availability from a header version macro: murl_globals_init (below)
+ * resolves curl_ws_recv/curl_ws_send by name from whatever is actually loaded,
+ * once, at startup, and every call site checks that result — never a
+ * compile-time guess.
+ *
+ * This block ONLY exists so the two functions below still compile against an
+ * old curl.h that doesn't declare any of this — when curl.h is new enough it
+ * already defines CURLINC_WEBSOCKETS_H, so nothing here is redeclared. */
+#ifndef CURLINC_WEBSOCKETS_H
+struct curl_ws_frame {
+  int        age;
+  int        flags;
+  curl_off_t offset;
+  curl_off_t bytesleft;
+  size_t     len;
+};
+#define CURLWS_TEXT   (1 << 0)
+#define CURLWS_BINARY (1 << 1)
+#define CURLWS_CONT   (1 << 2)
+#define CURLWS_CLOSE  (1 << 3)
+#define CURLWS_PING   (1 << 4)
+#define CURLWS_OFFSET (1 << 5)
+#define CURLWS_PONG   (1 << 6)
+#endif
+
+typedef CURLcode (*murl_ws_recv_fn)(CURL*, void*, size_t, size_t*,
+                                    const struct curl_ws_frame**);
+typedef CURLcode (*murl_ws_send_fn)(CURL*, const void*, size_t, size_t*,
+                                    curl_off_t, unsigned int);
+
+/* curl_mime_init/free/addpart/name/filename/type/data/filedata and
+ * CURLOPT_MIMEPOST were added in 7.56.0, replacing the older curl_formadd/
+ * curl_formfree API (deprecated by curl itself, and not used here — same
+ * "gracefully unavailable rather than reimplement against a deprecated API"
+ * choice as WebSockets above, resolved the same way: by name, at runtime,
+ * in murl_globals_init, never assumed from a header version.
+ *
+ * curl_mime/curl_mimepart themselves are opaque struct typedefs declared
+ * directly in curl.h (no separate header with its own include guard the way
+ * websockets.h has one), so an old curl.h simply won't have them at all —
+ * this fallback exists so the rest of the file (which already spells out
+ * both pointer types throughout, not just in the code below) still
+ * compiles. */
+#if LIBCURL_VERSION_NUM < 0x073800
+typedef struct curl_mime      curl_mime;
+typedef struct curl_mimepart  curl_mimepart;
+#endif
+
+typedef curl_mime*    (*murl_mime_init_fn)(CURL*);
+typedef void           (*murl_mime_free_fn)(curl_mime*);
+typedef curl_mimepart* (*murl_mime_addpart_fn)(curl_mime*);
+typedef CURLcode        (*murl_mime_name_fn)(curl_mimepart*, const char*);
+typedef CURLcode        (*murl_mime_filename_fn)(curl_mimepart*, const char*);
+typedef CURLcode        (*murl_mime_type_fn)(curl_mimepart*, const char*);
+typedef CURLcode        (*murl_mime_data_fn)(curl_mimepart*, const char*, size_t);
+typedef CURLcode        (*murl_mime_filedata_fn)(curl_mimepart*, const char*);
+
+/* Resolved once, process-wide, in murl_globals_init (below the Easy/Mime
+ * sections that use them — the mrbgem callback trampolines and mime
+ * functions are defined early in the file, so these declarations have to be
+ * here, near their types, not down by the call_once machinery they're
+ * filled in by). All 8 or none: mime_new checks every one of these before
+ * building a Mime, so nothing downstream (addpart, the field setters) ever
+ * runs with a partially-resolved set. */
+static murl_mime_init_fn     g_mime_init     = NULL;
+static murl_mime_free_fn     g_mime_free     = NULL;
+static murl_mime_addpart_fn  g_mime_addpart  = NULL;
+static murl_mime_name_fn     g_mime_name     = NULL;
+static murl_mime_filename_fn g_mime_filename = NULL;
+static murl_mime_type_fn     g_mime_type     = NULL;
+static murl_mime_data_fn     g_mime_data     = NULL;
+static murl_mime_filedata_fn g_mime_filedata = NULL;
 
 /* =========================================================================
  * URL::Libcurl::Easy  (CDATA = murl_easy_t, wraps CURL*)
@@ -119,7 +190,7 @@ static void
 murl_mime_free(mrb_state* mrb, void* p)
 {
   (void)mrb;
-  if (p) curl_mime_free((curl_mime*)p);
+  if (p) g_mime_free((curl_mime*)p);
 }
 
 static const struct mrb_data_type murl_mime_type = {
@@ -150,11 +221,19 @@ murl_part_get(mrb_state* mrb, mrb_value v)
 static mrb_value
 murl_lc_mime_new(mrb_state* mrb, mrb_value mod)
 {
+  /* All 8 resolve together or not at all (murl_globals_init) — checking
+   * g_mime_init here is enough to guarantee every g_mime_* used downstream
+   * (addpart, the field setters, and this Mime's eventual g_mime_free) is
+   * also non-NULL, since none of those are reachable without a Mime that
+   * only this function can create. */
+  if (unlikely(!g_mime_init))
+    mrb_raise(mrb, E_NOTIMP_ERROR, "the loaded libcurl has no multipart/mime support (needs 7.56.0+)");
+
   mrb_value easy_obj;
   mrb_get_args(mrb, "o", &easy_obj);
   murl_easy_t* e = murl_easy_get(mrb, easy_obj);
 
-  curl_mime* m = curl_mime_init(e->curl);
+  curl_mime* m = g_mime_init(e->curl);
   if (unlikely(!m)) mrb_raise(mrb, E_RUNTIME_ERROR, "curl_mime_init failed");
 
   struct RClass* lc  = mrb_class_ptr(mod);
@@ -177,7 +256,7 @@ murl_lc_mime_addpart(mrb_state* mrb, mrb_value mod)
   mrb_get_args(mrb, "o", &mime_obj);
   curl_mime* m = murl_mime_get(mrb, mime_obj);
 
-  curl_mimepart* p = curl_mime_addpart(m);
+  curl_mimepart* p = g_mime_addpart(m);
   if (unlikely(!p)) mrb_raise(mrb, E_RUNTIME_ERROR, "curl_mime_addpart failed");
 
   struct RClass* lc  = mrb_class_ptr(mod);
@@ -202,8 +281,8 @@ murl_lc_mime_name(mrb_state* mrb, mrb_value mod)
   (void)mod;
   mrb_value part_obj, name;
   mrb_get_args(mrb, "oS", &part_obj, &name);
-  murl_mime_check(mrb, curl_mime_name(murl_part_get(mrb, part_obj),
-                                      mrb_string_cstr(mrb, name)), "curl_mime_name");
+  murl_mime_check(mrb, g_mime_name(murl_part_get(mrb, part_obj),
+                                   mrb_string_cstr(mrb, name)), "curl_mime_name");
   return part_obj;
 }
 
@@ -214,8 +293,8 @@ murl_lc_mime_data(mrb_state* mrb, mrb_value mod)
   (void)mod;
   mrb_value part_obj, data;
   mrb_get_args(mrb, "oS", &part_obj, &data);
-  murl_mime_check(mrb, curl_mime_data(murl_part_get(mrb, part_obj),
-                                      RSTRING_PTR(data), (size_t)RSTRING_LEN(data)),
+  murl_mime_check(mrb, g_mime_data(murl_part_get(mrb, part_obj),
+                                   RSTRING_PTR(data), (size_t)RSTRING_LEN(data)),
                   "curl_mime_data");
   return part_obj;
 }
@@ -227,8 +306,8 @@ murl_lc_mime_filedata(mrb_state* mrb, mrb_value mod)
   (void)mod;
   mrb_value part_obj, path;
   mrb_get_args(mrb, "oS", &part_obj, &path);
-  murl_mime_check(mrb, curl_mime_filedata(murl_part_get(mrb, part_obj),
-                                          mrb_string_cstr(mrb, path)), "curl_mime_filedata");
+  murl_mime_check(mrb, g_mime_filedata(murl_part_get(mrb, part_obj),
+                                       mrb_string_cstr(mrb, path)), "curl_mime_filedata");
   return part_obj;
 }
 
@@ -239,8 +318,8 @@ murl_lc_mime_type(mrb_state* mrb, mrb_value mod)
   (void)mod;
   mrb_value part_obj, type;
   mrb_get_args(mrb, "oS", &part_obj, &type);
-  murl_mime_check(mrb, curl_mime_type(murl_part_get(mrb, part_obj),
-                                      mrb_string_cstr(mrb, type)), "curl_mime_type");
+  murl_mime_check(mrb, g_mime_type(murl_part_get(mrb, part_obj),
+                                   mrb_string_cstr(mrb, type)), "curl_mime_type");
   return part_obj;
 }
 
@@ -251,8 +330,8 @@ murl_lc_mime_filename(mrb_state* mrb, mrb_value mod)
   (void)mod;
   mrb_value part_obj, name;
   mrb_get_args(mrb, "oS", &part_obj, &name);
-  murl_mime_check(mrb, curl_mime_filename(murl_part_get(mrb, part_obj),
-                                          mrb_string_cstr(mrb, name)), "curl_mime_filename");
+  murl_mime_check(mrb, g_mime_filename(murl_part_get(mrb, part_obj),
+                                       mrb_string_cstr(mrb, name)), "curl_mime_filename");
   return part_obj;
 }
 
@@ -348,6 +427,13 @@ static unsigned  g_refs = 0;          /* live holders: VMs + thread-shares */
 static tss_t     g_share_key;         /* thread-local CURLSH* */
 static int       g_share_key_ok = 0;  /* tss_create succeeded */
 
+/* Resolved once, process-wide, in murl_globals_init below — NULL when the
+ * loaded libcurl doesn't actually have the WebSocket API. Never assumed from
+ * a header version; see the comment on the declarations near the top of the
+ * file. */
+static murl_ws_recv_fn g_ws_recv = NULL;
+static murl_ws_send_fn g_ws_send = NULL;
+
 /* VMs currently alive on THIS OS thread. gem_init bumps it, gem_final drops it,
  * and the thread's share is drained when it falls to zero — so the share lives
  * exactly as long as some VM on the thread can use it, and its teardown is
@@ -359,13 +445,99 @@ static _Thread_local unsigned t_vm_count = 0;
 
 static void murl_share_dtor(void* p);  /* fwd: tss destructor, defined below */
 
-/* call_once target: build the mutex (mtx_t has no static initializer) and the
- * tss key. If tss_create fails the gem still works — easies just run shareless. */
+#ifndef MURL_CURL_STATIC
+/* "ws" (case-insensitive, exactly 2 chars) — matches how curl_version_info's
+ * ->protocols array names the WebSocket protocol. Hand-rolled instead of
+ * strcasecmp so this file pulls in no extra header for two characters. Only
+ * the dlsym path (below) calls this — guarded the same way that path is,
+ * not by platform, since that's the actual reason it exists. */
+static int
+murl_is_ws_protocol(const char* p)
+{
+  return (p[0] == 'w' || p[0] == 'W') && (p[1] == 's' || p[1] == 'S') && p[2] == '\0';
+}
+#endif
+
+/* call_once target: build the mutex (mtx_t has no static initializer), the
+ * tss key, and resolve the WebSocket and mime functions from whatever
+ * libcurl this process actually has loaded. If tss_create fails the gem
+ * still works — easies just run shareless.
+ *
+ * On non-Windows, "actually has loaded" is asked two ways, not one:
+ *   1. curl_version_info()'s ->protocols list is the gate — the same signal
+ *      URL::PROTOS is built from, so it already accounts for both curl's
+ *      version AND any build-time feature toggle (a distro could ship a
+ *      recent-enough curl with WebSockets explicitly compiled out via
+ *      CURL_DISABLE_WEBSOCKETS despite a version number that would suggest
+ *      otherwise — version_num alone can't see that, ->protocols can).
+ *   2. dlsym(RTLD_DEFAULT, ...) is how the actual callable pointer is
+ *      obtained — a name lookup against whatever is loaded, not a build-time
+ *      link dependency, so this compiles and links the same regardless of
+ *      what curl.h or libcurl the build machine happened to have.
+ * g_ws_recv/g_ws_send are left NULL unless BOTH agree: the library claims WS
+ * support AND the symbol actually resolves. Neither check alone is trusted.
+ *
+ * curl_version_info needs no libcurl call to have run first (curl_global_init
+ * is brought up separately, by the first murl_global_ref caller) and, being
+ * called from inside call_once, runs on exactly one thread ever, so there is
+ * nothing here to race.
+ *
+ * MURL_CURL_STATIC (mrbgem.rake, set only where the build actually vendors
+ * and statically links curl — Windows today) means there is nothing to ask:
+ * curl_ws_recv/curl_ws_send are this translation unit's own linked-in
+ * symbols, unconditionally present, since that build always forces
+ * WebSockets on (see mrbgem.rake) — assigning their address directly is a
+ * fact that build guarantees, not a version guess. This is keyed on the
+ * actual linking mode rather than the platform: a statically-linked
+ * curl_ws_recv would never be dlsym(RTLD_DEFAULT, ...)-visible either (it
+ * was never a shared library's own exported dynamic symbol), so the
+ * dlsym path below is only ever correct against a genuinely dynamic libcurl
+ * — which is what MURL_CURL_STATIC being undefined actually promises. */
 static void
 murl_globals_init(void)
 {
   mtx_init(&g_lock, mtx_plain);
   g_share_key_ok = (tss_create(&g_share_key, murl_share_dtor) == thrd_success);
+
+#ifdef MURL_CURL_STATIC
+  g_ws_recv = curl_ws_recv;
+  g_ws_send = curl_ws_send;
+  g_mime_init     = curl_mime_init;
+  g_mime_free     = curl_mime_free;
+  g_mime_addpart  = curl_mime_addpart;
+  g_mime_name     = curl_mime_name;
+  g_mime_filename = curl_mime_filename;
+  g_mime_type     = curl_mime_type;
+  g_mime_data     = curl_mime_data;
+  g_mime_filedata = curl_mime_filedata;
+#else
+  curl_version_info_data* vi = curl_version_info(CURLVERSION_NOW);
+  int lib_claims_ws = 0;
+  if (vi && vi->protocols) {
+    for (const char* const* p = vi->protocols; *p != NULL; p++) {
+      if (murl_is_ws_protocol(*p)) { lib_claims_ws = 1; break; }
+    }
+  }
+  if (lib_claims_ws) {
+    g_ws_recv = (murl_ws_recv_fn)dlsym(RTLD_DEFAULT, "curl_ws_recv");
+    g_ws_send = (murl_ws_send_fn)dlsym(RTLD_DEFAULT, "curl_ws_send");
+  }
+
+  /* Mime has no protocols-list equivalent to gate on (it isn't a scheme),
+   * so the version curl_version_info() itself reports is the best available
+   * pre-check — still paired with dlsym as the actual resolution mechanism,
+   * same "neither signal alone is trusted" rule as WS above. */
+  if (vi && vi->version_num >= 0x073800) {
+    g_mime_init     = (murl_mime_init_fn)dlsym(RTLD_DEFAULT, "curl_mime_init");
+    g_mime_free     = (murl_mime_free_fn)dlsym(RTLD_DEFAULT, "curl_mime_free");
+    g_mime_addpart  = (murl_mime_addpart_fn)dlsym(RTLD_DEFAULT, "curl_mime_addpart");
+    g_mime_name     = (murl_mime_name_fn)dlsym(RTLD_DEFAULT, "curl_mime_name");
+    g_mime_filename = (murl_mime_filename_fn)dlsym(RTLD_DEFAULT, "curl_mime_filename");
+    g_mime_type     = (murl_mime_type_fn)dlsym(RTLD_DEFAULT, "curl_mime_type");
+    g_mime_data     = (murl_mime_data_fn)dlsym(RTLD_DEFAULT, "curl_mime_data");
+    g_mime_filedata = (murl_mime_filedata_fn)dlsym(RTLD_DEFAULT, "curl_mime_filedata");
+  }
+#endif
 }
 
 /* Bring curl_global_init up on the first holder and tear it down after the
@@ -952,7 +1124,9 @@ murl_lc_easy_setopt(mrb_state* mrb, mrb_value mod)
   else if (opt == MRB_SYM(sslkey))             rc = curl_easy_setopt(h, CURLOPT_SSLKEY, mrb_string_cstr(mrb, val));
   else if (opt == MRB_SYM(keypasswd))          rc = curl_easy_setopt(h, CURLOPT_KEYPASSWD, mrb_string_cstr(mrb, val));
   else if (opt == MRB_SYM(capath))             rc = curl_easy_setopt(h, CURLOPT_CAPATH, mrb_string_cstr(mrb, val));
+#if LIBCURL_VERSION_NUM >= 0x072D00 /* 7.45.0 — enum member, #ifdef can't see it */
   else if (opt == MRB_SYM(pinnedpublickey))    rc = curl_easy_setopt(h, CURLOPT_PINNEDPUBLICKEY, mrb_string_cstr(mrb, val));
+#endif
   else if (opt == MRB_SYM(ssl_cipher_list))    rc = curl_easy_setopt(h, CURLOPT_SSL_CIPHER_LIST, mrb_string_cstr(mrb, val));
   else if (opt == MRB_SYM(sslversion))         rc = curl_easy_setopt(h, CURLOPT_SSLVERSION, (long)mrb_as_int(mrb, val));
   /* --- HTTP version / cookies / redirect auth --------------------------- */
@@ -968,7 +1142,9 @@ murl_lc_easy_setopt(mrb_state* mrb, mrb_value mod)
   /* --- name resolution -------------------------------------------------- */
   else if (opt == MRB_SYM(interface))          rc = curl_easy_setopt(h, CURLOPT_INTERFACE, mrb_string_cstr(mrb, val));
   else if (opt == MRB_SYM(dns_servers))        rc = curl_easy_setopt(h, CURLOPT_DNS_SERVERS, mrb_string_cstr(mrb, val));
+#if LIBCURL_VERSION_NUM >= 0x073E00 /* 7.62.0 — enum member, #ifdef can't see it */
   else if (opt == MRB_SYM(doh_url))            rc = curl_easy_setopt(h, CURLOPT_DOH_URL, mrb_string_cstr(mrb, val));
+#endif
   /* --- transfer rate limiting ------------------------------------------- */
   else if (opt == MRB_SYM(max_send_speed))     rc = curl_easy_setopt(h, CURLOPT_MAX_SEND_SPEED_LARGE, (curl_off_t)mrb_as_int(mrb, val));
   else if (opt == MRB_SYM(max_recv_speed))     rc = curl_easy_setopt(h, CURLOPT_MAX_RECV_SPEED_LARGE, (curl_off_t)mrb_as_int(mrb, val));
@@ -985,9 +1161,17 @@ murl_lc_easy_setopt(mrb_state* mrb, mrb_value mod)
                                                           : CURLOPT_TCP_KEEPINTVL, secs);
   }
   /* --- unix domain socket (Docker / HTTP-over-unix) --------------------- */
+#if LIBCURL_VERSION_NUM >= 0x072D00 /* 7.45.0 — enum member, #ifdef can't see it */
   else if (opt == MRB_SYM(unix_socket_path))   rc = curl_easy_setopt(h, CURLOPT_UNIX_SOCKET_PATH, mrb_string_cstr(mrb, val));
+#endif
   /* --- multipart/form-data: val is a URL::Libcurl::Mime built in Ruby --- */
+#if LIBCURL_VERSION_NUM >= 0x073800 /* 7.56.0 — enum member, #ifdef can't see it; the
+                                      * curl_mime_* functions themselves are guarded
+                                      * separately, at runtime, via g_mime_init (see
+                                      * murl_lc_mime_new) — this only gates whether
+                                      * CURLOPT_MIMEPOST itself compiles */
   else if (opt == MRB_SYM(mimepost))           rc = curl_easy_setopt(h, CURLOPT_MIMEPOST, murl_mime_get(mrb, val));
+#endif
   else if (opt == MRB_SYM(post_fields)) {
     mrb_value s = mrb_str_to_str(mrb, val);
     curl_easy_setopt(h, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)RSTRING_LEN(s));
@@ -1083,32 +1267,71 @@ murl_lc_easy_getinfo(mrb_state* mrb, mrb_value mod)
   }
   else if (info == MRB_SYM(total_time)) {
     /* curl reports microseconds; mruby-chrono turns them into the duration
-     * (Float seconds) every other time value in the gem speaks. */
+     * (Float seconds) every other time value in the gem speaks.
+     *
+     * CURLINFO_TOTAL_TIME_T (off_t microseconds) needs 7.61.0 — but #total_time
+     * is core path, read on every response, not an optional feature like the
+     * WebSocket/mime primitives elsewhere in this file. So unlike those, an
+     * old libcurl here does not get a version-gated raise or a silent nil:
+     * CURLINFO_TOTAL_TIME (double seconds) has existed since curl's earliest
+     * history and is a real, honest answer, just at double-precision instead
+     * of microsecond-integer precision — an acceptable trade on a build this
+     * old, not a degradation a caller has to special-case. */
+#if LIBCURL_VERSION_NUM >= 0x073D00 /* 7.61.0 — enum member, #ifdef can't see it */
     curl_off_t us = 0;
     murl_easy_check(mrb, curl_easy_getinfo(h, CURLINFO_TOTAL_TIME_T, &us));
     return mrb_chrono_from(mrb, mrb_convert_int64(mrb, (int64_t)us),
                            MRB_CHRONO_DUR_MICROSECONDS);
+#else
+    double secs = 0;
+    murl_easy_check(mrb, curl_easy_getinfo(h, CURLINFO_TOTAL_TIME, &secs));
+    return mrb_chrono_from(mrb, mrb_convert_int64(mrb, (int64_t)(secs * 1000000.0)),
+                           MRB_CHRONO_DUR_MICROSECONDS);
+#endif
   }
   else if (info == MRB_SYM(content_type)) {
     const char* ct = NULL;
     murl_easy_check(mrb, curl_easy_getinfo(h, CURLINFO_CONTENT_TYPE, &ct));
     return ct ? mrb_str_new_cstr(mrb, ct) : mrb_nil_value();
   }
+#if LIBCURL_VERSION_NUM >= 0x072D00 /* 7.45.0 — enum member, #ifdef can't see it.
+                                      * Only websocket.rb calls :activesocket,
+                                      * itself unreachable unless g_ws_recv/
+                                      * g_ws_send resolved — real WebSocket support
+                                      * (7.86.0+) implies this too, so an old-header
+                                      * build falling through to "unsupported info"
+                                      * below is never actually reached in practice. */
   else if (info == MRB_SYM(activesocket)) {
     curl_socket_t sock = CURL_SOCKET_BAD;
     murl_easy_check(mrb, curl_easy_getinfo(h, CURLINFO_ACTIVESOCKET, &sock));
     if (sock == CURL_SOCKET_BAD) return mrb_nil_value();
     return mrb_int_value(mrb, (mrb_int)sock);
   }
+#endif
   else if (info == MRB_SYM(retry_after)) {
-    /* CURLINFO_RETRY_AFTER is an enum member (not a macro), so gate on the
-     * version it appeared in: 7.66.0. A duration built from the response's
-     * Retry-After header (curl parses both the delta and HTTP-date forms,
-     * reporting whole seconds); curl reports 0 when the header was absent,
-     * which we surface as nil. Pure marshalling, no policy. */
+    /* CURLINFO_RETRY_AFTER is an *enum member* (CURLINFO_OFF_T + 57 inside
+     * curl.h's CURLINFO enum), not a #define — the preprocessor has no
+     * visibility into enum declarations at all, so #ifdef/#ifndef can never
+     * detect it (unlike CURLWS_TEXT or the CURLINC_WEBSOCKETS_H include
+     * guard above, which really are macros). A version check is the only
+     * way to ask "did this header's text declare it" — legitimate here
+     * specifically because that's a compile-time-only question with no
+     * other answer, not an attempt to infer runtime behavior from it. The
+     * *runtime* question — does the libcurl actually loaded support it — is
+     * asked separately, of the library itself, below. */
 #if LIBCURL_VERSION_NUM >= 0x074200
+    /* nil on a *running* libcurl that predates this (it falls through
+     * curl_easy_getinfo's own default case to CURLE_UNKNOWN_OPTION, see
+     * lib/getinfo.c upstream, never a type-confused read) reads exactly like
+     * nil on one that has it but the response carried no Retry-After
+     * header. A duration built from the response's Retry-After header (curl
+     * parses both the delta and HTTP-date forms, reporting whole seconds);
+     * curl reports 0 when the header was absent, which we also surface as
+     * nil. Pure marshalling, no policy. */
     curl_off_t secs = 0;
-    murl_easy_check(mrb, curl_easy_getinfo(h, CURLINFO_RETRY_AFTER, &secs));
+    CURLcode rc = curl_easy_getinfo(h, CURLINFO_RETRY_AFTER, &secs);
+    if (rc == CURLE_UNKNOWN_OPTION) return mrb_nil_value();
+    murl_easy_check(mrb, rc);
     if (secs <= 0) return mrb_nil_value();
     return mrb_chrono_from(mrb, mrb_convert_int64(mrb, (int64_t)secs),
                            MRB_CHRONO_DUR_SECONDS);
@@ -1171,7 +1394,15 @@ murl_lc_easy_perform(mrb_state* mrb, mrb_value mod)
  * calls, so CURLE_AGAIN is marshalled to nil rather than raised.
  * ========================================================================= */
 
-#ifdef MURL_HAVE_WEBSOCKETS
+/* Raised by both primitives below when g_ws_recv/g_ws_send didn't resolve —
+ * the libcurl actually loaded at runtime lacks the WebSocket API, established
+ * once in murl_globals_init, never guessed from a header version. */
+static void
+murl_ws_check_available(mrb_state* mrb)
+{
+  if (unlikely(!g_ws_recv || !g_ws_send))
+    mrb_raise(mrb, E_NOTIMP_ERROR, "the loaded libcurl has no WebSocket support (needs 7.86.0+)");
+}
 
 /* easy_ws_recv(easy, buflen) -> [String, flags_int, bytesleft_int] | nil
  *   nil means CURLE_AGAIN (nothing readable yet); the caller waits on the fd. */
@@ -1179,6 +1410,8 @@ static mrb_value
 murl_lc_easy_ws_recv(mrb_state* mrb, mrb_value mod)
 {
   (void)mod;
+  murl_ws_check_available(mrb);
+
   mrb_value easy_obj;
   mrb_int   buflen;
   mrb_get_args(mrb, "oi", &easy_obj, &buflen);
@@ -1189,7 +1422,7 @@ murl_lc_easy_ws_recv(mrb_state* mrb, mrb_value mod)
   mrb_value buf = mrb_str_new(mrb, NULL, (mrb_int)buflen);
   size_t recv = 0;
   const struct curl_ws_frame* meta = NULL;
-  CURLcode rc = curl_ws_recv(e->curl, RSTRING_PTR(buf), (size_t)buflen, &recv, &meta);
+  CURLcode rc = g_ws_recv(e->curl, RSTRING_PTR(buf), (size_t)buflen, &recv, &meta);
 
   if (rc == CURLE_AGAIN) return mrb_nil_value();
   murl_easy_check(mrb, rc);
@@ -1220,6 +1453,8 @@ static mrb_value
 murl_lc_easy_ws_send(mrb_state* mrb, mrb_value mod)
 {
   (void)mod;
+  murl_ws_check_available(mrb);
+
   mrb_value easy_obj, data;
   mrb_int   flags;
   mrb_int   fragsize = 0;
@@ -1231,8 +1466,8 @@ murl_lc_easy_ws_send(mrb_state* mrb, mrb_value mod)
     flags |= mrb_str_is_utf8(data) ? CURLWS_TEXT : CURLWS_BINARY;
 
   size_t sent = 0;
-  CURLcode rc = curl_ws_send(e->curl, RSTRING_PTR(data), (size_t)RSTRING_LEN(data),
-                             &sent, (curl_off_t)fragsize, (unsigned int)flags);
+  CURLcode rc = g_ws_send(e->curl, RSTRING_PTR(data), (size_t)RSTRING_LEN(data),
+                          &sent, (curl_off_t)fragsize, (unsigned int)flags);
   if (rc == CURLE_AGAIN) return mrb_nil_value();
   murl_easy_check(mrb, rc);
 
@@ -1241,18 +1476,6 @@ murl_lc_easy_ws_send(mrb_state* mrb, mrb_value mod)
   mrb_ary_push(mrb, out, mrb_int_value(mrb, flags));
   return out;
 }
-
-#else  /* libcurl built without WebSocket support */
-
-static mrb_value
-murl_lc_ws_unsupported(mrb_state* mrb, mrb_value mod)
-{
-  (void)mod;
-  mrb_raise(mrb, E_NOTIMP_ERROR, "embedded libcurl built without WebSocket support");
-  return mrb_nil_value();
-}
-
-#endif
 
 /* =========================================================================
  * multi_init -> Multi
@@ -1303,9 +1526,13 @@ murl_lc_multi_setopt(mrb_state* mrb, mrb_value mod)
 
   if      (opt == MRB_SYM(pipelining))             rc = curl_multi_setopt(h, CURLMOPT_PIPELINING, (long)mrb_as_int(mrb, val));
   else if (opt == MRB_SYM(maxconnects))            rc = curl_multi_setopt(h, CURLMOPT_MAXCONNECTS, (long)mrb_as_int(mrb, val));
+#if LIBCURL_VERSION_NUM >= 0x071E00 /* 7.30.0 — enum members, #ifdef can't see them */
   else if (opt == MRB_SYM(max_host_connections))   rc = curl_multi_setopt(h, CURLMOPT_MAX_HOST_CONNECTIONS, (long)mrb_as_int(mrb, val));
   else if (opt == MRB_SYM(max_total_connections))  rc = curl_multi_setopt(h, CURLMOPT_MAX_TOTAL_CONNECTIONS, (long)mrb_as_int(mrb, val));
+#endif
+#if LIBCURL_VERSION_NUM >= 0x074300 /* 7.67.0 — enum member, #ifdef can't see it */
   else if (opt == MRB_SYM(max_concurrent_streams)) rc = curl_multi_setopt(h, CURLMOPT_MAX_CONCURRENT_STREAMS, (long)mrb_as_int(mrb, val));
+#endif
   else {
     mrb_raisef(mrb, E_ARGUMENT_ERROR, "unsupported option: :%n", opt);
   }
@@ -1489,24 +1716,26 @@ mrb_mruby_url_gem_init(mrb_state* mrb)
   mrb_define_module_function_id(mrb, lc, MRB_SYM(easy_strerror), murl_lc_easy_strerror, MRB_ARGS_REQ(1));
   mrb_define_module_function_id(mrb, lc, MRB_SYM(easy_perform),  murl_lc_easy_perform,  MRB_ARGS_REQ(1));
 
-#ifdef MURL_HAVE_WEBSOCKETS
+  /* Always registered — murl_ws_check_available (inside each) is what
+   * decides, at call time, whether g_ws_recv/g_ws_send actually resolved. No
+   * build-time branch here: registration can't know what murl_globals_init
+   * will find at process startup. */
   mrb_define_module_function_id(mrb, lc, MRB_SYM(easy_ws_recv), murl_lc_easy_ws_recv, MRB_ARGS_REQ(2));
   mrb_define_module_function_id(mrb, lc, MRB_SYM(easy_ws_send), murl_lc_easy_ws_send, MRB_ARGS_ARG(3, 1));
-#else
-  mrb_define_module_function_id(mrb, lc, MRB_SYM(easy_ws_recv), murl_lc_ws_unsupported, MRB_ARGS_ANY());
-  mrb_define_module_function_id(mrb, lc, MRB_SYM(easy_ws_send), murl_lc_ws_unsupported, MRB_ARGS_ANY());
-#endif
 
   /* WebSocket frame flags (CURLWS_*), published so the Ruby URL::WebSocket can
    * map its :text/:binary/:ping/:pong/:close symbols to the bitmask and back.
-   * Each is 0 when the embedded libcurl predates the WebSocket API. */
-  mrb_define_const_id(mrb, lc, MRB_SYM(WS_TEXT),   mrb_int_value(mrb, MURL_WS_FLAG(TEXT)));
-  mrb_define_const_id(mrb, lc, MRB_SYM(WS_BINARY), mrb_int_value(mrb, MURL_WS_FLAG(BINARY)));
-  mrb_define_const_id(mrb, lc, MRB_SYM(WS_CONT),   mrb_int_value(mrb, MURL_WS_FLAG(CONT)));
-  mrb_define_const_id(mrb, lc, MRB_SYM(WS_CLOSE),  mrb_int_value(mrb, MURL_WS_FLAG(CLOSE)));
-  mrb_define_const_id(mrb, lc, MRB_SYM(WS_PING),   mrb_int_value(mrb, MURL_WS_FLAG(PING)));
-  mrb_define_const_id(mrb, lc, MRB_SYM(WS_PONG),   mrb_int_value(mrb, MURL_WS_FLAG(PONG)));
-  mrb_define_const_id(mrb, lc, MRB_SYM(WS_OFFSET), mrb_int_value(mrb, MURL_WS_FLAG(OFFSET)));
+   * These are plain stable bit values (see the guarded fallback definitions
+   * near the top of the file) — always published regardless of whether
+   * g_ws_recv/g_ws_send actually resolved; a Ruby caller only ever hits the
+   * NotImplementedError from actually trying to send/receive. */
+  mrb_define_const_id(mrb, lc, MRB_SYM(WS_TEXT),   mrb_int_value(mrb, CURLWS_TEXT));
+  mrb_define_const_id(mrb, lc, MRB_SYM(WS_BINARY), mrb_int_value(mrb, CURLWS_BINARY));
+  mrb_define_const_id(mrb, lc, MRB_SYM(WS_CONT),   mrb_int_value(mrb, CURLWS_CONT));
+  mrb_define_const_id(mrb, lc, MRB_SYM(WS_CLOSE),  mrb_int_value(mrb, CURLWS_CLOSE));
+  mrb_define_const_id(mrb, lc, MRB_SYM(WS_PING),   mrb_int_value(mrb, CURLWS_PING));
+  mrb_define_const_id(mrb, lc, MRB_SYM(WS_PONG),   mrb_int_value(mrb, CURLWS_PONG));
+  mrb_define_const_id(mrb, lc, MRB_SYM(WS_OFFSET), mrb_int_value(mrb, CURLWS_OFFSET));
 
   mrb_define_module_function_id(mrb, lc, MRB_SYM(multi_init),          murl_lc_multi_init,          MRB_ARGS_NONE());
   mrb_define_module_function_id(mrb, lc, MRB_SYM(multi_setopt),        murl_lc_multi_setopt,        MRB_ARGS_REQ(3));

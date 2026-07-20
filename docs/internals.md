@@ -162,9 +162,12 @@ Two rules to stay safe:
 - `mruby-string-ext` — `String#byteslice` for Ruby-side upload chunking
 - `mruby-string-is-utf8` — `String#is_utf8?` for WebSocket TEXT/BINARY framing
 
-On Linux/macOS the gem finds libcurl via `pkg-config`. On Windows it builds
-the vendored `deps/curl` with CMake and links it statically against Schannel
-(no OpenSSL); `mrbgem.rake` handles this.
+On Linux/macOS the gem finds libcurl via `pkg-config`; if that fails, the
+build stops right there with the install command for your platform — this
+gem never builds its own curl outside of Windows. Windows has no system
+libcurl to look for, so it always builds the vendored `deps/curl` with CMake
+and links it statically against Schannel (no OpenSSL); `mrbgem.rake` handles
+this.
 
 ## Roadmap
 
