@@ -10,7 +10,7 @@
 - [Retrying failed responses](#retrying-failed-responses)
 - [Other protocols](#other-protocols)
 - [SMTP(S)](#smtps)
-- [IMAP(S)](#imaps--fetch--move--store--expunge)
+- [IMAP(S)](#imaps--fetch--move--store--expunge--search)
 - [Upload sources](#upload-sources)
 - [WebSocket](#websocket)
 
@@ -357,7 +357,7 @@ URL("smtps://mail.example.com:465").deliver(
 > The verb is called `deliver` (not `send`) so we never shadow
 > `Object#send`.
 
-## IMAP(S) — `fetch` / `move` / `store` / `expunge`
+## IMAP(S) — `fetch` / `move` / `store` / `expunge` / `search`
 
 The mailbox is the URL path (`imaps://user:pw@host/INBOX`); UIDs go into
 the command. Each returns a `URL::Response`; a `NO`/`BAD` tagged reply
@@ -373,7 +373,19 @@ mbox.store(uid: 7, flags: "\\Deleted")        # UID STORE 7 +FLAGS (\Deleted)
 mbox.store(uid: 7, flags: "\\Seen", op: "-")  # remove a flag (op: "+"/"-"/"")
 mbox.expunge                                  # delete = store(\Deleted) then expunge
 mbox.move(uid: 7, to: "Archive")              # UID MOVE 7 Archive
+
+mbox.search.imap_uids                         # UID SEARCH ALL -> [1, 2, 3]
+mbox.search("UNSEEN").imap_uids               # any IMAP SEARCH key
 ```
+
+`search` returns the raw untagged `* SEARCH ...` line as `resp.body`
+(persistent UIDs, per curl's own recommendation — the plain
+`imaps://host/INBOX?CRITERIA` URL-query form curl also supports returns
+transient sequence numbers instead, so this gem doesn't expose that form).
+`resp.imap_uids` (see [Response](#response)) parses it into an `Array` of
+`Integer` UIDs — regex-free, like the rest of this gem — and is `[]` rather
+than an error both when the search matched nothing and when called on a
+response that isn't a search result.
 
 ## Upload sources
 

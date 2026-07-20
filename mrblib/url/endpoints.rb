@@ -193,11 +193,22 @@ class URL
       def expunge(**o)
         @exec.imap(@uri, "EXPUNGE", _ck(o))
       end
+      # UID SEARCH — curl's own recommended way to list a mailbox's messages
+      # by persistent UID (its docs note the plain "?CRITERIA" URL-query form
+      # returns transient sequence numbers instead). criteria is any IMAP
+      # SEARCH key — "ALL" (default), "UNSEEN", "SUBJECT foo", etc. The
+      # response body is the raw "* SEARCH 1 2 3" untagged line; parsing it
+      # into UIDs is the caller's job, same as every other IMAP verb here
+      # hands back an unparsed protocol response.
+      def search(criteria = "ALL", **o)
+        @exec.imap(@uri, "UID SEARCH #{criteria}", _ck(o))
+      end
 
       def self.fetch(uri, uid:, **o, &b);              new(uri).fetch(uid: uid, **o, &b); end
       def self.move(uri, uid:, to:, **o);              new(uri).move(uid: uid, to: to, **o); end
       def self.store(uri, uid:, flags:, op: "+", **o); new(uri).store(uid: uid, flags: flags, op: op, **o); end
       def self.expunge(uri, **o);                      new(uri).expunge(**o); end
+      def self.search(uri, criteria = "ALL", **o);     new(uri).search(criteria, **o); end
       def self.parallel(uri, verb, *a, **o, &b);       new(uri).parallel(verb, *a, **o, &b); end
     end
     class IMAPS < IMAP; end if supports?("imaps")
