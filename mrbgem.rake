@@ -110,6 +110,16 @@ MRuby::Gem::Specification.new('mruby-url') do |spec|
         spec.linker.library_paths << "#{curl_inst}/lib"
         spec.linker.libraries     << 'libcurl'
         spec.cc.defines           << 'CURL_STATICLIB'
+        # Ours, not curl's: read in mrb_url.c to pick how the WebSocket
+        # functions are resolved. A statically-linked curl_ws_recv/send are
+        # this translation unit's own linked-in symbols — direct linkage is
+        # correct and dlsym(RTLD_DEFAULT, ...) would not find them anyway
+        # (they were never a shared library's own exported dynamic symbols).
+        # Set here because it's a fact about THIS build's linking mode
+        # (-DBUILD_SHARED_LIBS=OFF above), not something to infer from being
+        # on Windows — the two happen to coincide today only because this is
+        # the one branch that vendors a static curl.
+        spec.cc.defines           << 'MURL_CURL_STATIC'
 
         # mrb_url.c includes C11 <threads.h> (call_once). MSVC only exposes it
         # — and recognizes the _Noreturn it declares thrd_exit with — under
@@ -126,64 +136,24 @@ MRuby::Gem::Specification.new('mruby-url') do |spec|
     # manager or Homebrew, and many other things on the box already depend
     # on it. Look it up via pkg-config first — cheap, and reuses whatever
     # TLS/http2/etc. the system build already has.
+    # Unlike Windows, we never vendor-build curl here — not even as a
+    # fallback. Doing that safely would also need OpenSSL's dev headers
+    # (curl's own CMake build doesn't fail without a TLS backend, it just
+    # silently produces a curl with HTTPS/WSS/FTPS/IMAPS/… all compiled out,
+    # so it "succeeds" and then fails every TLS request at runtime instead of
+    # failing here where the cause is obvious) plus cmake itself. Simpler and
+    # safer to just say what's missing and stop.
     unless spec.search_package('libcurl')
-      warn <<~WARN
-        [mruby-url] system libcurl not found via pkg-config — falling back to
-        building the vendored copy in deps/curl (needs cmake; slower on a clean
-        build, cached after).
-
-        To use the system libcurl instead (faster, smaller, reuses whatever
-        TLS/http2/etc. it was already built with), install its -dev package
-        and re-run:
+      raise <<~MSG
+        [mruby-url] system libcurl not found via pkg-config. Install its
+        development package — not just the runtime library, curl.h has to be
+        on the include path — and re-run:
           Debian/Ubuntu:  sudo apt install libcurl4-openssl-dev pkg-config
           Fedora/RHEL:    sudo dnf install libcurl-devel pkgconf-pkg-config
           Arch:           sudo pacman -S curl pkgconf
           macOS:          brew install curl pkg-config
         (macOS: curl is keg-only — also `export PKG_CONFIG_PATH="$(brew --prefix curl)/lib/pkgconfig"`)
-
-        To build the vendored copy yourself, cmake is required:
-          Debian/Ubuntu:  sudo apt install cmake
-          Fedora/RHEL:    sudo dnf install cmake
-          Arch:           sudo pacman -S cmake
-          macOS:          brew install cmake
-      WARN
-
-      require 'fileutils'
-
-      curl_src   = "#{spec.dir}/deps/curl"
-      curl_build = "#{spec.build_dir}/curl-build"
-      curl_inst  = ENV['MURL_CURL_INSTALL'] || "#{spec.build_dir}/curl-install"
-
-      # No idempotency dance (see the Windows branch above for the same call):
-      # CMake's own configure cache and make/ninja's dependency tracking make
-      # a no-op run sub-second, and a deps/curl submodule bump gets picked up
-      # and rebuilt same as any other source change would. Keeping curl_build
-      # around (never wiped here) is what makes that incremental.
-      FileUtils.mkdir_p(curl_build)
-      args = [
-        "-S \"#{curl_src}\"",
-        "-B \"#{curl_build}\"",
-        "-DCMAKE_BUILD_TYPE=Release",
-        "-DCMAKE_INSTALL_PREFIX=\"#{curl_inst}\"",
-        "-DBUILD_SHARED_LIBS=OFF",
-        "-DBUILD_CURL_EXE=OFF",
-        "-DCURL_USE_LIBPSL=OFF",
-        "-DCURL_DISABLE_WEBSOCKETS=OFF", # see the Windows branch above
-      ]
-      sh "cmake #{args.join(' ')}"
-      sh "cmake --build \"#{curl_build}\" --config Release --target install"
-
-      # The CMake build installs its own libcurl.pc — point pkg-config at it
-      # and re-run the exact same search_package call, so the vendored build
-      # wires up include/lib paths and static-link deps (OpenSSL, zlib, …)
-      # identically to the system-libcurl path above, instead of hand-rolling
-      # a second, divergent set of compiler/linker flags.
-      pc_dir = Dir.glob("#{curl_inst}/lib*/pkgconfig").first or
-        raise "vendored curl built but no libcurl.pc found under #{curl_inst}"
-      ENV['PKG_CONFIG_PATH'] = [pc_dir, ENV['PKG_CONFIG_PATH']].compact.join(File::PATH_SEPARATOR)
-
-      spec.search_package('libcurl') or
-        raise "vendored curl built at #{curl_inst} but pkg-config still can't find it"
+      MSG
     end
 
     # C11 call_once (gem_init) lives in libpthread on glibc < 2.34; -pthread
