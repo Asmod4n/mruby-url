@@ -2,6 +2,7 @@
 
 - [Calling URL](#calling-url)
 - [Defaults](#defaults)
+- [Connection filtering](#connection-filtering)
 - [Convenience kwargs](#convenience-kwargs)
 - [Response](#response)
 - [Error handling](#error-handling)
@@ -63,6 +64,50 @@ Every HTTP call gets these unless you override them:
 Compression is **opt-in**, not a default: pass `accept_encoding: ""` to
 advertise gzip/deflate/br/zstd and have libcurl transparently decompress the
 response, or a specific token list (e.g. `"gzip"`) to narrow it.
+
+## Connection filtering
+
+Every request goes through `URL.shared` (or your own `URL.open` session)
+unless it's driven from inside a streaming callback. Set `on_open_socket`
+once on that session and it's applied to every request built against it —
+the hook for refusing SSRF-style targets (loopback, RFC1918, link-local,
+cloud metadata IPs, ...) before any connection to them is made:
+
+```ruby
+URL.shared.on_open_socket do |addr, purpose|
+  next true unless addr.ipv4?   # this example only filters v4
+  octets = addr.ip_address.split(".").map(&:to_i)
+  !(octets[0] == 127 ||                                    # 127.0.0.0/8 loopback
+    octets[0] == 10 ||                                     # 10.0.0.0/8
+    (octets[0] == 172 && (16..31).include?(octets[1])) ||  # 172.16.0.0/12
+    (octets[0] == 192 && octets[1] == 168) ||               # 192.168.0.0/16
+    (octets[0] == 169 && octets[1] == 254))                 # 169.254.0.0/16 (link-local + cloud metadata)
+end
+
+URL("http://169.254.169.254/latest/meta-data/").get.error
+# => #<URL::TransportError ...> — refused before any socket ever opened
+```
+
+`addr` is a real
+[`Addrinfo`](https://github.com/mruby/mruby/blob/master/mrbgems/mruby-socket)
+(`mruby-socket` is already a hard dependency of this gem), built from the
+address libcurl just resolved and is about to connect to — `addr.ip_address`,
+`addr.ipv4?`/`addr.ipv6?`, `addr.ip_port` are all real, backed by an actual
+`getnameinfo(3)` call, not a hand-rolled parse. `purpose` is `:connect` for a
+normal outbound connection, or `:accept` for the rare FTP active-mode data
+connection.
+
+Return truthy to allow the connection, falsy/nil to refuse just that
+candidate address (libcurl tries the next resolved address, if any, then
+fails the transfer if none are left — a value on `resp.error`, never a
+raise). An exception inside the block refuses the candidate the same way and
+then surfaces from the call that drove the transfer — fails closed, not
+open. No block set: every address is allowed, same as before this hook
+existed.
+
+A single request can override the session's default with its own policy via
+the lower-level `URL::Request#on_open_socket`, for callers already
+constructing requests at that level.
 
 ## Convenience kwargs
 

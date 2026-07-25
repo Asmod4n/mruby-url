@@ -181,6 +181,121 @@ assert('URL::Request#dup gives an independent easy handle') do
   assert_kind_of URL::Libcurl::Easy, b.handle
 end
 
+# Every test below targets 127.0.0.1 — the only loopback address guaranteed
+# bindable/routable on every CI platform (127.0.0.2+ works on Linux, where
+# the whole 127.0.0.0/8 block is aliased to lo by default, but is not
+# reliably bindable on macOS or reachable on Windows). $base already has a
+# live pooled connection on 127.0.0.1:$server_port this thread's shared
+# CURLSH would happily reuse — and CURLOPT_OPENSOCKETFUNCTION only fires
+# when libcurl actually opens a NEW socket, never on a reused one — so
+# freshness here comes from the PORT instead: a low fixed port nothing else
+# in the suite ever connects to (for the vetoed/excepted candidates, where
+# no server needs to be listening at all — CURL_SOCKET_BAD refuses the
+# candidate before any connect is attempted), or a fresh OS-assigned
+# ephemeral port from TCPServer.new('127.0.0.1', 0) (for the one test that
+# needs a real successful connection).
+
+assert('URL::Request inherits the owning session on_open_socket default, which can veto a connect') do
+  session = URL.open
+  seen = []
+  session.on_open_socket { |addr, purpose| seen << [addr.ip_address, purpose]; false }
+
+  url = "http://127.0.0.1:2/"
+  req, state = URL.__send__(:_build_request, session, :GET, url, nil, { timeout: 5.s }, nil)
+  resp = URL.__send__(:_drive_sync, session, url, req, state)
+
+  assert_false resp.success?
+  assert_not_nil resp.error
+  assert_equal [["127.0.0.1", :connect]], seen
+end
+
+assert('on_open_socket allows the connection through when the block returns truthy') do
+  srv  = TCPServer.new('127.0.0.1', 0)
+  url  = "http://127.0.0.1:#{srv.addr[1]}/"
+
+  session = URL.open
+  called = false
+  session.on_open_socket { |addr, purpose| called = true; true }
+
+  req, state = URL.__send__(:_build_request, session, :GET, url, nil, { timeout: 5.s }, nil)
+  loop = session.event_loop
+  code = nil
+  session.add(req) { |c| code = c }   # first drive pass: resolve + opensocket + connect
+
+  # Neither "the client's connect() has already landed by the time #add
+  # returns" nor "once accepted, the client has already written its request"
+  # can be assumed — both held on Linux but not reliably on every platform
+  # (observed as a multi-minute CI hang on macOS, then a hang again once the
+  # first was fixed). The client only makes progress — connecting, then
+  # writing the request — while ITS side of the event loop is pumped, so
+  # loop.run_once has to keep running on every iteration of this loop, not
+  # just while waiting to accept: accepting and then switching to a
+  # recv-only loop stops driving the client, and its request never arrives.
+  # One bounded, continuously-interleaved loop for both stages; a bad
+  # assumption here is a fast, clear test failure instead of a hang.
+  peer     = nil
+  request  = String.new
+  deadline = Chrono::Steady.now + 5.s
+  until (peer && request.include?("\r\n\r\n")) || Chrono::Steady.now > deadline
+    if peer
+      if IO.select([peer], nil, nil, 0)
+        chunk = peer.recv(4096)
+        break if chunk.nil? || chunk.empty?
+        request << chunk
+      end
+    elsif IO.select([srv], nil, nil, 0)
+      peer = srv.accept
+    end
+    loop.run_once(50.ms)
+  end
+  assert_not_nil peer, "server never received the connection"
+  assert_include request, "\r\n\r\n", "server never received the full request"
+
+  begin
+    peer.write("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+  ensure
+    peer.close
+  end
+
+  begin
+    URL.__send__(:_drive_until, loop) { !code.nil? }
+  ensure
+    session.remove(req)
+    srv.close
+  end
+  resp = URL.__send__(:_finish_response, url, req, state, code)
+
+  assert_true resp.success?
+  assert_true called
+end
+
+assert('Request#on_open_socket overrides the session-wide default') do
+  session = URL.open
+  session_called = false
+  session.on_open_socket { |addr, purpose| session_called = true; false }   # session default: deny everything
+
+  url = "http://127.0.0.1:3/"
+  req, state = URL.__send__(:_build_request, session, :GET, url, nil, { timeout: 5.s }, nil)
+  request_called = false
+  req.on_open_socket { |addr, purpose| request_called = true; false }       # this request's own veto runs instead
+  resp = URL.__send__(:_drive_sync, session, url, req, state)
+
+  assert_false resp.success?
+  assert_true request_called
+  assert_false session_called
+end
+
+assert('an exception raised inside on_open_socket refuses the connection and surfaces to the caller') do
+  session = URL.open
+  session.on_open_socket { |addr, purpose| raise "boom" }
+
+  url = "http://127.0.0.1:4/"
+  req, state = URL.__send__(:_build_request, session, :GET, url, nil, { timeout: 5.s }, nil)
+  assert_raise(RuntimeError) do
+    URL.__send__(:_drive_sync, session, url, req, state)
+  end
+end
+
 assert('handles with no duplicable libcurl resource refuse dup/clone') do
   # The multi handle has no curl_multi_duphandle, and the mime tree/parts are
   # tied to the easy that built them — dup/clone would share or orphan the C

@@ -8,14 +8,16 @@
 # Ruby orchestration over them.
 #
 # The callback setters store the block as an ivar (@on_data / @on_header /
-# @on_read) directly on the Easy handle, because the C write/header/read
-# trampolines read those ivars off the Easy object when libcurl fires them.
+# @on_read / @on_open_socket) directly on the Easy handle, because the C
+# write/header/read/opensocket trampolines read those ivars off the Easy
+# object when libcurl fires them.
 
-# The Easy handle carries the user callbacks as ivars. The C write/header/read
-# trampolines read @on_data / @on_header / @on_read off this object, so define
-# plain writers here (attr_writer assigns exactly those ivars).
+# The Easy handle carries the user callbacks as ivars. The C
+# write/header/read/opensocket trampolines read @on_data / @on_header /
+# @on_read / @on_open_socket off this object, so define plain writers here
+# (attr_writer assigns exactly those ivars).
 class URL::Libcurl::Easy
-  attr_writer :on_data, :on_header, :on_read
+  attr_writer :on_data, :on_header, :on_read, :on_open_socket
 end
 
 class URL::Request
@@ -24,10 +26,15 @@ class URL::Request
   # Make a fresh easy handle, optionally set its URL, and remember the owning
   # session. The easy handle's GC frees the underlying CURL*; the
   # write/header/read callbacks are already wired by Libcurl.easy_init.
+  # The session's on_open_socket default (if any) is applied here, through
+  # the same #on_open_socket below, so it gets the identical Addrinfo-wrapping
+  # treatment as an explicit per-request override — the request can still
+  # replace it with its own by calling #on_open_socket again afterward.
   def initialize(session, url = nil)
     @session = session
     @handle  = URL::Libcurl.easy_init
     URL::Libcurl.easy_setopt(@handle, :url, url) if url
+    on_open_socket(&session.on_open_socket) if session.on_open_socket
   end
 
   # dup / clone: give the copy its OWN libcurl handle. Object#initialize_copy
@@ -74,6 +81,25 @@ class URL::Request
 
   def on_read(&block)
     @handle.on_read = block
+    self
+  end
+
+  # Fires once per resolved address libcurl is about to connect to, before
+  # it opens the socket — the hook for refusing SSRF-style targets (loopback,
+  # RFC1918, link-local, cloud metadata IPs, ...) before any connection is
+  # made. The C trampoline yields the raw resolved sockaddr bytes; wrap them
+  # in an Addrinfo here (mruby-socket is already a hard dependency of this
+  # gem) so the block gets a real object — addr.ip_address, addr.ipv4?/ipv6?
+  # — instead of bytes it would have to unpack itself. purpose is :connect
+  # for a normal outbound connection, or :accept for the rare FTP
+  # active-mode data connection.
+  #
+  # Return truthy from the block to allow the connection, falsy/nil to
+  # refuse just that candidate address (libcurl tries the next resolved
+  # address, if any). No block set: every address is allowed, same as
+  # before this callback existed.
+  def on_open_socket(&block)
+    @handle.on_open_socket = lambda { |sockaddr, purpose| block.call(Addrinfo.new(sockaddr), purpose) }
     self
   end
 end
