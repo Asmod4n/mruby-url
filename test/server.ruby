@@ -275,18 +275,19 @@ end
 
 # ---- implicit-TLS IMAP server (IMAPS) -------------------------------------
 #
-# Minimal IMAPS endpoint for the URL IMAP verbs (move/store/expunge/fetch).
+# Minimal IMAPS endpoint for the URL IMAP verbs (move/store/expunge/fetch/search).
 # Implicit TLS, like the SMTP fixture: the socket is wrapped in SSL on accept
 # (no STARTTLS) and the same self-signed cert is reused.
 #
 # We speak just enough of curl's IMAP client flow: an untagged "* OK" greeting,
 # then tagged CAPABILITY / LOGIN (accept any creds) / SELECT (untagged EXISTS +
 # OK), then the command under test. curl drives a SELECTed mailbox then either
-# issues our -X custom request (UID STORE / EXPUNGE / UID MOVE) or, for a
-# message fetch, translates the URL's ";UID=<n>" into "UID FETCH <n> BODY[]"
-# itself. Each tagged command gets the right untagged response and a tagged
-# "OK"; FETCH returns a small literal-counted message body. Every received
-# command line is appended to test/imap_received so the mruby tests can assert.
+# issues our -X custom request (UID STORE / EXPUNGE / UID MOVE / UID SEARCH) or,
+# for a message fetch, translates the URL's ";UID=<n>" into "UID FETCH <n>
+# BODY[]" itself. Each tagged command gets the right untagged response and a
+# tagged "OK"; FETCH returns a small literal-counted message body, SEARCH a
+# fixed "1 2 3" UID list. Every received command line is appended to
+# test/imap_received so the mruby tests can assert.
 #
 # Self-signed cert generated above; the client (curl/mruby) is told not to
 # verify it (ssl_verify_peer:/ssl_verify_host: false in the test).
@@ -342,6 +343,9 @@ def handle_imap_session(ssl_sock, received_file)
         ssl_sock.write(IMAP_MESSAGE)
         ssl_sock.write(")\r\n")
         write.call("#{tag} OK UID FETCH completed")
+      when 'SEARCH'
+        write.call('* SEARCH 1 2 3')
+        write.call("#{tag} OK UID SEARCH completed")
       else
         write.call("#{tag} OK completed")
       end

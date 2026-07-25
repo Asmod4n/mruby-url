@@ -210,9 +210,10 @@ URL("file:///etc/hostname").download           if URL.supports?("file")
 # dict: define(word, database: "!")
 # URL("dict://dict.org/").define("ruby")
 
-# imap(s): fetch(uid:) / move(uid:, to:) / store(uid:, flags:, op: "+") / expunge
+# imap(s): fetch(uid:) / move(uid:, to:) / store(uid:, flags:, op: "+") / expunge / search(criteria = "ALL")
 # URL("imaps://user:pass@h/INBOX").fetch(uid: 7)
 # URL("imaps://user:pass@h/INBOX").store(uid: 7, flags: "\\Deleted")
+# URL("imaps://user:pass@h/INBOX").search("UNSEEN").imap_uids # [1, 2, 3]
 
 # pop3(s): list / fetch(n = nil) (alias download)
 # URL("pop3://user:pass@h/").fetch(1)

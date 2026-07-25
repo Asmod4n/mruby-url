@@ -993,6 +993,44 @@ assert('URL.fetch returns the message body') do
   assert_include streamed, "This is the fixture message body."
 end
 
+assert('URL.search issues UID SEARCH and returns the raw untagged line') do
+  skip "libcurl built without imaps" unless URL.supports?("imaps")
+  skip "no imap test server"         unless $imap_port
+
+  base = "imaps://user:pass@127.0.0.1:#{$imap_port}/INBOX"
+
+  # Default criteria is "ALL".
+  resp = URL(base).search(ssl_verify_peer: false, ssl_verify_host: false)
+  assert_kind_of URL::Response, resp
+  assert_equal 0, resp.error_code
+  assert_include resp.body, "* SEARCH 1 2 3"
+  assert_equal [1, 2, 3], resp.imap_uids
+
+  got = File.read($imap_received)
+  assert_include got, "UID SEARCH ALL"
+
+  # An explicit criterion is passed straight through.
+  URL(base).search("UNSEEN", ssl_verify_peer: false, ssl_verify_host: false)
+  got = File.read($imap_received)
+  assert_include got, "UID SEARCH UNSEEN"
+end
+
+assert('Response#imap_uids parses the untagged SEARCH line into Integers') do
+  mk = ->(body) {
+    URL::Response.new(url: "imaps://h/INBOX", effective_url: "imaps://h/INBOX",
+                       code: 0, body: body, raw_headers: [], total_time: 0.s,
+                       content_type: nil, error_code: 0)
+  }
+
+  assert_equal [1, 2, 3], mk.call("* SEARCH 1 2 3\r\n").imap_uids
+  assert_equal [42],      mk.call("* SEARCH 42\r\n").imap_uids
+  assert_equal [],        mk.call("* SEARCH\r\n").imap_uids       # empty result, not an error
+  assert_equal [],        mk.call("some other body\r\n").imap_uids # no SEARCH line at all
+  assert_equal [],        mk.call(nil).imap_uids                  # no body at all
+  # Multiple untagged SEARCH lines (RFC 3501 permits it) concatenate.
+  assert_equal [1, 2, 3], mk.call("* SEARCH 1 2\r\n* SEARCH 3\r\n").imap_uids
+end
+
 assert('IMAP verbs gate unavailable / unknown schemes') do
   # An IMAP verb on a non-IMAP wrapper class doesn't exist (URL::HTTP has no
   # #move), so the wrong-shape call raises NoMethodError up front — before any

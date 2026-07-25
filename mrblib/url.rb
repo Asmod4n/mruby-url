@@ -132,6 +132,23 @@ class URL::Response
     headers[name.to_s.downcase]
   end
 
+  # Parses the untagged "* SEARCH ..." line URL::IMAP#search returns into an
+  # Array of Integer UIDs. Regex-free: a plain prefix check plus split, same
+  # as #lines. "* SEARCH" with nothing after it (a valid, empty result) parses
+  # to []; a response with no SEARCH line at all (e.g. called on something
+  # other than a #search result) also gives [] rather than raising — there's
+  # no data to report either way. Multiple untagged SEARCH lines (rare, but
+  # not forbidden by RFC 3501) are concatenated.
+  def imap_uids
+    marker = "* SEARCH"
+    uids = []
+    lines.each do |line|
+      next unless line.start_with?(marker)
+      uids.concat(line[marker.length..].split(" ").map(&:to_i))
+    end
+    uids
+  end
+
   def json
     @json ||= JSON.parse(@body)
   end
