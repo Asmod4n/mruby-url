@@ -1714,12 +1714,16 @@ murl_lc_multi_info_read(mrb_state* mrb, mrb_value mod)
     if (msg->msg != CURLMSG_DONE) continue;
 
     /* Out of memory is the one CURLcode we never marshal back as a value:
-     * building the wrapper in Ruby might itself allocate. Mirror mruby's own
-     * allocator (mrb_realloc) — flag the VM out-of-memory and raise the
+     * building the wrapper in Ruby might itself allocate. Raise the
      * preallocated NoMemoryError (mrb->nomem_err) directly, so OOM never
-     * reaches Ruby as a plain code. */
+     * reaches Ruby as a plain code.
+     *
+     * The gc.out_of_memory flag that used to be set beside this is gone
+     * from mruby: the allocator raises through mrb_raise_nomemory() now,
+     * which is internal.h's. The flag was the allocator's own bookkeeping
+     * and never this gem's to write - raising the preallocated error is
+     * what mattered, and that is unchanged. */
     if (unlikely(msg->data.result == CURLE_OUT_OF_MEMORY)) {
-      mrb->gc.out_of_memory = TRUE;
       mrb_exc_raise(mrb, mrb_obj_value(mrb->nomem_err));
     }
 
